@@ -1,0 +1,12 @@
+[submodule "rust"]
+	path = rust
+	url = https://github.com/yskzalloc/rust.git
+	branch = kcov-dataflow
+[submodule "llvm-project"]
+	path = llvm-project
+	url = https://github.com/yskzalloc/llvm-project.git
+	branch = kcov-dataflow
+[submodule "linux"]
+	path = linux
+	url = https://github.com/yskzalloc/linux.git
+	branch = kcov-dataflow

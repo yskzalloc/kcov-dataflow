@@ -1,0 +1,48 @@
+% shared/macros.tex — Identity-masked macros for both arXiv and NDSS versions
+% Toggle anonymization: set \anonymoustrue for NDSS, \anonymousfalse for arXiv
+\newif\ifanonymous
+\anonymoustrue % default: anonymous (NDSS)
+
+\ifanonymous
+  \newcommand{\toolname}{{\sc BoundaryFlow}\xspace}
+  \newcommand{\anonrepo}{\url{https://anonymous.4open.science/r/XXXX}}
+  \newcommand{\authorblock}{%
+    \author{Anonymous Submission \\ Paper ID: TBD}%
+  }
+\else
+  \newcommand{\toolname}{{\sc kcov-dataflow}\xspace}
+  \newcommand{\anonrepo}{\url{https://github.com/REDACTED/kcov-dataflow}}
+  \newcommand{\authorblock}{%
+    \author{%
+      First Author\thanks{Affiliation} \and
+      Second Author\thanks{Affiliation}
+    }%
+  }
+\fi
+
+% Technical shorthands
+\newcommand{\sancov}{\texttt{SanitizerCoverage}\xspace}
+\newcommand{\tracepc}{\texttt{trace-pc}\xspace}
+\newcommand{\traceargs}{\texttt{dataflow-args}\xspace}
+\newcommand{\traceret}{\texttt{dataflow-ret}\xspace}
+\newcommand{\kcov}{\texttt{KCOV}\xspace}
+\newcommand{\kasan}{\texttt{KASAN}\xspace}
+\newcommand{\syzkaller}{\texttt{syzkaller}\xspace}
+\newcommand{\drgn}{\texttt{drgn}\xspace}
+\newcommand{\virtme}{\texttt{virtme-ng}\xspace}
+
+% Data-flow tuple notation
+\newcommand{\dftuple}[4]{\ensuremath{\langle #1, #2, #3, #4 \rangle}}
+\newcommand{\callerid}{\ensuremath{\mathit{PC}_{\mathrm{caller}}}}
+\newcommand{\calleeid}{\ensuremath{\mathit{PC}_{\mathrm{callee}}}}
+
+% Listing style
+\usepackage{listings}
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny,
+  captionpos=b,
+}

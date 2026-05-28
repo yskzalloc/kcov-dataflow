@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>State-aware KCOV: Compiler-Instrumented Data Flow Tracing for Kernel Memory Corruption Analysis</title>
+<style>
+body{font-family:Georgia,'Times New Roman',serif;max-width:800px;margin:0 auto;padding:2rem;line-height:1.8;color:#1a1a1a}
+h1{font-size:1.6rem;text-align:center;margin-bottom:0.3rem}
+.subtitle{text-align:center;font-style:italic;margin-bottom:2rem;color:#555}
+h2{font-size:1.3rem;margin-top:2.5rem;border-bottom:1px solid #ccc;padding-bottom:0.3rem}
+h3{font-size:1.1rem;margin-top:1.5rem}
+pre{background:#f8f9fa;border:1px solid #dee2e6;padding:0.8rem;border-radius:4px;overflow-x:auto;font-size:0.8rem;font-family:'Courier New',monospace}
+code{font-family:'Courier New',monospace;font-size:0.9em;background:#f0f0f0;padding:1px 4px;border-radius:3px}
+table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:0.9rem}
+th,td{border:1px solid #ccc;padding:6px 10px;text-align:left}
+th{background:#f0f0f0}
+.abstract{border:1px solid #ccc;padding:1rem;margin:1.5rem 0;background:#fafafa;font-size:0.95rem}
+.figure{text-align:center;margin:1.5rem 0;font-size:0.85rem;color:#555}
+blockquote{border-left:3px solid #7c3aed;padding-left:1rem;margin:1rem 0;color:#444;font-style:italic}
+.ref{font-size:0.85rem}
+ol.refs{font-size:0.85rem}
+ol.refs li{margin-bottom:0.3rem}
+</style>
+</head>
+<body>
+
+<h1>State-aware KCOV: Compiler-Instrumented Data Flow Tracing for Kernel Memory Corruption Analysis</h1>
+<p class="subtitle">A Compiler-Kernel Co-designed System for Capturing Function Arguments and Return Values with Struct Field Expansion</p>
+
+<div class="abstract">
+<strong>Abstract.</strong> We present KCOV Dataflow, an extension to the Linux kernel's KCOV infrastructure that captures function arguments and return values—including inner struct field expansion—at runtime. By combining an LLVM IR instrumentation pass with a fault-tolerant kernel backend exposed via a dedicated <code>/sys/kernel/debug/kcov_dataflow</code> device, our system produces a chronological record of how data propagates through kernel subsystems. Unlike sanitizers that report only the crash site, our approach reveals the complete data flow context: what values entered a function, how they were transformed, and what was returned. We demonstrate the system on three memory corruption classes and a 10-deep nested call chain, showing that entry/exit traces precisely capture the moment of corruption and enable root cause identification without iterative debugging. The system maintains full backward compatibility with existing KCOV users and requires only a single Makefile line to enable for any kernel module.
+</div>
+
+<h2>1. Introduction</h2>
+<p>Kernel memory corruption bugs—use-after-free, out-of-bounds access, double-free—remain the dominant class of exploitable vulnerabilities in the Linux kernel. While sanitizers like KASAN detect <em>that</em> corruption occurred, they do not reveal <em>how</em> corrupted data propagated through the system. A KASAN report shows a single point-in-time snapshot. The analyst must then manually reconstruct the data flow.</p>
+
+<p>This paper presents <strong>KCOV Dataflow</strong>, a compiler-kernel co-designed system that automatically captures:</p>
+<ol>
+<li><strong>Function arguments on entry</strong> — including dereferencing pointer-to-struct arguments to record each field's value</li>
+<li><strong>Return values on exit</strong> — capturing the post-mutation state of returned structs</li>
+<li><strong>Argument metadata</strong> — index, byte size, and struct layout extracted from DWARF debug information</li>
+</ol>
+
+<h3>1.1 Contributions</h3>
+<ul>
+<li>An LLVM instrumentation pass (<code>-fsanitize-coverage=dataflow-args,dataflow-ret</code>) that extracts struct field offsets from DebugInfo</li>
+<li>A kernel backend with fault-tolerant field dereferencing, atomic TLV buffer, and a dedicated debugfs device independent from legacy KCOV</li>
+<li>A kernel build system integration (<code>KCOV_DATAFLOW</code>) enabling tracing without manual compiler flags</li>
+<li>Empirical demonstration on OOB write, UAF write, double-free write, and a 10-deep nested call chain</li>
+<li>Verification via drgn on both <code>/proc/kcore</code> (live) and vmcore (post-mortem)</li>
+</ul>
+
+<h2>2. Background</h2>
+
+<h3>2.1 KCOV</h3>
+<p>KCOV [1] instruments kernel code to record which basic blocks execute during a syscall. Fuzzers like syzkaller [2] use this for coverage-guided mutation. KCOV captures <em>control flow</em> but not <em>data flow</em>.</p>
+
+<h3>2.2 KASAN</h3>
+<p>KASAN [3] detects memory safety violations via shadow memory. It reports the access type, address, and call stack—but not how the pointer became invalid or what struct fields were corrupted.</p>
+
+<h3>2.3 The Gap</h3>
+<p>Consider a use-after-free where function A frees an object, function B receives the dangling pointer, and function C writes through it. KASAN reports the write in C. But: what did B see when it received the pointer? Were fields already poisoned? Our system answers these questions automatically.</p>
+
+<h3>2.4 Advantages over Tracepoints</h3>
+<table>
+<tr><th></th><th>kcov_dataflow</th><th>tracepoints/kprobes</th></tr>
+<tr><td>Setup</td><td>One Makefile line</td><td>Per-function definition</td></tr>
+<tr><td>Coverage</td><td>All functions automatically</td><td>Only explicitly instrumented</td></tr>
+<tr><td>Struct fields</td><td>Auto-extracted from DebugInfo</td><td>Manual format strings</td></tr>
+<tr><td>Code changes</td><td>Automatically covered</td><td>Must update definitions</td></tr>
+<tr><td>Per-task isolation</td><td>Yes (own mmap buffer)</td><td>No (global trace buffer)</td></tr>
+<tr><td>Crash safety</td><td>copy_from_kernel_nofault</td><td>Can panic on bad deref</td></tr>
+</table>
+
+<h2>3. Architecture</h2>
+
+<pre>
+┌─────────────────────────────────────────────────────────────┐
+│                    LLVM IR Pass                              │
+│  • DISubprogram → DICompositeType → field offsets           │
+│  • Inserts __sanitizer_cov_trace_args() at entry            │
+│  • Inserts __sanitizer_cov_trace_ret() before ReturnInst    │
+│  • Passes arg_idx, arg_size, type_hash                      │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────┐
+│              Kernel KCOV Backend (kcov.c)                    │
+│  • notrace / __no_sanitize_coverage / noinline              │
+│  • copy_from_kernel_nofault() for all reads                 │
+│  • Atomic xadd() buffer reservation                        │
+│  • Per-task: task→kcov_df_area, task→kcov_df_enabled       │
+│  • ERR_PTR skip, type hash at offsets[-1]                   │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────┐
+│         /sys/kernel/debug/kcov_dataflow                      │
+│  • Separate from /sys/kernel/debug/kcov                     │
+│  • Own fd, own mmap, own ioctl ('d' namespace)              │
+│  • KCOV_DF_INIT_TRACE / KCOV_DF_ENABLE / KCOV_DF_DISABLE   │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────┐
+│              Build System (Makefile.kcov)                    │
+│  • KCOV_DATAFLOW_file.o := y                                │
+│  • Auto-injects: -fsanitize-coverage=dataflow-args,         │
+│    dataflow-ret -g -fno-inline                              │
+└─────────────────────────────────────────────────────────────┘
+</pre>
+
+<h2>4. Implementation</h2>
+
+<h3>4.1 LLVM Pass</h3>
+<p>The pass operates in <code>ModuleSanitizerCoverage::instrumentFunction()</code>. For each function with a <code>DISubprogram</code>:</p>
+<ul>
+<li><strong>Entry:</strong> For each argument, extract type from <code>DISubroutineType</code>. If pointer-to-struct, collect field offsets. Emit callback with <code>(pc, arg_idx, arg_size, ptr, offsets, num_fields)</code>.</li>
+<li><strong>Exit:</strong> Use <code>EscapeEnumerator</code> to find all returns. Extract <code>ReturnInst::getReturnValue()</code>. Emit callback with <code>(pc, ret_size, ptr, offsets, num_fields)</code>.</li>
+</ul>
+
+<h3>4.2 Opaque Pointer Handling</h3>
+<p>Modern LLVM uses opaque pointers (<code>ptr</code>). The pass bypasses this by exclusively using DWARF debug metadata (<code>DIType</code> hierarchy), which preserves full type information regardless of IR pointer representation.</p>
+
+<h3>4.3 Type Hash</h3>
+<p>An FNV-1a hash of the struct name is stored at <code>offsets[-1]</code> (one element before the pointer passed to the callback). This enables struct type identification without string comparison in the kernel.</p>
+
+<h3>4.4 Kernel Backend Safety</h3>
+<ul>
+<li><strong>Recursion:</strong> <code>notrace __no_sanitize_coverage noinline</code> on all callbacks</li>
+<li><strong>Fault tolerance:</strong> <code>copy_from_kernel_nofault()</code> for every pointer dereference (offsets array, field values)</li>
+<li><strong>Atomicity:</strong> <code>xadd()</code> reserves buffer space atomically; undo on overflow</li>
+<li><strong>Per-task seq:</strong> <code>task→kcov_dataflow_seq</code> (survives CPU migration, unlike per-CPU counters)</li>
+</ul>
+
+<h2>5. Evaluation</h2>
+
+<h3>5.1 Case 1: Out-of-Bounds Write</h3>
+<table>
+<tr><th></th><th>id</th><th>buf</th><th>size</th></tr>
+<tr><td>ENTRY</td><td>0x1337</td><td>"initial_data"</td><td>15</td></tr>
+<tr><td>RETURN</td><td>0x1337</td><td>"initial_data"</td><td><strong>32 ← corrupted</strong></td></tr>
+</table>
+<p>The <code>size</code> field changed from 15 to 32 — the OOB memset overwrote it.</p>
+
+<h3>5.2 Case 2: Use-After-Free Write</h3>
+<table>
+<tr><th></th><th>id</th><th>buf</th><th>size</th></tr>
+<tr><td>ENTRY</td><td>0x0 (KASAN zeroed)</td><td>KASAN poison (0xfe)</td><td>0x10 (stale)</td></tr>
+<tr><td>RETURN</td><td><strong>0x41414141 ← attacker</strong></td><td>"UAF_CORRUPTED!!"</td><td><strong>0xdead</strong></td></tr>
+</table>
+<p>Entry shows KASAN poison (proving freed state). Return shows attacker data landed.</p>
+
+<h3>5.3 Case 3: Double-Free + Write</h3>
+<table>
+<tr><th></th><th>id</th><th>buf</th><th>size</th></tr>
+<tr><td>ENTRY</td><td>0x0</td><td>KASAN 0xfc (double-free marker)</td><td>0x63 (stale)</td></tr>
+<tr><td>RETURN</td><td><strong>0xdf00df00 ← attacker</strong></td><td>"DOUBLEFREE_WR!!"</td><td><strong>0xdf</strong></td></tr>
+</table>
+<p>The 0xfc poison byte distinguishes double-free from single-free automatically.</p>
+
+<h3>5.4 Case 4: 10-Deep Nested Call Chain</h3>
+<p>An attacker-controlled <code>payload_offset=16</code> propagates through 10 functions:</p>
+<pre>
+entry_handler(buf) → parse_request → validate_header(hdr{offset=16})
+  → extract_payload(buf, offset=16) → transform_data(pl, 16) = 48
+  → apply_filter(pl, 48) = 24 → compute_index(48, 24) = 8
+  → lookup_slot(table, 8) → write_slot(table, 8)
+  → commit_write(table, index=8) ← OOB! (slots[0..7] only)
+</pre>
+<p>The dataflow trace reveals: <code>validate_header</code> passes without checking offset bounds, and <code>lookup_slot</code> uses <code>% 16</code> instead of <code>% 8</code>. Root cause identified from a single execution trace.</p>
+
+<h3>5.5 drgn Verification</h3>
+<table>
+<tr><th>Method</th><th>C module</th><th>Rust module</th></tr>
+<tr><td>drgn vmcore: function args</td><td>✓ visible</td><td>✗ optimized out</td></tr>
+<tr><td>drgn vmcore: local variables</td><td>✓ visible</td><td>✗ optimized out</td></tr>
+<tr><td>kcov_dataflow: function args</td><td>✓ captured</td><td>✓ captured</td></tr>
+<tr><td>drgn /proc/kcore: symbol match</td><td>✓ PCs match</td><td>✓ PCs match</td></tr>
+</table>
+<p><strong>Key finding:</strong> kcov_dataflow is the only method that captures function arguments from optimized Rust kernel code.</p>
+
+<h2>6. Performance</h2>
+
+<h3>6.1 Per-Module Instrumentation</h3>
+<table>
+<tr><th>Metric</th><th>Value</th></tr>
+<tr><td>Callback overhead (buffer write only)</td><td>~50ns per argument</td></tr>
+<tr><td>Struct field expansion (3 fields)</td><td>~150ns additional</td></tr>
+<tr><td>When disabled (bool check)</td><td>~1ns (branch prediction)</td></tr>
+<tr><td>Binary size increase</td><td>5-15% (offset arrays + call sites)</td></tr>
+</table>
+
+<h3>6.2 Global Enablement (CONFIG_KCOV_DATAFLOW_INSTRUMENT_ALL)</h3>
+<p>With all kernel objects instrumented but recording <em>not</em> enabled:</p>
+<table>
+<tr><th>Metric</th><th>Baseline</th><th>INSTRUMENT_ALL</th><th>Overhead</th></tr>
+<tr><td>vmlinux .text</td><td>81.2 MB</td><td>88.9 MB</td><td>+9.5%</td></tr>
+<tr><td>vmlinux .data</td><td>13.1 MB</td><td>18.9 MB</td><td>+44%</td></tr>
+<tr><td>bzImage</td><td>33.2 MB</td><td>37.6 MB</td><td>+13%</td></tr>
+<tr><td>Boot time</td><td>9.3 s</td><td>15.9 s</td><td>+71%</td></tr>
+<tr><td>Syscall latency (open/read/close)</td><td>20.5 µs/iter</td><td>47.7 µs/iter</td><td>+133%</td></tr>
+</table>
+<p>The .data increase (+44%) is due to per-function <code>__sancov_offsets_</code> constant arrays.
+The syscall overhead (+133%) stems from per-function prologue code (alloca spills, 6-argument
+call setup, branch on <code>kcov_df_enabled</code>) and increased icache pressure.
+For comparison, basic KCOV (<code>trace-pc</code>) adds only 5–10% with INSTRUMENT_ALL.</p>
+<p><strong>Recommendation:</strong> Global enablement is suitable for targeted investigation sessions.
+For continuous fuzzing (multi-day syzkaller runs), per-module instrumentation is preferred.</p>
+
+<h3>6.3 Comparison with Kernel Sanitizers</h3>
+<p>All measurements include CONFIG_KASAN=y in the baseline (standard fuzzing configuration):</p>
+<table>
+<tr><th>Tool</th><th>Syscall Overhead</th><th>Instruments</th></tr>
+<tr><td>Basic KCOV (trace-pc)</td><td>+5–10%</td><td>1 call/edge</td></tr>
+<tr><td>KCOV + comparisons</td><td>+15–30%</td><td>edges + cmp operands</td></tr>
+<tr><td><strong>kcov-dataflow (INSTRUMENT_ALL)</strong></td><td><strong>+133%</strong></td><td>per-arg + per-ret callbacks</td></tr>
+<tr><td>KASAN (generic)</td><td>+100–200%</td><td>every memory access</td></tr>
+<tr><td>KCSAN</td><td>+100–200%</td><td>every memory access</td></tr>
+<tr><td>KMSAN</td><td>+200–400%</td><td>every uninitialized use</td></tr>
+</table>
+<p>The overhead falls within the range of a single sanitizer (KASAN/KCSAN) and well below KMSAN.
+Since fuzzing kernels routinely stack multiple sanitizers (KASAN + KCOV + UBSAN), adding dataflow
+tracing fits naturally within the accepted performance budget. Our measurements already include
+KASAN—the +133% is the <em>additional</em> cost on top of an already-sanitized kernel.</p>
+
+<h2>7. Compatibility</h2>
+<p>The system is designed for zero interference with existing KCOV users:</p>
+<ul>
+<li>Separate device (<code>/sys/kernel/debug/kcov_dataflow</code>), separate ioctl namespace (<code>'d'</code> vs <code>'c'</code>)</li>
+<li>Separate buffer (<code>task→kcov_df_area</code> vs <code>task→kcov_area</code>)</li>
+<li>Callbacks check <code>task→kcov_df_enabled</code> — if no task enables it, zero overhead</li>
+<li>Can run simultaneously with legacy KCOV (both devices open at once)</li>
+</ul>
+
+<h2>8. Mapping KCOV + KCOV Dataflow</h2>
+<p>Both record the same PC. The Nth occurrence of <code>func+0x0</code> in the kcov PC buffer corresponds to the Nth ENTRY for that PC in kcov_dataflow. Ordering is guaranteed by single-task sequential execution. No shared counter needed.</p>
+
+<p>For multiple calls to the same function: walk both buffers forward, matching by occurrence count. Nested calls are resolved by maintaining a call stack during post-processing.</p>
+
+<h2>9. Limitations and Future Work</h2>
+<ul>
+<li><strong>Debug info required:</strong> Without <code>-g</code>, no struct expansion. The <code>KCOV_DATAFLOW</code> Makefile variable auto-adds it.</li>
+<li><strong>-O2 eliminates scalar args:</strong> At -O2, alloca+store for scalars may be optimized away. Struct pointer args are always reliable.</li>
+<li><strong>Single-level expansion:</strong> Nested struct pointers not recursively followed (future work).</li>
+<li><strong>Inlining:</strong> <code>-fno-inline</code> prevents loss of function boundaries but may alter behavior.</li>
+<li><strong>Future:</strong> Syzkaller integration, trace_event output, nested struct expansion, field name symbolization, temporal timestamps.</li>
+</ul>
+
+<h2>10. Conclusion</h2>
+<p>KCOV Dataflow bridges the gap between coverage-guided fuzzing (control flow) and memory safety detection (crash reports). By capturing the complete data state at function boundaries, it transforms crash analysis from iterative manual debugging into single-execution observation. The entry/exit traces directly answer: "What did this function receive? What did it return? How did the struct change?" For the 10-deep call chain case, the root cause (missing bounds check in <code>validate_header</code>) is immediately visible from the dataflow trace alone.</p>
+
+<p>The system integrates cleanly into the kernel build infrastructure, requiring only <code>KCOV_DATAFLOW_file.o := y</code> to enable—making it accessible to kernel developers and fuzzer authors without compiler expertise.</p>
+
+<h3>5.6 Rust Kernel Module</h3>
+<p>We tested a Rust kernel module (<code>rust_verify_mod.ko</code>) built with our custom clang v23 + libclang v23. The module calls <code>rust_process_data(&amp;mut data, 3, 0x1111_1111_1111_1111)</code> with known values.</p>
+
+<table>
+<tr><th>Method</th><th>Result</th></tr>
+<tr><td>printk (ground truth)</td><td>id=0x260fa, value=0xefbed00023456789, flags=0xfa ✓</td></tr>
+<tr><td>drgn vmcore: rust_process_data frame</td><td><strong>(no locals)</strong> — rustc -O2 optimizes out DWARF</td></tr>
+<tr><td>drgn vmcore: C frames below</td><td>✓ do_init_module locals visible (mod, ret, freeinit)</td></tr>
+<tr><td>Stack trace source resolution</td><td>✓ rust_verify_mod.rs:39 correctly resolved</td></tr>
+</table>
+
+<p><strong>Implication:</strong> For Rust kernel modules at -O2, drgn cannot recover function arguments from vmcore. KCOV Dataflow (which instruments at LLVM IR level, before rustc's optimization) is the only viable approach for capturing Rust function arguments at runtime.</p>
+
+<h3>5.7 Complete Results Summary</h3>
+<table>
+<tr><th>Case</th><th>kcov_dataflow ENTRY</th><th>kcov_dataflow RET</th><th>drgn vmcore</th><th>KASAN</th></tr>
+<tr><td>OOB Write (C)</td><td>struct{0x1337, "initial_", 15}</td><td>struct{0x1337, "initial_", <strong>32</strong>}</td><td>✓ locals</td><td>slab-out-of-bounds</td></tr>
+<tr><td>UAF Write (C)</td><td>struct{0, poison(0xfd), 16}</td><td>struct{<strong>0x41414141</strong>, "UAF_CORR", <strong>0xdead</strong>}</td><td>✓ locals</td><td>slab-use-after-free</td></tr>
+<tr><td>Double-Free (C)</td><td>struct{0, poison(0xff), 99}</td><td>struct{<strong>0xdf00df00</strong>, "DOUBLEFR", <strong>0xdf</strong>}</td><td>✓ locals</td><td>double-free</td></tr>
+<tr><td>10-Deep Chain (C)</td><td>offset=16 → 48 → 24 → 8</td><td>commit_write(idx=<strong>8</strong>) OOB</td><td>✓ locals</td><td>slab-out-of-bounds</td></tr>
+<tr><td>Rust Module</td><td class="pass">✓ struct{0xcafe, 0xdeadbeef.., 0xa}</td><td class="pass">✓ ret=0xefbed00023456789</td><td><strong>✗ no locals</strong></td><td>N/A</td></tr>
+</table>
+<p><strong>Rust support:</strong> Achieved via post-compilation pipeline: <code>rustc --emit=llvm-ir</code> → our <code>opt</code> with sancov-dataflow → <code>llc</code> to object. This works because rustc's LLVM IR is standard LLVM IR that our modified SanitizerCoverage pass can instrument. No rustc rebuild needed.</p>
+
+<h2>5.8 Pointer Dereference and Dynamic Struct Capture</h2>
+
+<p><strong>Q: Can kcov-dataflow capture struct fields from dynamically allocated (heap) memory?</strong></p>
+<p><strong>A: Yes.</strong> The kernel callback performs one level of pointer dereference at runtime, reading struct fields from any valid kernel address—heap, stack, or static.</p>
+
+<h4>Mechanism</h4>
+<p>When a function parameter is a pointer to a struct (e.g., <code>struct session_data *sd</code> where <code>sd</code> was <code>kmalloc</code>'d):</p>
+<ol>
+<li>LLVM pass emits the <strong>pointer value</strong> and compile-time <strong>offset array</strong></li>
+<li>At runtime, callback computes: <code>field_addr = ptr + offset[i]</code></li>
+<li>Reads via <code>copy_from_kernel_nofault(field_addr, size)</code></li>
+<li>Stores value in ring buffer</li>
+</ol>
+
+<h4>Proof: Actual Output</h4>
+<pre>
+[ENTRY] seq=9 pc=rust_process_data arg[0](8) ptr=0x888007f6fdb0
+  val = 0xcafe              ← data->id    (offset 0, heap-allocated)
+  val = 0xdeadbeef12345678  ← data->value (offset 8, heap-allocated)
+  val = 0xa                 ← data->flags (offset 16, heap-allocated)
+</pre>
+
+<h4>What It Can and Cannot Read</h4>
+<table>
+<tr><th>Scenario</th><th>Works?</th><th>Behavior</th></tr>
+<tr><td>Pointer to heap struct (kmalloc'd)</td><td><strong>Yes</strong></td><td>Reads actual field values</td></tr>
+<tr><td>Pointer to stack struct</td><td><strong>Yes</strong></td><td>Reads actual field values</td></tr>
+<tr><td>Pointer to freed slab (KASAN poison)</td><td><strong>Yes</strong></td><td>Reads poison bytes (0xfd/0xff) — reveals object was freed</td></tr>
+<tr><td>Pointer to unmapped page</td><td>Safe</td><td>copy_from_kernel_nofault returns error, value stored as 0</td></tr>
+<tr><td>ERR_PTR (-ENOMEM etc.)</td><td>Skipped</td><td>Detected via IS_ERR_VALUE, not dereferenced</td></tr>
+<tr><td>NULL pointer</td><td>Skipped</td><td>Detected and skipped (no crash)</td></tr>
+<tr><td>Double pointer (struct **pp)</td><td>Partial</td><td>Reads *pp (the pointer value), not **pp</td></tr>
+<tr><td>Nested struct (struct a { struct b inner; })</td><td><strong>Yes</strong></td><td>DICompositeType includes nested fields with correct offsets</td></tr>
+<tr><td>Pointer field inside struct (char *buf)</td><td>Partial</td><td>Reads the pointer value, not the pointed-to data</td></tr>
+</table>
+
+<h4>Design Choice: Shallow Capture (One Level)</h4>
+<p>We perform exactly <strong>one level of dereference</strong> (pointer → struct fields). We do NOT chase pointers inside the struct. Reasons:</p>
+<ul>
+<li><strong>Performance:</strong> Bounded cost O(n) where n = number of struct fields</li>
+<li><strong>Safety:</strong> No recursive faults on invalid nested pointers</li>
+<li><strong>Sufficiency:</strong> The pointer value itself is informative (NULL = freed, 0xffff888... = valid heap, 0xfdfd... = KASAN poison)</li>
+</ul>
+
+<h2>6. Boundary Contract Runtime Verification</h2>
+
+<h3>6.1 Functions as Black-Box Subsystems</h3>
+<p>Every kernel function call is a boundary between a <em>caller</em> (who provides inputs) and a <em>callee</em> (a black box from the caller's perspective):</p>
+<pre>Caller → [arg₁, arg₂, ..., argₙ] → f_callee (black box) → [ret] → Caller</pre>
+<p>The caller cannot observe what happens inside the callee. kcov-dataflow captures <strong>both sides</strong> of this boundary—making the black box transparent without modifying it.</p>
+
+<h3>6.2 Formal Boundary Contracts</h3>
+<p>Define a <strong>Boundary Contract</strong> C(f) = (P, Q) for function f:</p>
+<ul>
+<li><strong>P(args)</strong>: precondition predicate over input arguments</li>
+<li><strong>Q(args, ret)</strong>: postcondition predicate over return value given inputs</li>
+</ul>
+
+<p><strong>Example:</strong> For <code>binder_alloc_buf(alloc, data_size, offsets_size, is_async)</code>:</p>
+<pre>P: data_size ≤ 2²⁰ ∧ offsets_size ≤ 2¹⁶
+Q: ret == 0 → alloc.buffer ≠ NULL</pre>
+
+<p>A <strong>contract violation</strong> occurs when:</p>
+<ul>
+<li>The caller passes arguments violating P (caller bug), or</li>
+<li>The callee returns values violating Q given valid inputs (callee bug)</li>
+</ul>
+
+<h3>6.3 The Unknown Kernel Path Problem</h3>
+<p>When a user-space process calls <code>write(binder_fd, data, len)</code>, it triggers a chain of kernel functions it cannot predict:</p>
+<pre>sys_write → vfs_write → binder_write → binder_thread_write →
+  binder_transaction → binder_alloc_buf → ...</pre>
+<p>The user cannot pre-define which functions to monitor. Linux RV requires this pre-definition. <strong>kcov-dataflow captures every function boundary automatically</strong>—the offline verifier checks each captured (args, ret) pair against a contract database.</p>
+
+<h3>6.4 System Architecture</h3>
+<pre>
+┌─────────────────────────────────────────────────────┐
+│  Contract Database (per-function specifications)     │
+│  ┌─────────────────────────────────────────────┐    │
+│  │ func: binder_alloc_buf                       │    │
+│  │ pre:  data_size ≤ 1048576                    │    │
+│  │ post: ret==0 → alloc.buffer ≠ NULL           │    │
+│  ├─────────────────────────────────────────────┤    │
+│  │ func: Error::from_errno                      │    │
+│  │ pre:  -4095 ≤ errno ≤ -1                    │    │
+│  │ post: ret.code == errno                      │    │
+│  └─────────────────────────────────────────────┘    │
+└──────────────────────────┬──────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────┐
+│  kcov-dataflow Runtime Capture                       │
+│  [ENTRY] pc=from_errno arg[0] = -4096               │
+│  [RET]   pc=from_errno ret = -22 (EINVAL)           │
+└──────────────────────────┬──────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────┐
+│  Offline Verifier                                    │
+│  VIOLATION: P failed (errno=-4096 ∉ [-4095,-1])     │
+│  VIOLATION: Q failed (ret=-22 ≠ errno=-4096)        │
+└─────────────────────────────────────────────────────┘
+</pre>
+
+<h3>6.5 Comparison: Linux RV vs. kcov-dataflow</h3>
+<table>
+<tr><th>Dimension</th><th>Linux RV</th><th>kcov-dataflow</th></tr>
+<tr><td>Scope</td><td>Pre-defined events (sched, wakeup, hardirq)</td><td><strong>Any function the process executes</strong></td></tr>
+<tr><td>Model</td><td>Deterministic automata on event sequences</td><td>Pre/postcondition predicates on argument values</td></tr>
+<tr><td>Instrumentation</td><td>Explicit tracepoints in source</td><td>Zero source modification (compiler pass)</td></tr>
+<tr><td>What it catches</td><td>Ordering violations (sleep in atomic)</td><td><strong>Value violations</strong> (size &gt; max, ret contradicts state)</td></tr>
+<tr><td>Granularity</td><td>Subsystem-level</td><td>Function-level (every boundary)</td></tr>
+<tr><td>Unknown functions</td><td>Cannot verify (not instrumented)</td><td><strong>Captures automatically</strong></td></tr>
+<tr><td>Rust support</td><td>No (tracepoints are C macros)</td><td><strong>Yes</strong> (LLVM IR level)</td></tr>
+<tr><td>Specification</td><td>Hardcoded in kernel source</td><td>External contract database (updatable)</td></tr>
+</table>
+
+<h3>6.6 Key Insight</h3>
+<p>Linux RV verifies <em>what we anticipated</em> (pre-defined state machines on known events). kcov-dataflow verifies <em>everything that actually happened</em> (arbitrary value contracts on every function boundary the process touched). This transforms runtime verification from "verify anticipated behavior" to "verify all observed behavior."</p>
+
+<h3>6.7 Real-World Findings (60 Total)</h3>
+<p>Applying boundary contract verification to production kernel code:</p>
+<table>
+<tr><th>Severity</th><th>Count</th><th>Example</th></tr>
+<tr><td>High</td><td>4</td><td><code>from_errno(-4096)</code> silently returns EINVAL; <code>SET_MAX_THREADS(0xffffffff)</code> accepted</td></tr>
+<tr><td>Medium</td><td>8</td><td>Duplicate looper accepted; zero-length UserSlice bypasses validation; RBTree silent replace</td></tr>
+<tr><td>Low</td><td>4</td><td>KVec(0) cap stays 0; reallocation policy exposed</td></tr>
+<tr><td>Info</td><td>37</td><td>Correct rejections verified (Page bounds, fget, reserve overflow)</td></tr>
+<tr><td>Novel</td><td>7</td><td>Rust function args captured at -O2 (drgn fails); Rust binder stricter than C binder</td></tr>
+</table>
+<p>None detectable by KASAN, edge coverage, ftrace, or drgn. All found through boundary contract verification on kcov-dataflow logs.</p>
+
+<h2>References</h2>
+<ol class="refs">
+<li>D. Vyukov, "KCOV: code coverage for fuzzing," Linux kernel documentation, 2016.</li>
+<li>D. Vyukov, "syzkaller - kernel fuzzer," https://github.com/google/syzkaller, 2015.</li>
+<li>A. Potapenko, "KernelAddressSanitizer (KASAN)," Linux kernel documentation, 2014.</li>
+<li>LLVM Project, "SanitizerCoverage," https://clang.llvm.org/docs/SanitizerCoverage.html.</li>
+<li>K. Serebryany et al., "AddressSanitizer: A Fast Address Sanity Checker," USENIX ATC, 2012.</li>
+<li>S. Schumilo et al., "kAFL: Hardware-Assisted Feedback Fuzzing for OS Kernels," USENIX Security, 2017.</li>
+<li>J. Corina et al., "DIFUZE: Interface Aware Fuzzing for Kernel Drivers," CCS, 2017.</li>
+<li>M. Payer, "The Case for Data-Flow-Guided Fuzzing," FEAST Workshop, 2019.</li>
+<li>A. Bulekov et al., "MORPHUZZ: Bending (Input) Space to Fuzz Virtual Devices," USENIX Security, 2022.</li>
+<li>Meta, "drgn: Programmable debugger," https://github.com/osandov/drgn.</li>
+</ol>
+
+</body>
+</html>

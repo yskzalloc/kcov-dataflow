@@ -1,0 +1,381 @@
+%% spec-arxiv.tex — Specification & AI Generation Prompt for arXiv Preprint
+%% Title: "State-Aware Kernel Fuzzing via Caller-Callee Data-Flow Tracing and Triage"
+%% Target: arXiv cs.CR (Cryptography and Security) / cs.OS
+%%
+%% This file is NOT compiled directly. It is the specification document that
+%% defines the structure, content requirements, and AI generation prompts for
+%% producing the arXiv version of the paper.
+%%
+%% Usage: Feed sections of this spec to an AI agent to generate paper/arxiv/main.tex
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% METADATA
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% Title: State-Aware Kernel Fuzzing via Caller-Callee Data-Flow Tracing and Triage
+% Authors: [Real names — arXiv is NOT anonymous]
+% Format: US Letter, two-column, 10pt (use article class + geometry)
+% Page limit: None (arXiv), target 14–16 pages including appendix
+% Anonymization: OFF (\anonymousfalse in shared/macros.tex)
+% Repository: Link to actual repo (non-anonymous)
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% STRUCTURAL OUTLINE
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% 1. Abstract (250 words)
+% 2. Introduction (2 pages)
+% 3. Background & Motivation (1.5 pages)
+% 4. System Design & Architecture (3 pages)
+% 5. Implementation (2 pages)
+% 6. Evaluation (3 pages)
+% 7. Discussion & Limitations (1 page)
+% 8. Related Work (1 page)
+% 9. Conclusion (0.5 page)
+% A. Appendix: LLVM Pass Details, Ring Buffer Protocol, Rust FFI
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% SECTION 1: ABSTRACT
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+% PROMPT:
+% Write a 250-word abstract for a systems security paper. The paper presents
+% \toolname{}, an LLVM-based instrumentation framework that extends Linux KCOV
+% with data-flow tracing of function arguments and return values.
+%
+% Key points to cover:
+% - Problem: Edge coverage (trace-pc) is context-blind; it cannot distinguish
+%   execution paths that differ only in argument values (e.g., different ioctl
+%   commands reaching the same switch dispatch). This limits fuzzer exploration
+%   of deep kernel state spaces.
+% - Solution: A compiler pass (-fsanitize-coverage=dataflow-args,dataflow-ret)
+%   that emits callbacks capturing [PC, arg_index, arg_size, pointer, struct
+%   field offsets] at function entry and [PC, ret_size, pointer, field offsets]
+%   at return. A separate /sys/kernel/debug/kcov_dataflow device provides
+%   lock-free per-task ring buffers.
+% - Dual benefit: (1) Fuzzers gain state-aware feedback for mutation guidance.
+%   (2) Security analysts get deterministic argument traces for root-cause
+%   analysis without printf/kprobe overhead.
+% - Results: Captures all arguments including struct field expansion via DWARF
+%   DICompositeType. Verified on C and Rust kernel modules. Zero interference
+%   with existing KCOV/syzkaller. Overhead: <3% on lmbench micro-benchmarks
+%   for instrumented modules.
+% - Rust: Post-compilation pipeline (rustc→opt→llc) enables instrumentation
+%   without modifying rustc, making this the only method to capture Rust kernel
+%   function arguments at runtime (drgn/vmcore fails due to -O2 DWARF elision).
+%
+% Style: Objective, precise. No marketing language. State contributions clearly.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% SECTION 2: INTRODUCTION
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+% PROMPT:
+% Write a 2-page Introduction for the arXiv version. Structure:
+%
+% Paragraph 1 — The Kernel Complexity Problem:
+% - Linux kernel exceeds 30M LOC. Rust integration adds cross-language FFI
+%   boundaries. Complex locking hierarchies (rwsem, mutex, rcu) create deep
+%   state spaces unreachable by coverage-guided fuzzing alone.
+% - Cite: syzkaller found 5000+ bugs but plateaus on stateful subsystems
+%   (ksmbd, io_uring, binder).
+%
+% Paragraph 2 — The Semantic Gap:
+% - KCOV trace-pc reports "which basic blocks executed" but not "with what
+%   values." Two executions of copy_from_user() with different sizes hit the
+%   same edges but have vastly different security implications.
+% - Fuzzers cannot distinguish these without data-flow context.
+%
+% Paragraph 3 — Prior Approaches and Their Limitations:
+% - ftrace/kprobes: Per-function overhead, not scalable to full-kernel fuzzing.
+% - IJON: Manual annotation — doesn't scale to 30M LOC.
+% - Context-sensitive coverage (Angora, CollAFL): Clones call sites but
+%   explodes on polymorphic dispatch (file_operations has 20+ function pointers).
+% - DataFlowSanitizer (DFSan): Byte-level taint — 10-100x overhead, unusable
+%   for kernel fuzzing.
+%
+% Paragraph 4 — Our Approach:
+% - Lightweight LLVM IR pass that captures the data-flow tuple at every
+%   function boundary: \dftuple{\callerid}{\calleeid}{\vec{args}}{\mathit{ret}}
+% - Separate kernel device (/sys/kernel/debug/kcov_dataflow) with zero
+%   interference to existing KCOV.
+% - Works for both C (clang flag) and Rust (post-compilation opt pipeline).
+%
+% Paragraph 5 — Contributions (itemize):
+% \begin{itemize}
+%   \item An LLVM SanitizerCoverage extension that captures function arguments
+%         and return values with automatic struct field expansion via DWARF
+%         metadata, requiring zero source annotation.
+%   \item A lock-free, per-task kernel transport mechanism that operates safely
+%         in NMI/hardirq context without interfering with existing KCOV or
+%         syzkaller infrastructure.
+%   \item A post-compilation pipeline enabling Rust kernel module
+%         instrumentation without modifying rustc.
+%   \item Demonstration of dual-use: fuzzing feedback guidance AND deterministic
+%         root-cause analysis for 5 vulnerability classes (OOB, UAF,
+%         double-free, deep-chain propagation, cross-language FFI).
+% \end{itemize}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% SECTION 3: BACKGROUND & MOTIVATION
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+% PROMPT:
+% Write Section 3 (1.5 pages). Subsections:
+%
+% 3.1 KCOV and Coverage-Guided Kernel Fuzzing
+% - How KCOV works: per-task mmap'd buffer, trace-pc callback, edge hashing.
+% - How syzkaller uses it: corpus minimization, coverage-based prioritization.
+% - Limitation: coverage saturation on stateful protocols.
+%
+% 3.2 The Data-Flow Blind Spot
+% - Concrete example: ksmbd SMB2_CREATE handler. The same edges are hit for
+%   different file access modes, but the security-relevant difference is in the
+%   flags argument to vfs_open(). Coverage cannot distinguish these.
+% - Another example: Rust FFI boundary. A Rust wrapper calls a C function with
+%   a struct pointer. The struct fields determine behavior but are invisible to
+%   edge coverage.
+%
+% 3.3 Threat Model and Assumptions
+% - Attacker: unprivileged user-space process with access to syscall interface.
+% - Goal: trigger memory corruption in kernel via stateful interaction.
+% - Assumption: KASAN/KMSAN detect the corruption once triggered; our tool
+%   provides the path TO triggering it and the data FOR triaging it.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% SECTION 4: SYSTEM DESIGN & ARCHITECTURE
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+% PROMPT:
+% Write Section 4 (3 pages). This is the core technical contribution.
+%
+% 4.1 Overview
+% - Architecture diagram description: Compiler → Kernel Transport → User-space
+%   Consumer (fuzzer or analyst tool).
+% - Data-flow tuple: \dftuple{PC}{arg\_idx \times arg\_size}{ptr}{offsets[]}
+%
+% 4.2 LLVM IR Boundary Instrumentation
+% - Pass location: llvm/lib/Transforms/Instrumentation/SanitizerCoverage.cpp
+% - Trigger: -fsanitize-coverage=dataflow-args,dataflow-ret
+% - For each Function F with DISubprogram metadata:
+%   * Extract parameter types from debug info
+%   * For struct/composite types: walk DICompositeType to get field offsets
+%   * Compute FNV-1a hash of type name → stored at offsets[-1] for dedup
+%   * Insert call to __sanitizer_cov_trace_args(pc, arg_idx, arg_size, ptr,
+%     offsets_ptr, num_fields) at function entry
+%   * Insert call to __sanitizer_cov_trace_ret(pc, ret_size, ptr, offsets_ptr,
+%     num_fields) before each ReturnInst
+% - Handling edge cases: varargs (skip), naked functions (skip), functions
+%   without debug info (skip gracefully), ERR_PTR values (detected via
+%   IS_ERR_VALUE range check in kernel callback)
+%
+% 4.3 Lock-Free Per-Task Ring Buffer
+% - Design: task_struct gains kcov_df_area (u64*), kcov_df_size, kcov_df_seq
+% - Reservation: atomic_add returns slot; if slot >= size, event dropped (no
+%   blocking, no allocation)
+% - Record format: [seq | flags | pc | arg_idx | arg_size | num_fields |
+%   field_values...]
+% - Safety: notrace, __no_sanitize_coverage, noinline. All pointer reads via
+%   copy_from_kernel_nofault(). No printk in data path.
+% - Contexts: Safe in process, softirq, hardirq. NOT safe in NMI (disabled
+%   via in_nmi() check).
+%
+% 4.4 Separate Device Interface
+% - /sys/kernel/debug/kcov_dataflow — completely independent from /sys/kernel/debug/kcov
+% - Ioctl namespace 'd': KCOV_DF_INIT_TRACE (0x80086401), KCOV_DF_ENABLE
+%   (0x6464), KCOV_DF_DISABLE (0x6465)
+% - mmap: user-space maps the ring buffer directly (zero-copy read)
+% - No interference with syzkaller's existing KCOV usage
+%
+% 4.5 Rust Module Support
+% - Challenge: rustc bundles its own LLVM; cannot pass custom -fsanitize flags
+% - Solution: Post-compilation pipeline
+%   1. rustc --emit=llvm-ir (generates .ll with DWARF debug info)
+%   2. opt -passes=sancov-module -sanitizer-coverage-dataflow-args/ret
+%   3. llc -filetype=obj → instrumented .o
+%   4. Normal module linking
+% - Why it works: LLVM IR is language-agnostic; our pass operates identically
+%   on Rust-generated IR as on C-generated IR
+% - Verified: struct field expansion works on Rust #[repr(C)] types
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% SECTION 5: IMPLEMENTATION
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+% PROMPT:
+% Write Section 5 (2 pages). Concrete implementation details.
+%
+% 5.1 LLVM Pass (600 LOC added to SanitizerCoverage.cpp)
+% - InjectTraceForArgs(): iterates Function arguments, resolves DILocalVariable
+%   → DIType → DICompositeType for structs
+% - InjectTraceForRet(): instruments each ReturnInst
+% - Offset array: compile-time constant global [hash, off0, off1, ..., offN]
+% - Integration: cl::opt flags, CodeGenOptions plumbing through clang driver
+%
+% 5.2 Kernel Backend (400 LOC in kernel/kcov.c)
+% - struct kcov_dataflow: owns buffer, size, seq counter, file_operations
+% - __sanitizer_cov_trace_args(): notrace, reads fields via
+%   copy_from_kernel_nofault, writes record atomically
+% - __sanitizer_cov_trace_ret(): same pattern for return values
+% - Per-module enablement: KCOV_DATAFLOW_file.o := y in module Makefile
+%
+% 5.3 Build System Integration
+% - scripts/Makefile.kcov: exports CFLAGS_KCOV_DATAFLOW
+% - scripts/Makefile.lib: applies flags when KCOV_DATAFLOW_$(basetarget).o = y
+% - Rust: manual pipeline via tools/kcov-dataflow/rustc-kcov-dataflow.sh wrapper
+%
+% 5.4 User-Space Consumer
+% - Open /dev/kcov_dataflow, ioctl(KCOV_DF_INIT_TRACE, buf_size)
+% - mmap() the buffer, ioctl(KCOV_DF_ENABLE)
+% - Trigger kernel code path (write to procfs/debugfs trigger)
+% - Read records from mmap'd buffer, ioctl(KCOV_DF_DISABLE)
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% SECTION 6: EVALUATION
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+% PROMPT:
+% Write Section 6 (3 pages). Use our actual experimental data:
+%
+% 6.1 Experimental Setup
+% - Kernel: linux-next 7.1.0-rc4, CONFIG_KASAN=y, CONFIG_KCOV=y,
+%   CONFIG_KCOV_DATAFLOW_ARGS=y, CONFIG_KCOV_DATAFLOW_RET=y, CONFIG_RUST=y
+% - Compiler: Custom clang v23 (LLVM trunk + dataflow pass)
+% - Hardware: virtme-ng (QEMU/KVM), 4 vCPUs, 4GB RAM
+%
+% 6.2 Correctness Verification (Table 1)
+% | Case              | ENTRY captured              | RET captured           | drgn vmcore | KASAN report    |
+% |-------------------|-----------------------------|------------------------|-------------|-----------------|
+% | OOB Write (C)     | struct{0x1337,initial_,15}  | struct{0x1337,_,32}    | ✓ locals    | slab-OOB        |
+% | UAF Write (C)     | struct{0,poison,16}         | struct{0x41414141,_,_} | ✓ locals    | slab-UAF        |
+% | Double-Free (C)   | struct{0,poison,99}         | struct{0xdf00df00,_,_} | ✓ locals    | double-free     |
+% | 10-Deep Chain (C) | offset propagation visible  | commit_write(idx=8)    | ✓ locals    | slab-OOB        |
+% | Rust Module       | struct{0xcafe,0xdeadbeef.., | ret=0xefbed00023456789 | ✗ no locals | N/A             |
+% |                   |  0xa}, mult=3, cookie=0x1.. |                        |             |                 |
+%
+% 6.3 Rust vs C Observability (Table 2)
+% | Method                    | C module | Rust module |
+% |---------------------------|----------|-------------|
+% | kcov_dataflow ENTRY args  | ✓        | ✓           |
+% | kcov_dataflow RET value   | ✓        | ✓           |
+% | drgn vmcore locals        | ✓        | ✗ (-O2)    |
+% | printk (ground truth)     | ✓        | ✓           |
+%
+% 6.4 Performance Overhead
+% - Methodology: lmbench lat_syscall, lat_pipe with/without instrumented module
+% - Result: <3% overhead on instrumented paths (atomic_add + copy_from_kernel_nofault)
+% - Zero overhead on non-instrumented code paths (no callback emitted)
+%
+% 6.5 Triage Capability
+% - For each vulnerability case, show how the ENTRY/RET trace provides:
+%   * The exact argument that was corrupted
+%   * The struct field offset where corruption occurred
+%   * The call chain leading to the corruption
+% - Compare with KASAN alone: KASAN says "OOB at addr X" but not which
+%   argument carried the bad value or which caller passed it
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% SECTION 7: DISCUSSION & LIMITATIONS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+% PROMPT:
+% Write Section 7 (1 page):
+%
+% 7.1 Limitations
+% - Requires debug info (-g) for struct field expansion; without it, only
+%   scalar capture works
+% - Rust pipeline requires manual post-compilation step (not yet integrated
+%   into Kbuild automatically)
+% - Buffer overflow: if kernel code generates more events than buffer size,
+%   events are silently dropped (by design — no blocking)
+% - NMI context: instrumentation disabled (could miss NMI-triggered bugs)
+%
+% 7.2 Fuzzer Integration (Future Work)
+% - Syzkaller executor modification: parse mmap'd kcov_dataflow buffer,
+%   hash argument values into coverage bitmap
+% - Mutation guidance: prioritize inputs that produce novel argument
+%   combinations at deep call sites
+% - Comparison metric: unique (PC, arg_hash) pairs vs unique edges
+%
+% 7.3 Upstream Path
+% - LLVM: submit as RFC to llvm-dev (SanitizerCoverage extension)
+% - Kernel: submit to linux-kernel@vger (KCOV maintainer: Dmitry Vyukov)
+% - Rust: propose -Zsanitizer-coverage=dataflow-args to rustc team
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% SECTION 8: RELATED WORK
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+% PROMPT:
+% Write Section 8 (1 page). Categorize:
+%
+% Coverage-Guided Kernel Fuzzing:
+% - syzkaller [Vyukov 2015], kAFL [Schumilo 2017], DIFUZE [Corina 2017]
+% - Limitation: all use edge/block coverage only
+%
+% Data-Flow Guided Fuzzing:
+% - Payer [FEAST 2019]: argues for data-flow but no kernel implementation
+% - Angora [Chen 2018]: byte-level taint for user-space, 10x overhead
+% - GREYONE [Gan 2020]: taint-guided fuzzing, user-space only
+%
+% Kernel Instrumentation:
+% - KCOV [Vyukov 2016]: edge coverage, our foundation
+% - ftrace/kprobes: dynamic, per-function, high overhead
+% - eBPF: programmable but restricted context, no struct field expansion
+%
+% Post-Mortem Analysis:
+% - drgn [Meta]: vmcore analysis, fails on optimized Rust
+% - crash/kdump: requires full crash, not suitable for silent bugs
+%
+% Our position: First system combining compile-time data-flow instrumentation
+% with a production-grade kernel transport, supporting both C and Rust.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% SECTION 9: CONCLUSION
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+% PROMPT:
+% Write a 0.5-page conclusion. Restate:
+% - We presented \toolname{}, bridging the semantic gap between coverage-guided
+%   fuzzing and data-flow analysis for OS kernels.
+% - Key insight: function boundaries are natural observation points where
+%   data-flow context is both cheap to capture and highly informative.
+% - Demonstrated on 5 vulnerability classes across C and Rust kernel modules.
+% - Open-sourced at \anonrepo{}.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% APPENDIX
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+% A.1 LLVM Pass: Full InjectTraceForArgs Algorithm (pseudocode)
+% A.2 Ring Buffer Record Format (byte-level diagram)
+% A.3 Rust Post-Compilation Pipeline (step-by-step with commands)
+% A.4 Complete ioctl Interface Specification
+% A.5 drgn Verification Script
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% FIGURES
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+% Figure 1: System architecture (Compiler → Kernel → User-space)
+% Figure 2: LLVM pass data flow (Function → DISubprogram → DICompositeType → offsets[])
+% Figure 3: Ring buffer record format
+% Figure 4: Comparison: edge coverage vs data-flow coverage on ksmbd state machine
+% Figure 5: Rust pipeline diagram (rustc → opt → llc → ld)
+% Figure 6: Triage example: OOB write traced through 3 function boundaries
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% REFERENCES (BibTeX keys)
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+% @misc{vyukov2016kcov,  ...}
+% @misc{vyukov2015syzkaller, ...}
+% @inproceedings{schumilo2017kafl, ...}
+% @inproceedings{corina2017difuze, ...}
+% @inproceedings{payer2019dataflow, ...}
+% @inproceedings{serebryany2012asan, ...}
+% @inproceedings{bulekov2022morphuzz, ...}
+% @misc{drgn, ...}
+% @misc{llvmsancov, ...}
+% @inproceedings{chen2018angora, ...}
+% @inproceedings{gan2020greyone, ...}
