@@ -522,16 +522,20 @@ buffer before calling \texttt{ioctl(KCOV\_DF\_DISABLE)}.
 
 \subsection{Experimental Setup}
 
-We evaluate \toolname{} on linux-next 7.1.0-rc4 compiled with our custom
-clang/LLVM~23 (trunk plus the dataflow pass). The kernel is configured with
-\texttt{CONFIG\_KASAN=y}, \texttt{CONFIG\_KCOV=y},
+We evaluate \toolname{} on linux-next 7.1.0-rc5 (next-20260528) compiled with
+our custom clang/LLVM~23 (commit \texttt{05a4e8c}, trunk plus the dataflow
+pass). Rust modules are compiled with rustc~1.98.0-nightly (2026-05-22), built
+against the same LLVM~23 to share the dataflow instrumentation passes. The
+kernel is configured with \texttt{CONFIG\_KASAN=y}, \texttt{CONFIG\_KCOV=y},
 \texttt{CONFIG\_KCOV\_DATAFLOW\_ARGS=y}, \texttt{CONFIG\_KCOV\_DATAFLOW\_RET=y},
-\texttt{CONFIG\_RUST=y}, and \texttt{CONFIG\_DEBUG\_INFO\_DWARF5=y}. Tests run
-under virtme-ng (QEMU/KVM) with 4~vCPUs and 4\,GB RAM.
+\texttt{CONFIG\_RUST=y}, \texttt{CONFIG\_ANDROID\_BINDER\_IPC=y}, and
+\texttt{CONFIG\_SAMPLE\_RUST\_MISC\_DEVICE=y}. Tests run under virtme-ng
+(QEMU/KVM) with 8~vCPUs and 1\,GB RAM.
 
-Five purpose-built kernel modules exercise distinct vulnerability classes:
-out-of-bounds write, use-after-free write, double-free write, 10-level deep
-call chain with taint propagation, and a Rust FFI module.
+Thirteen purpose-built kernel modules (10 Rust, 3 C) exercise distinct
+scenarios: FFI contract violation, silent in-bounds corruption, 10-level deep
+taint propagation, binder ioctl edge cases, and Rust core API boundary
+conditions (KVec, RBTree, Arc, Page, UserSlice, credential subsystem).
 
 \subsection{Correctness Verification}
 
