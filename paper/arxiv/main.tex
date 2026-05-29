@@ -794,20 +794,28 @@ visible through \toolname{}.
 
 \begin{table}[t]
 \centering
-\caption{Findings by severity (60 total).}\label{tab:severity}
+\caption{Audit results by category (60 test cases).}\label{tab:severity}
 \small
-\begin{tabular}{@{}lr@{}}
+\begin{tabular}{@{}lrl@{}}
 \toprule
-\textbf{Severity} & \textbf{Count} \\
+\textbf{Category} & \textbf{Count} & \textbf{Meaning} \\
 \midrule
-High & 4 \\
-Medium & 8 \\
-Low & 4 \\
-Info (correct behavior verified) & 37 \\
-Novel (Rust-specific observability) & 7 \\
+High & 4 & Exploitable bugs (OOB, NULL deref, DoS) \\
+Medium & 8 & Missing validation or semantic issues \\
+Low & 4 & Minor correctness concerns \\
+Info & 37 & Correct behavior confirmed (not bugs) \\
+Novel & 7 & First-ever Rust observability at -O2 \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+\noindent Of the 60 test cases, only 16 (High+Medium+Low) represent actual
+bugs or issues. The remaining 44 are \emph{positive results}: the Info
+category confirms that kernel APIs handle edge cases correctly (e.g.,
+\texttt{KVec::reserve(usize::MAX)} returns \texttt{AllocError},
+\texttt{fget(0xFFFFFFFF)} returns NULL). These are not bugs---they
+demonstrate that \toolname{} is equally valuable for \emph{building
+confidence} in correct implementations as for finding defects.
 
 \section{Why ftrace Cannot Trace Rust Functions}\label{sec:ftrace}
 
