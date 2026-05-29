@@ -236,14 +236,15 @@ memory (e.g., KASAN red zones, freed slabs). Values in the
 \texttt{IS\_ERR\_VALUE} range ($[-4095, -1]$) are detected and skipped.
 
 \paragraph{Record Format.} Each record is a variable-length sequence of
-\texttt{u64} words: \texttt{[seq | flags | pc | arg\_idx | arg\_size |
-num\_fields | field\_val$_0$ | \ldots | field\_val$_N$]}.
+\texttt{u64} words starting with a 3-word header: \texttt{[type\_and\_seq | pc | meta | field\_val$_0$ | \ldots | field\_val$_N$]} (or a single scalar value if \texttt{num\_fields} is 0). Here, \texttt{type\_and\_seq} packs the type marker (\texttt{0xE0000000} for entry, \texttt{0xF0000000} for return) and the 24-bit sequence number. The \texttt{meta} word packs the 8-bit argument index (for entry, 0 for return), 8-bit argument or return size in bytes, and the lower 48 bits of the raw pointer value.
 
 \paragraph{Safety.} Callbacks are marked \texttt{notrace},
 \texttt{\_\_no\_sanitize\_coverage}, and \texttt{noinline} to prevent recursion.
-No \texttt{printk} or allocation occurs in the data path. The implementation is
-safe in process, softirq, and hardirq contexts; NMI is disabled via an
-\texttt{in\_nmi()} early-return check.
+No \texttt{printk} or allocation occurs in the data path. An
+\texttt{in\_task()} guard at the top of the write path rejects all calls from
+non-process contexts (softirq, hardirq, and NMI), eliminating the risk of
+reentrant corruption when a hardware or software interrupt preempts a task
+that is already inside the callback.
 
 \subsection{Separate Device Interface}\label{sec:device}
 
@@ -847,9 +848,18 @@ future work.
 the buffer capacity, events are silently dropped. This is by design---blocking
 would introduce deadlocks in interrupt context.
 
-\paragraph{NMI Context.} Instrumentation is disabled in NMI handlers
-(\texttt{in\_nmi()} check). Bugs triggered exclusively from NMI context would
-be missed.
+\paragraph{Interrupt and NMI Context.} Instrumentation callbacks are
+restricted to process context via an \texttt{in\_task()} check: any call
+originating from a softirq, hardirq, or NMI handler is silently discarded.
+This is stronger than the per-context filtering used by mainline KCOV
+(which allows softirq tracing via \texttt{kcov\_remote\_start}); we chose
+the stricter policy because the dataflow callback performs pointer
+dereferences (\texttt{copy\_from\_kernel\_nofault}) whose latency is
+unacceptable in hard-interrupt paths, and because per-task buffer
+interleaving from nested contexts would corrupt record boundaries.
+Bugs triggered exclusively from interrupt context are therefore invisible
+to \toolname{}; however, such bugs are also unreachable by KCOV-guided
+fuzzers, which exercise kernel code through syscalls in process context.
 
 \paragraph{Fuzzer Integration (Future Work).} Integrating \toolname{} with
 syzkaller requires modifying the executor to parse the \texttt{mmap}'d
@@ -903,7 +913,8 @@ boundaries are natural observation points where data-flow context is both cheap
 to capture and highly informative for both automated exploration and human
 triage.
 
-The system requires no source annotation, operates safely in interrupt context,
+The system requires no source annotation, operates safely in process context
+with explicit rejection of interrupt and NMI callbacks,
 and---uniquely---supports Rust kernel modules via a post-compilation pipeline
 that is the only known method for capturing Rust function arguments at runtime
 given \texttt{-O2} DWARF elision.
@@ -941,7 +952,7 @@ Source code is available at \anonrepo{}.
 
 \section{Ring Buffer Record Format}\label{app:ringbuf}
 
-Each record occupies $6 + N$ quadwords (64-bit each):
+Each record occupies $3 + N$ quadwords (64-bit each), where $N$ is the number of fields (or 1 for scalar values when $N=0$):
 
 \begin{center}
 \small
@@ -949,12 +960,10 @@ Each record occupies $6 + N$ quadwords (64-bit each):
 \hline
 \textbf{Offset} & \textbf{Field} & \textbf{Description} \\
 \hline
-0 & \texttt{seq} & Monotonic sequence number \\
-1 & \texttt{flags} & ENTRY=1, RET=2 \\
-2 & \texttt{pc} & Instrumented function address \\
-3 & \texttt{arg\_idx | arg\_size} & Packed: index (hi32) | size (lo32) \\
-4 & \texttt{num\_fields} & Number of struct fields (0 for scalar) \\
-5..5+N & \texttt{field\_val[0..N]} & Field values read via \texttt{copy\_from\_kernel\_nofault} \\
+0 & \texttt{type\_and\_seq} & Packed: type marker (bits [31:28], \texttt{0xE} for entry, \texttt{0xF} for return) | seq (bits [23:0]) \\
+1 & \texttt{pc} & Instrumented function address \\
+2 & \texttt{meta} & Packed: arg\_idx (bits [63:56], 0 for return) | size (bits [55:48]) | pointer (bits [47:0]) \\
+3..3+N & \texttt{field\_val[0..N]} & Field or scalar values read via \texttt{copy\_from\_kernel\_nofault} \\
 \hline
 \end{tabular}
 \end{center}
