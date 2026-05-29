@@ -1001,45 +1001,10 @@ contracts over all \emph{reachable} states discovered during exploration.
 The structured, machine-readable output (unlike \texttt{printk} logs) makes
 this amenable to automated reasoning tools without manual log parsing.
 
-
-\subsection{Toward Post-Mortem Formal Verification}\label{sec:postmortem}
-
-Classical formal verification proves properties for \emph{all} inputs
-statically, but is intractable for 30M~LOC kernels. We observe that
-\toolname{}'s structured output enables a complementary approach:
-\emph{post-mortem contract verification}---mechanically checking recorded
-execution against formal specifications after the fact.
-
-\paragraph{Key Insight.} The ring buffer produces a complete sequence of
-$\langle \mathit{PC}, \mathit{args}, \mathit{ret} \rangle$ tuples for every
-instrumented function the process executed. This is a \emph{finite execution
-trace} in the formal methods sense---the input to a runtime verification
-monitor.
-
-\paragraph{What This Enables.}
-\begin{enumerate}[nosep]
-  \item \textbf{Offline model checking:} Replay the buffer against temporal
-        logic specifications (e.g., LTL: ``every \texttt{alloc} is eventually
-        followed by \texttt{free} with the same pointer'').
-  \item \textbf{Contract refinement:} Automatically infer likely contracts from
-        many executions (Daikon-style invariant detection on kernel functions),
-        then flag violations in new runs.
-  \item \textbf{Differential verification:} Compare argument/return value
-        distributions across kernel versions to detect semantic regressions
-        that pass all tests but violate implicit contracts.
-\end{enumerate}
-
-\paragraph{Soundness Boundary.} This is \emph{not} full formal verification:
-it only covers paths actually exercised. However, combined with a fuzzer that
-maximizes path diversity, it approaches bounded model checking---verifying
-contracts over all \emph{reachable} states discovered during exploration.
-The structured, machine-readable output (unlike \texttt{printk} logs) makes
-this amenable to automated reasoning tools without manual log parsing.
-
 \section{Discussion \& Limitations}\label{sec:discussion}
 
 \paragraph{Debug Info Requirement.} Full struct field expansion requires
-\texttt{CONFIG_DEBUG_INFO, -g}; without it, only scalar argument values are captured. This is not
+\texttt{CONFIG\_DEBUG\_INFO, -g}; without it, only scalar argument values are captured. This is not
 a practical limitation for kernel fuzzing (KASAN already requires debug info).
 
 \paragraph{Rust Pipeline.} The post-compilation pipeline is not yet integrated
