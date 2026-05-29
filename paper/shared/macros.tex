@@ -1,7 +1,6 @@
 % shared/macros.tex — Identity-masked macros for both arXiv and NDSS versions
-% Toggle anonymization: set \anonymoustrue for NDSS, \anonymousfalse for arXiv
-\newif\ifanonymous
-\anonymoustrue % default: anonymous (NDSS)
+% Toggle anonymization: set \anonymoustrue before \input{macros} for NDSS,
+%                       set \anonymousfalse before \input{macros} for arXiv
 
 \ifanonymous
   \newcommand{\toolname}{{\sc BoundaryFlow}\xspace}

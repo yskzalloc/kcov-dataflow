@@ -19,23 +19,23 @@
 \usepackage{pifont}
 \usepackage{amssymb}
 \usepackage{xspace}
+\usepackage[text=PREPRINT,color=gray!25,scale=3]{draftwatermark}
 \graphicspath{{media/}}
 
 \newcommand{\cmark}{\ding{51}}
 \newcommand{\xmark}{\ding{55}}
+\newif\ifanonymous
+\anonymoustrue
 \input{../shared/macros}
-\anonymousfalse
 
 % Header
 \pagestyle{fancy}
 \thispagestyle{empty}
-\rhead{ \textit{ }}
-\fancyhead[LO]{State-Aware Kernel Fuzzing via Caller-Callee Data-Flow Extraction}
+\renewcommand{\shorttitle}{Per-Task Data-Flow Extraction at Kernel Function Boundaries}
+\renewcommand{\headeright}{A Preprint}
 
 %% Title
-\title{State-Aware Kernel Fuzzing via Caller-Callee Data-Flow Extraction
-\thanks{\textit{\underline{Citation}}:
-\textbf{Authors. State-Aware Kernel Fuzzing via Caller-Callee Data-Flow Extraction. 2026. DOI:000000/11111.}}
+\title{Beyond Edge Coverage: Per-Task Data-Flow Extraction at Kernel Function Boundaries via LLVM
 }
 
 \authorblock
@@ -63,7 +63,7 @@ device (\texttt{/sys/kernel/debug/kcov\_dataflow}) provides lock-free per-task
 ring buffers with no interference to existing KCOV or syzkaller infrastructure.
 We demonstrate dual utility: (1)~fuzzers gain state-aware feedback for mutation
 guidance into value-dependent state transitions, and (2)~security analysts
-obtain deterministic argument traces for root-cause analysis without
+obtain deterministic argument records for root-cause analysis without
 \texttt{printk} or kprobe overhead. A post-compilation pipeline
 (\texttt{rustc}$\to$\texttt{opt}$\to$\texttt{llc}) enables Rust kernel module
 instrumentation without modifying rustc---the only runtime method for capturing
@@ -123,8 +123,8 @@ Our contributions are:
         values with automatic struct field expansion via \texttt{DICompositeType}
         metadata, requiring zero source annotation.
   \item A lock-free, per-task kernel transport mechanism that operates safely in
-        process, softirq, and hardirq contexts without interfering with existing
-        KCOV or syzkaller infrastructure.
+        process context with explicit interrupt rejection, without interfering
+        with existing KCOV or syzkaller infrastructure.
   \item A post-compilation pipeline enabling Rust kernel module instrumentation
         without modifying the Rust compiler toolchain.
   \item Empirical demonstration on five vulnerability classes showing that
@@ -374,13 +374,13 @@ KCOV_DATAFLOW_my_module.o := y
 compiled with dataflow instrumentation automatically. Individual files or
 directories can opt out with \texttt{KCOV\_DATAFLOW\_file.o := n} or
 \texttt{KCOV\_DATAFLOW := n}. This enables whole-kernel argument/return
-tracing for comprehensive fuzzing campaigns.
+extraction for comprehensive fuzzing campaigns.
 
 \paragraph{Optional Inlining Control.}
 \texttt{CONFIG\_KCOV\_DATAFLOW\_NO\_INLINE} (default \texttt{y}) adds
 \texttt{-fno-inline} to instrumented files for complete argument visibility.
 Setting it to \texttt{n} allows global enablement with significantly lower
-overhead---inlined functions lose individual argument traces but the kernel
+overhead---inlined functions lose individual argument records but the kernel
 retains normal performance characteristics and stack depth.
 
 For Rust modules, the wrapper script
@@ -555,18 +555,18 @@ KMSAN                       & +200--400\% & every uninitialized use \\
 \noindent The overhead of \toolname{} falls within the range of a single
 sanitizer (KASAN/KCSAN) and is well below KMSAN. Since fuzzing kernels
 routinely stack multiple sanitizers (KASAN + KCOV + UBSAN), adding dataflow
-tracing fits naturally within the accepted performance budget.
+extraction fits naturally within the accepted performance budget.
 Notably, our measurements already include KASAN---the +133\% is the
 \emph{additional} cost on top of an already-sanitized kernel.
 
 \subsection{Triage Capability}
 
-For each vulnerability case, the ENTRY/RET trace provides:
+For each vulnerability case, the ENTRY/RET record provides:
 (1)~the exact argument that was corrupted (identified by \texttt{arg\_idx} and
 field offset), (2)~the struct field where corruption occurred (visible as a
 value change between ENTRY and RET), and (3)~the call chain leading to
 corruption (via sequence numbers and PC values). The 10-deep chain case
-demonstrates that \toolname{} traces taint propagation across function
+demonstrates that \toolname{} captures taint propagation across function
 boundaries automatically, identifying the root cause
 (\texttt{validate\_header()} missing bounds check) from the dataflow log alone.
 
@@ -649,7 +649,7 @@ rbtree, str\}.rs} with edge-case inputs:
   \item \textbf{RBTree:} Duplicate key insert silently replaces (differs from
         \texttt{std::HashMap::try\_insert} which returns \texttt{Err}).
   \item \textbf{Arc:} \texttt{into\_unique\_or\_drop} with multiple refs
-        correctly drops; refcount operations traced at \texttt{-O2}.
+        correctly drops; refcount operations captured at \texttt{-O2}.
   \item \textbf{Page:} Cross-page boundary reads correctly rejected
         (offset+len $>$ 4096 $\to$ EINVAL).
   \item \textbf{UserSlice:} NULL, kernel-range, and unmapped addresses all
@@ -736,7 +736,7 @@ Per-task isolation & \xmark & \cmark \\
 
 We observe that \toolname{} enables a new form of \emph{runtime verification}
 for kernel functions: verifying pre/postcondition contracts at function
-boundaries without source modification, for any function the traced process
+boundaries without source modification, for any function the monitored process
 executes---including functions the developer did not anticipate.
 
 \subsection{Functions as Black-Box Subsystems}
