@@ -13,6 +13,8 @@
 \usepackage{microtype}
 \usepackage{fancyhdr}
 \usepackage{graphicx}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,fit,calc,decorations.pathreplacing}
 \usepackage{enumitem}
 \usepackage{algorithm}
 \usepackage{algpseudocode}
@@ -164,6 +166,38 @@ function with a struct pointer whose fields determine kernel behavior. Edge
 coverage sees one call site; the struct contents---which control whether a
 privilege check is bypassed---are invisible.
 
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  node distance=0.4cm and 1.2cm,
+  block/.style={rectangle, draw, rounded corners, minimum width=2.2cm, minimum height=0.7cm, font=\footnotesize, align=center},
+  arrow/.style={-{Stealth[length=2mm]}, thick},
+  label/.style={font=\scriptsize\itshape, text=gray}
+]
+% Left side: Edge Coverage
+\node[font=\footnotesize\bfseries] (t1) {Edge Coverage (KCOV)};
+\node[block, below=0.3cm of t1] (a1) {syscall()};
+\node[block, below=of a1] (b1) {vfs\_open()};
+\node[block, below=of b1] (c1) {do\_open()};
+\draw[arrow] (a1) -- (b1);
+\draw[arrow] (b1) -- (c1);
+\node[label, right=0.1cm of b1] {flags=?};
+\node[label, below=0.1cm of c1] {Sees: A$\to$B$\to$C};
+
+% Right side: Data-Flow Extraction
+\node[font=\footnotesize\bfseries, right=3.5cm of t1] (t2) {+ Data-Flow Extraction};
+\node[block, below=0.3cm of t2] (a2) {syscall()};
+\node[block, below=of a2, fill=green!10] (b2) {vfs\_open()};
+\node[block, below=of b2] (c2) {do\_open()};
+\draw[arrow] (a2) -- (b2);
+\draw[arrow] (b2) -- (c2);
+\node[label, right=0.1cm of b2, text=black] {flags=O\_WRONLY|O\_TRUNC};
+\node[label, below=0.1cm of c2] {Sees: A$\to$B(flags=0x241)$\to$C};
+\end{tikzpicture}
+\caption{Edge coverage reports identical paths for different argument values.
+Data-flow extraction reveals the security-relevant difference.}\label{fig:blind-spot}
+\end{figure}
+
 \subsection{Threat Model and Assumptions}
 
 We assume a standard kernel fuzzing threat model: an unprivileged user-space
@@ -186,6 +220,40 @@ per-task ring buffer, and (3)~user-space consumers (fuzzer executors or analyst
 tools) read the buffer via \texttt{mmap()}. The system is activated by the
 compiler flags \texttt{-fsanitize-coverage=dataflow-args,dataflow-ret} and
 requires no source-level annotation.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  node distance=0.5cm and 0.8cm,
+  layer/.style={rectangle, draw, thick, rounded corners, minimum width=6cm, minimum height=1cm, font=\footnotesize, align=center},
+  comp/.style={rectangle, draw, fill=blue!8, minimum width=2.5cm, minimum height=0.6cm, font=\scriptsize, align=center},
+  arrow/.style={-{Stealth[length=2mm]}, thick},
+  label/.style={font=\scriptsize\itshape}
+]
+% Layer 1: Compile time
+\node[layer, fill=yellow!10] (l1) {};
+\node[font=\scriptsize\bfseries, anchor=north west] at (l1.north west) {\quad Compile Time};
+\node[comp] at ([yshift=-0.1cm]l1.center) (pass) {LLVM SanCov Pass\\(dataflow-args/ret)};
+
+% Layer 2: Kernel runtime
+\node[layer, fill=orange!10, below=0.6cm of l1] (l2) {};
+\node[font=\scriptsize\bfseries, anchor=north west] at (l2.north west) {\quad Kernel Runtime};
+\node[comp, fill=orange!15] at ([xshift=-1.2cm,yshift=-0.1cm]l2.center) (cb) {\_\_sanitizer\_cov\\\_trace\_args/ret};
+\node[comp, fill=orange!15] at ([xshift=1.5cm,yshift=-0.1cm]l2.center) (buf) {Per-Task\\Ring Buffer};
+
+% Layer 3: User space
+\node[layer, fill=green!10, below=0.6cm of l2] (l3) {};
+\node[font=\scriptsize\bfseries, anchor=north west] at (l3.north west) {\quad User Space};
+\node[comp, fill=green!15] at ([yshift=-0.1cm]l3.center) (user) {mmap() consumer\\(fuzzer / analyst)};
+
+% Arrows
+\draw[arrow] (pass) -- node[right, label] {inserts callbacks} (cb);
+\draw[arrow] (cb) -- node[above, label] {atomic write} (buf);
+\draw[arrow] (buf) -- node[right, label] {shared memory} (user);
+\end{tikzpicture}
+\caption{Three-layer architecture: compile-time instrumentation, kernel-resident
+lock-free buffer, and user-space consumption via \texttt{mmap()}.}\label{fig:arch}
+\end{figure}
 
 \subsection{LLVM IR Boundary Instrumentation}\label{sec:llvm-pass}
 
@@ -238,6 +306,35 @@ memory (e.g., KASAN red zones, freed slabs). Values in the
 \paragraph{Record Format.} Each record is a variable-length sequence of
 \texttt{u64} words starting with a 3-word header: \texttt{[type\_and\_seq | pc | meta | field\_val$_0$ | \ldots | field\_val$_N$]} (or a single scalar value if \texttt{num\_fields} is 0). Here, \texttt{type\_and\_seq} packs the type marker (\texttt{0xE0000000} for entry, \texttt{0xF0000000} for return) and the 24-bit sequence number. The \texttt{meta} word packs the 8-bit argument index (for entry, 0 for return), 8-bit argument or return size in bytes, and the lower 48 bits of the raw pointer value.
 
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  cell/.style={rectangle, draw, minimum width=1.4cm, minimum height=0.5cm, font=\tiny, align=center},
+  hdr/.style={cell, fill=blue!12},
+  dat/.style={cell, fill=green!12},
+  cnt/.style={cell, fill=gray!15},
+]
+\node[cnt] (c0) {area[0]\\count};
+\node[hdr, right=0pt of c0] (h1) {type|seq};
+\node[hdr, right=0pt of h1] (h2) {PC};
+\node[hdr, right=0pt of h2] (h3) {meta};
+\node[dat, right=0pt of h3] (d1) {field$_0$};
+\node[dat, right=0pt of d1] (d2) {field$_1$};
+\node[cell, right=0pt of d2, draw=none] (dots) {\ldots};
+
+\node[font=\tiny, below=0.2cm of c0] {u64};
+\node[font=\tiny\itshape, above=0.15cm of h1] {3-word header};
+\node[font=\tiny\itshape, above=0.15cm of d1] {N fields};
+
+\draw[decorate, decoration={brace, amplitude=3pt, raise=2pt}]
+  (h1.north west) -- (h3.north east);
+\draw[decorate, decoration={brace, amplitude=3pt, raise=2pt}]
+  (d1.north west) -- (d2.north east);
+\end{tikzpicture}
+\caption{Ring buffer layout: area[0] holds the atomic write counter;
+each record has a 3-word header followed by field values.}\label{fig:record}
+\end{figure}
+
 \paragraph{Safety.} Callbacks are marked \texttt{notrace},
 \texttt{\_\_no\_sanitize\_coverage}, and \texttt{noinline} to prevent recursion.
 No \texttt{printk} or allocation occurs in the data path. An
@@ -276,6 +373,31 @@ on Rust-generated IR. The text format (\texttt{.ll}) avoids bitcode version
 incompatibilities between LLVM~22 and~23. Struct field expansion works on Rust
 \texttt{\#[repr(C)]} types whose \texttt{DICompositeType} metadata is preserved
 by \texttt{rustc -g}.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  node distance=0.3cm and 0.4cm,
+  pstep/.style={rectangle, draw, fill=blue!8, minimum width=1.8cm, minimum height=0.6cm, font=\scriptsize, align=center},
+  arrow/.style={-{Stealth[length=2mm]}, thick},
+  label/.style={font=\tiny\itshape, text=gray}
+]
+\node[pstep] (rustc) {rustc\\--emit=llvm-ir};
+\node[pstep, right=0.6cm of rustc] (opt) {opt\\(our pass)};
+\node[pstep, right=0.6cm of opt] (llc) {llc\\-filetype=obj};
+\node[pstep, right=0.6cm of llc] (ld) {ld\\module.ko};
+
+\draw[arrow] (rustc) -- node[above, label] {.ll} (opt);
+\draw[arrow] (opt) -- node[above, label] {.ll} (llc);
+\draw[arrow] (llc) -- node[above, label] {.o} (ld);
+
+\node[label, below=0.15cm of rustc] {Rust LLVM 22};
+\node[label, below=0.15cm of opt] {Custom LLVM 23};
+\node[label, below=0.15cm of llc] {Custom LLVM 23};
+\end{tikzpicture}
+\caption{Rust post-compilation pipeline: text-format IR avoids bitcode version
+incompatibility between rustc's bundled LLVM and our custom pass.}\label{fig:rust-pipeline}
+\end{figure}
 
 
 \subsection{Pointer Dereference and Dynamic Struct Capture}\label{sec:deref}
