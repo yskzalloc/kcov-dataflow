@@ -27,7 +27,7 @@
 \newcommand{\cmark}{\ding{51}}
 \newcommand{\xmark}{\ding{55}}
 \newif\ifanonymous
-\anonymoustrue
+\anonymousfalse
 \input{../shared/macros}
 
 % Header
@@ -75,7 +75,7 @@ double-free, 10-deep chain propagation, Rust FFI) with $<$3\% overhead on
 instrumented paths.
 \end{abstract}
 
-\keywords{Kernel Fuzzing \and Data-Flow Extraction \and LLVM Instrumentation \and KCOV \and Rust Kernel Modules}
+\keywords{Kernel Fuzzing \and Data-Flow Extraction \and LLVM Instrumentation \and KCOV \and Rust for Linux}
 
 
 \section{Introduction}\label{sec:intro}
@@ -225,31 +225,31 @@ requires no source-level annotation.
 \centering
 \begin{tikzpicture}[
   node distance=0.5cm and 0.8cm,
-  layer/.style={rectangle, draw, thick, rounded corners, minimum width=6cm, minimum height=1cm, font=\footnotesize, align=center},
+  layer/.style={rectangle, draw, thick, rounded corners, minimum width=9cm, minimum height=1.6cm, font=\footnotesize, align=center},
   comp/.style={rectangle, draw, fill=blue!8, minimum width=2.5cm, minimum height=0.6cm, font=\scriptsize, align=center},
   arrow/.style={-{Stealth[length=2mm]}, thick},
   label/.style={font=\scriptsize\itshape}
 ]
 % Layer 1: Compile time
 \node[layer, fill=yellow!10] (l1) {};
-\node[font=\scriptsize\bfseries, anchor=north west] at (l1.north west) {\quad Compile Time};
-\node[comp] at ([yshift=-0.1cm]l1.center) (pass) {LLVM SanCov Pass\\(dataflow-args/ret)};
+\node[font=\scriptsize\bfseries, anchor=north west] at ([xshift=3pt,yshift=-3pt]l1.north west) {Compile Time};
+\node[comp] at ([yshift=-0.2cm]l1.center) (pass) {LLVM SanCov Pass\\(dataflow-args/ret)};
 
 % Layer 2: Kernel runtime
-\node[layer, fill=orange!10, below=0.6cm of l1] (l2) {};
-\node[font=\scriptsize\bfseries, anchor=north west] at (l2.north west) {\quad Kernel Runtime};
-\node[comp, fill=orange!15] at ([xshift=-1.2cm,yshift=-0.1cm]l2.center) (cb) {\_\_sanitizer\_cov\\\_trace\_args/ret};
-\node[comp, fill=orange!15] at ([xshift=1.5cm,yshift=-0.1cm]l2.center) (buf) {Per-Task\\Ring Buffer};
+\node[layer, fill=orange!10, below=0.5cm of l1] (l2) {};
+\node[font=\scriptsize\bfseries, anchor=north west] at ([xshift=3pt,yshift=-3pt]l2.north west) {Kernel Runtime};
+\node[comp, fill=orange!15] at ([xshift=-2cm,yshift=-0.2cm]l2.center) (cb) {\_\_sanitizer\_cov\\\_trace\_args/ret};
+\node[comp, fill=orange!15] at ([xshift=2cm,yshift=-0.2cm]l2.center) (buf) {Per-Task\\Ring Buffer};
 
 % Layer 3: User space
-\node[layer, fill=green!10, below=0.6cm of l2] (l3) {};
-\node[font=\scriptsize\bfseries, anchor=north west] at (l3.north west) {\quad User Space};
-\node[comp, fill=green!15] at ([yshift=-0.1cm]l3.center) (user) {mmap() consumer\\(fuzzer / analyst)};
+\node[layer, fill=green!10, below=0.5cm of l2] (l3) {};
+\node[font=\scriptsize\bfseries, anchor=north west] at ([xshift=3pt,yshift=-3pt]l3.north west) {User Space};
+\node[comp, fill=green!15] at ([yshift=-0.2cm]l3.center) (user) {mmap() consumer\\(fuzzer / analyst)};
 
 % Arrows
-\draw[arrow] (pass) -- node[right, label] {inserts callbacks} (cb);
+\draw[arrow] (pass) -- node[left, label, pos=0.35] {inserts callbacks} (cb);
 \draw[arrow] (cb) -- node[above, label] {atomic write} (buf);
-\draw[arrow] (buf) -- node[right, label] {shared memory} (user);
+\draw[arrow] (buf) -- node[left, label, pos=0.35] {shared memory} (user);
 \end{tikzpicture}
 \caption{Three-layer architecture: compile-time instrumentation, kernel-resident
 lock-free buffer, and user-space consumption via \texttt{mmap()}.}\label{fig:arch}
@@ -543,6 +543,7 @@ cases, matching \texttt{printk} ground truth.
 \centering
 \caption{Correctness verification across five vulnerability classes.}\label{tab:correctness}
 \small
+\resizebox{\textwidth}{!}{%
 \begin{tabular}{@{}lllll@{}}
 \toprule
 \textbf{Case} & \textbf{ENTRY Captured} & \textbf{RET Captured} & \textbf{drgn} & \textbf{KASAN} \\
@@ -553,7 +554,8 @@ Double-Free (C) & \texttt{struct\{id=0, buf=poison(0xff), size=99\}} & \texttt{s
 10-Deep Chain (C) & offset propagation: $16\to48\to24\to8$ & \texttt{commit\_write(idx=8)} OOB & \cmark & slab-out-of-bounds \\
 Rust Module & \texttt{struct\{0xcafe, 0xdeadbeef.., 0xa\}}, mult=3, cookie=0x1111.. & \texttt{ret=0xefbed00023456789} & \xmark & N/A \\
 \bottomrule
-\end{tabular}
+\end{tabular}%
+}
 \end{table*}
 
 \subsection{Information Gain Over Existing Tools}
@@ -622,7 +624,7 @@ boots normally under virtme-ng. Table~\ref{tab:global-perf} quantifies the
 overhead when all kernel objects are instrumented but recording is
 \emph{not} enabled (the common idle state).
 
-\begin{table}[t]
+\begin{table}[htbp]
 \centering
 \caption{Global instrumentation overhead (recording disabled).}\label{tab:global-perf}
 \small
@@ -656,7 +658,7 @@ Table~\ref{tab:sanitizer-cmp} contextualizes \toolname{}'s overhead against
 established kernel sanitizers. All measurements include
 \texttt{CONFIG\_KASAN=y} in the baseline (the standard fuzzing configuration).
 
-\begin{table}[t]
+\begin{table}[htbp]
 \centering
 \caption{Overhead comparison with kernel sanitizers.}\label{tab:sanitizer-cmp}
 \small
@@ -735,6 +737,7 @@ No fuzzer is used---purely deterministic log auditing.
 \centering
 \caption{Critical and High severity findings from real kernel code.}\label{tab:critical}
 \small
+\resizebox{\textwidth}{!}{%
 \begin{tabular}{@{}llll@{}}
 \toprule
 \textbf{Severity} & \textbf{Location} & \textbf{Finding} & \textbf{Impact} \\
@@ -745,7 +748,8 @@ Medium & \texttt{drivers/android/binder/*.rs} & \texttt{BC\_ENTER\_LOOPER} dupli
 Medium & \texttt{rust/kernel/uaccess.rs} & Zero-length \texttt{UserSlice} read succeeds without validating ptr & Address never checked \\
 Medium & \texttt{rust/kernel/rbtree.rs} & Duplicate key insert silently replaces & Callers expecting ``fail if exists'' get wrong behavior \\
 \bottomrule
-\end{tabular}
+\end{tabular}%
+}
 \end{table*}
 
 \paragraph{Error Masking (High).} \texttt{Error::from\_errno(-4096)} is outside
@@ -955,10 +959,44 @@ postcondition violated ($\mathit{ret} = -22 \neq -4096$). Linux RV cannot
 catch this: no tracepoint exists inside \texttt{from\_errno}, and it is a Rust
 function invisible to C-based tracing infrastructure.
 
+\subsection{Toward Post-Mortem Formal Verification}\label{sec:postmortem}
+
+Classical formal verification proves properties for \emph{all} inputs
+statically, but is intractable for 30M~LOC kernels. We observe that
+\toolname{}'s structured output enables a complementary approach:
+\emph{post-mortem contract verification}---mechanically checking recorded
+execution against formal specifications after the fact.
+
+\paragraph{Key Insight.} The ring buffer produces a complete sequence of
+$\langle \mathit{PC}, \mathit{args}, \mathit{ret} \rangle$ tuples for every
+instrumented function the process executed. This is a \emph{finite execution
+trace} in the formal methods sense---the input to a runtime verification
+monitor.
+
+\paragraph{What This Enables.}
+\begin{enumerate}[nosep]
+  \item \textbf{Offline model checking:} Replay the buffer against temporal
+        logic specifications (e.g., LTL: ``every \texttt{alloc} is eventually
+        followed by \texttt{free} with the same pointer'').
+  \item \textbf{Contract refinement:} Automatically infer likely contracts from
+        many executions (Daikon-style invariant detection on kernel functions),
+        then flag violations in new runs.
+  \item \textbf{Differential verification:} Compare argument/return value
+        distributions across kernel versions to detect semantic regressions
+        that pass all tests but violate implicit contracts.
+\end{enumerate}
+
+\paragraph{Soundness Boundary.} This is \emph{not} full formal verification:
+it only covers paths actually exercised. However, combined with a fuzzer that
+maximizes path diversity, it approaches bounded model checking---verifying
+contracts over all \emph{reachable} states discovered during exploration.
+The structured, machine-readable output (unlike \texttt{printk} logs) makes
+this amenable to automated reasoning tools without manual log parsing.
+
 \section{Discussion \& Limitations}\label{sec:discussion}
 
 \paragraph{Debug Info Requirement.} Full struct field expansion requires
-\texttt{-g}; without it, only scalar argument values are captured. This is not
+\texttt{CONFIG_DEBUG_INFO, -g}; without it, only scalar argument values are captured. This is not
 a practical limitation for kernel fuzzing (KASAN already requires debug info).
 
 \paragraph{Rust Pipeline.} The post-compilation pipeline is not yet integrated
@@ -1078,14 +1116,14 @@ Each record occupies $3 + N$ quadwords (64-bit each), where $N$ is the number of
 
 \begin{center}
 \small
-\begin{tabular}{|c|l|l|}
+\begin{tabular}{|c|l|p{10.7cm}|}
 \hline
 \textbf{Offset} & \textbf{Field} & \textbf{Description} \\
 \hline
-0 & \texttt{type\_and\_seq} & Packed: type marker (bits [31:28], \texttt{0xE} for entry, \texttt{0xF} for return) | seq (bits [23:0]) \\
+0 & \texttt{type\_and\_seq} & Type marker (bits [31:28]: \texttt{0xE}=entry, \texttt{0xF}=return) | seq (bits [23:0]) \\
 1 & \texttt{pc} & Instrumented function address \\
-2 & \texttt{meta} & Packed: arg\_idx (bits [63:56], 0 for return) | size (bits [55:48]) | pointer (bits [47:0]) \\
-3..3+N & \texttt{field\_val[0..N]} & Field or scalar values read via \texttt{copy\_from\_kernel\_nofault} \\
+2 & \texttt{meta} & arg\_idx [63:56] | size [55:48] | pointer [47:0] \\
+3..3+N & \texttt{field\_val[0..N]} & Field or scalar values via \texttt{copy\_from\_kernel\_nofault} \\
 \hline
 \end{tabular}
 \end{center}
