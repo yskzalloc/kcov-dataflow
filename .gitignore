@@ -78,3 +78,6 @@ GTAGS
 *.orig
 *~
 \#*#
+
+# pdf
+*.pdf
