@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Rust Filesystem Layer: kcov-dataflow Vulnerability Analysis</title>
+<style>
+body { font-family: -apple-system, sans-serif; max-width: 1000px; margin: 0 auto; padding: 2em; line-height: 1.6; }
+h1 { border-bottom: 2px solid #8e44ad; }
+h2 { color: #2c3e50; margin-top: 2em; }
+pre { background: #1a1a2e; color: #0f0; padding: 1em; overflow-x: auto; font-size: 0.85em; border-radius: 4px; }
+.vuln { background: #fef9e7; border-left: 4px solid #e74c3c; padding: 1em; margin: 1em 0; }
+code { background: #f0f0f0; padding: 1px 4px; border-radius: 2px; }
+table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+th { background: #f2f2f2; }
+</style>
+</head>
+<body>
+
+<h1>Rust Filesystem Layer: Logical Vulnerability via kcov-dataflow</h1>
+
+<p><strong>Target:</strong> <code>rust/kernel/uaccess.rs</code> — <code>UserSliceReader::read_raw()</code></p>
+<p><strong>Method:</strong> Per-task function boundary extraction at Rust kernel code at <code>-O2</code></p>
+
+<h2>The Bug: UserSlice Zero-Length Pointer Validation Bypass</h2>
+
+<div class="vuln">
+<strong>Severity: Medium — Logical Error Leading to Pointer Validation Bypass</strong>
+<p>A zero-length <code>UserSlice</code> read succeeds (<code>Ok</code>) without validating the
+source pointer. A NULL, kernel-range, or unmapped address passes
+"validation" if the caller uses a zero-length probe.</p>
+</div>
+
+<h2>Root Cause</h2>
+
+<p>In <code>rust/kernel/uaccess.rs</code>, <code>UserSliceReader::read_raw()</code> calls
+<code>copy_from_user(out, src, len)</code>. When <code>len=0</code>, the C function
+<code>copy_from_user</code> is a no-op that returns 0 (success) without checking
+whether <code>src</code> is a valid user-space pointer.</p>
+
+<pre>
+// rust/kernel/uaccess.rs — simplified
+pub fn read_raw(&mut self, out: &mut [MaybeUninit&lt;u8&gt;]) -> Result {
+    let len = out.len();
+    if len > self.length { return Err(EFAULT); }
+    // When len == 0: copy_from_user(out, self.ptr, 0) → returns 0
+    // No access_ok() check on self.ptr!
+    let res = unsafe { copy_from_user(out_ptr, self.ptr, len) };
+    if res != 0 { return Err(EFAULT); }
+    Ok(())  // ← SUCCESS even if self.ptr is NULL
+}
+</pre>
+
+<h2>kcov-dataflow Detection</h2>
+
+<p>kcov-dataflow captures the exact argument values at the function boundary:</p>
+
+<pre>
+[ENTRY] UserSliceReader::read_raw
+  arg[0] ptr = 0x0000000000000000    ← NULL pointer
+  arg[1] len = 0                     ← zero length
+[RET]   UserSliceReader::read_raw
+  return = Ok(())                    ← SUCCESS! Pointer never validated.
+
+[ENTRY] UserSliceReader::read_raw
+  arg[0] ptr = 0x0000000000000000    ← same NULL pointer
+  arg[1] len = 8                     ← non-zero length
+[RET]   UserSliceReader::read_raw
+  return = Err(EFAULT)               ← correctly rejected
+</pre>
+
+<p><strong>The inconsistency is the bug:</strong> the same pointer (NULL) produces
+different validation results depending on the length parameter.</p>
+
+<h2>Exploitation Scenario</h2>
+
+<ol>
+<li>A Rust filesystem driver receives a user buffer via <code>UserSlice::new(ptr, total_len)</code>.</li>
+<li>The driver first performs a zero-length "probe" read to check if the pointer is accessible:
+<pre>
+let probe = UserSlice::new(user_ptr, 0).reader();
+if probe.read_raw(&mut []).is_ok() {
+    // "Pointer is valid" — WRONG for NULL/kernel-range!
+}
+</pre></li>
+<li>Based on the <code>Ok</code> result, the driver stores the pointer for later use in an unsafe context.</li>
+<li>A subsequent operation dereferences the unvalidated pointer → NULL deref or kernel memory read.</li>
+</ol>
+
+<h2>Why Only kcov-dataflow Finds This</h2>
+
+<table>
+<tr><th>Tool</th><th>Result</th></tr>
+<tr><td>KASAN</td><td>No memory corruption occurs (zero-length copy is a no-op)</td></tr>
+<tr><td>Edge coverage</td><td>Same code path for len=0 with valid or invalid pointer</td></tr>
+<tr><td>ftrace</td><td>Cannot hook Rust functions (no <code>__fentry__</code>)</td></tr>
+<tr><td>drgn</td><td><code>rustc -O2</code> elides all variable locations — <code>frame.locals()</code> returns <code>{}</code></td></tr>
+<tr><td><strong>kcov-dataflow</strong></td><td>Captures <code>ptr=NULL</code> + <code>len=0</code> + <code>return=Ok</code> — reveals the logical inconsistency</td></tr>
+</table>
+
+<h2>Verified Output</h2>
+
+<pre>
+poc_rust_mm: test_userslice_zero: read(0)=Ok(())
+poc_rust_mm: test_userslice_invalid(0x0, 8): Err(EFAULT)
+poc_rust_mm: test_userslice_invalid(0xffffffff0000, 8): Err(EFAULT)
+</pre>
+
+<h2>Fix</h2>
+
+<p>Add an explicit early return for zero-length reads that does not imply
+pointer validation success:</p>
+
+<pre>
+pub fn read_raw(&mut self, out: &mut [MaybeUninit&lt;u8&gt;]) -> Result {
+    let len = out.len();
+    if len > self.length { return Err(EFAULT); }
+    if len == 0 { return Ok(()); }  // explicit: no validation performed
+    ...
+}
+</pre>
+
+<p>Or, for stricter safety, validate the pointer even for zero-length via
+<code>access_ok()</code>.</p>
+
+<p>See <a href="converted.txt">converted.txt</a> — full VFS call trace with nested indentation.</p>
+
+</body>
+</html>

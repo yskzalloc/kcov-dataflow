@@ -1,0 +1,1 @@
+[    3.184078] poc_rust_mm: version magic '7.1.0-rc5-next-20260528-00006-g45381d910b5a SMP preempt mod_unload ' should be '7.1.0-rc5-next-20260528-00006-g45381d910b5a-dirty SMP preempt mod_unload '

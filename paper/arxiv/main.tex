@@ -346,7 +346,7 @@ that is already inside the callback.
 \subsection{Separate Device Interface}\label{sec:device}
 
 \toolname{} exposes \texttt{/sys/kernel/debug/kcov\_dataflow} as a device
-\emph{completely independent} from the legacy \texttt{/sys/kernel/debug/kcov}.
+\emph{completely independent} from the exsiting \texttt{/sys/kernel/debug/kcov}.
 This ensures zero interference with syzkaller's existing KCOV usage.
 
 The ioctl namespace uses magic~\texttt{'d'}:

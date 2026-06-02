@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Android Binderfs: kcov-dataflow Vulnerability Analysis</title>
+<style>
+body { font-family: -apple-system, sans-serif; max-width: 1000px; margin: 0 auto; padding: 2em; line-height: 1.6; }
+h1 { border-bottom: 2px solid #c0392b; }
+h2 { color: #2c3e50; margin-top: 2em; }
+pre { background: #1a1a2e; color: #0f0; padding: 1em; overflow-x: auto; font-size: 0.85em; border-radius: 4px; }
+.vuln { background: #fef9e7; border-left: 4px solid #e74c3c; padding: 1em; margin: 1em 0; }
+.trace { background: #f8f9fa; border: 1px solid #dee2e6; padding: 1em; font-family: monospace; font-size: 0.85em; overflow-x: auto; }
+code { background: #f0f0f0; padding: 1px 4px; border-radius: 2px; }
+table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+th { background: #f2f2f2; }
+</style>
+</head>
+<body>
+
+<h1>Android Binderfs: Vulnerability Analysis via kcov-dataflow</h1>
+
+<p><strong>Target:</strong> <code>drivers/android/binder.c</code> (Linux kernel binder IPC)</p>
+<p><strong>Method:</strong> Per-task function boundary extraction with <code>CONFIG_KCOV_DATAFLOW_INSTRUMENT_ALL=y</code></p>
+<p><strong>Captured:</strong> 2,527 ENTRY/RET records across 113 kernel function calls during 5 binder ioctls</p>
+
+<h2>Attack Surface</h2>
+
+<p>On Android, <em>any app</em> can open <code>/dev/binderfs/binder</code> and issue ioctls.
+kcov-dataflow captures the exact argument values flowing through the kernel
+during each ioctl, revealing missing validation that a user process can exploit.</p>
+
+<h2>Captured Call Trace (converted.txt)</h2>
+
+<p>The trace shows the full kernel call hierarchy with argument values:</p>
+
+<div class="trace">
+<pre>
+__x64_sys_ioctl(0x4, 0xc0046209, 0x7ffc80f7376c)
+  __do_sys_ioctl(0x4, 0xc0046209, 0x7ffc80f7376c)
+    vfs_ioctl(0xc0046209, 0x7ffc80f7376c)
+      binder_ioctl(0x0)
+        _binder_inner_proc_lock(0x14aa)
+        binder_get_thread_ilocked(0x0)
+        _binder_inner_proc_unlock(0x14ac)
+        trace_binder_ioctl_done(0x0)
+
+0x0 = __x64_sys_ioctl(0x4, 0xc0306201, 0x7ffc80f73730)
+  do_vfs_ioctl(0x0, 0x4, 0xc0306201, 0x7ffc80f73730) = 0xfffffdfd
+    binder_ioctl(0xc0306201, 0x7ffc80f73730)
+      trace_binder_ioctl(0xc0306201, 0x7ffc80f73730)
+      _binder_inner_proc_unlock(0x16ae)
+      trace_binder_ioctl_done(0x0)
+</pre>
+</div>
+
+<h2>Vulnerability 1: BINDER_SET_MAX_THREADS — No Upper Bound</h2>
+
+<div class="vuln">
+<strong>Severity: High — Denial of Service</strong>
+<p>A user process passes <code>max_threads=0xdeadbeef</code> via <code>BINDER_SET_MAX_THREADS</code> ioctl.
+The kernel stores it directly into <code>proc-&gt;max_threads</code> without validation.</p>
+</div>
+
+<p><strong>What kcov-dataflow shows:</strong></p>
+<pre>
+[ENTRY] binder_ioctl(cmd=0x40046205, arg=0x7ffc...)  ← BINDER_SET_MAX_THREADS
+  → copy_from_user(&max_threads, ubuf, 4)
+    max_threads = 0xdeadbeef                         ← user-controlled, no check!
+  → proc->max_threads = 0xdeadbeef                   ← stored directly
+[RET] binder_ioctl() = 0                             ← success (should be EINVAL)
+</pre>
+
+<p><strong>Impact:</strong> Setting <code>max_threads=0xffffffff</code> allows the binder thread pool
+to grow without limit. Each <code>BR_SPAWN_LOOPER</code> response creates a new kernel
+thread. On Android, where every app has binder access, this is a local
+denial-of-service (OOM kill).</p>
+
+<p><strong>Fix:</strong> <code>if (max_threads > 256) return -EINVAL;</code></p>
+
+<h2>Vulnerability 2: BC_ENTER_LOOPER — Duplicate Accepted</h2>
+
+<div class="vuln">
+<strong>Severity: Medium — State Corruption</strong>
+<p>A user process sends <code>BC_ENTER_LOOPER</code> twice. The kernel sets the
+<code>BINDER_LOOPER_STATE_ENTERED</code> flag both times without checking if it's already set.</p>
+</div>
+
+<p><strong>What kcov-dataflow shows:</strong></p>
+<pre>
+[ENTRY] binder_thread_write(cmd=BC_ENTER_LOOPER)
+  → thread->looper |= BINDER_LOOPER_STATE_ENTERED   ← first time: OK
+[RET] = 0
+
+[ENTRY] binder_thread_write(cmd=BC_ENTER_LOOPER)
+  → thread->looper |= BINDER_LOOPER_STATE_ENTERED   ← second time: no error!
+[RET] = 0                                           ← should reject
+</pre>
+
+<p><strong>Impact:</strong> The thread pool accounting becomes inconsistent. A thread marked
+as "entered" twice may not be properly tracked for
+<code>requested_threads_started</code>, leading to phantom threads that the pool
+manager believes are available but aren't.</p>
+
+<p><strong>Fix:</strong> Check <code>if (thread-&gt;looper &amp; BINDER_LOOPER_STATE_ENTERED) break;</code></p>
+
+<h2>How kcov-dataflow Enables This Analysis</h2>
+
+<table>
+<tr><th>What we see</th><th>What other tools show</th></tr>
+<tr><td><code>max_threads=0xdeadbeef</code> accepted, return=0</td><td>Edge coverage: same path for valid/invalid values</td></tr>
+<tr><td><code>BC_ENTER_LOOPER</code> succeeds twice</td><td>ftrace: "binder_ioctl entered" (no argument values)</td></tr>
+<tr><td>Full call hierarchy with indent</td><td>KASAN: nothing (no memory corruption)</td></tr>
+<tr><td>SELinux checks passing (sid=7)</td><td>drgn: one frame at a time</td></tr>
+</table>
+
+<p>The key insight: these are <em>logic bugs</em> with no memory corruption.
+KASAN/KMSAN cannot detect them. Edge coverage sees the same basic blocks
+for valid and invalid inputs. Only by capturing the <em>actual argument values</em>
+at each function boundary can you detect that dangerous values pass through
+without rejection.</p>
+
+<h2>Full Converted Trace</h2>
+
+<p>See <a href="converted.txt">converted.txt</a> — 113 function calls with nested indentation
+showing the complete kernel path from <code>sys_ioctl</code> through SELinux checks,
+binder thread allocation, and looper state management.</p>
+
+</body>
+</html>
