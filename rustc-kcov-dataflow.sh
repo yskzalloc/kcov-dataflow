@@ -35,8 +35,8 @@ if echo "$@" | grep -q "\-\-emit.*obj\|--emit.*link"; then
             # Run our opt with sancov dataflow
             $OPT -passes='sancov-module' \
                 -sanitizer-coverage-level=3 \
-                -sanitizer-coverage-dataflow-args \
-                -sanitizer-coverage-dataflow-ret \
+                -sanitizer-coverage-trace-args \
+                -sanitizer-coverage-trace-ret \
                 -S "$TMPIR" -o "$TMPINST" 2>/dev/null
 
             if [ $? -eq 0 ]; then

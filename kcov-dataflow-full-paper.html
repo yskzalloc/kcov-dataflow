@@ -43,7 +43,7 @@ ol.refs li{margin-bottom:0.3rem}
 
 <h3>1.1 Contributions</h3>
 <ul>
-<li>An LLVM instrumentation pass (<code>-fsanitize-coverage=dataflow-args,dataflow-ret</code>) that extracts struct field offsets from DebugInfo</li>
+<li>An LLVM instrumentation pass (<code>-fsanitize-coverage=trace-args,trace-ret</code>) that extracts struct field offsets from DebugInfo</li>
 <li>A kernel backend with fault-tolerant field dereferencing, atomic TLV buffer, and a dedicated debugfs device independent from legacy KCOV</li>
 <li>A kernel build system integration (<code>KCOV_DATAFLOW</code>) enabling tracing without manual compiler flags</li>
 <li>Empirical demonstration on OOB write, UAF write, double-free write, and a 10-deep nested call chain</li>
@@ -102,8 +102,8 @@ ol.refs li{margin-bottom:0.3rem}
 ┌──────────────────────────▼──────────────────────────────────┐
 │              Build System (Makefile.kcov)                    │
 │  • KCOV_DATAFLOW_file.o := y                                │
-│  • Auto-injects: -fsanitize-coverage=dataflow-args,         │
-│    dataflow-ret -g -fno-inline                              │
+│  • Auto-injects: -fsanitize-coverage=trace-args,         │
+│    trace-ret -g -fno-inline                              │
 └─────────────────────────────────────────────────────────────┘
 </pre>
 

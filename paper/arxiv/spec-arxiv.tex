@@ -48,7 +48,7 @@
 %   execution paths that differ only in argument values (e.g., different ioctl
 %   commands reaching the same switch dispatch). This limits fuzzer exploration
 %   of deep kernel state spaces.
-% - Solution: A compiler pass (-fsanitize-coverage=dataflow-args,dataflow-ret)
+% - Solution: A compiler pass (-fsanitize-coverage=trace-args,trace-ret)
 %   that emits callbacks capturing [PC, arg_index, arg_size, pointer, struct
 %   field offsets] at function entry and [PC, ret_size, pointer, field offsets]
 %   at return. A separate /sys/kernel/debug/kcov_dataflow device provides
@@ -156,7 +156,7 @@
 %
 % 4.2 LLVM IR Boundary Instrumentation
 % - Pass location: llvm/lib/Transforms/Instrumentation/SanitizerCoverage.cpp
-% - Trigger: -fsanitize-coverage=dataflow-args,dataflow-ret
+% - Trigger: -fsanitize-coverage=trace-args,trace-ret
 % - For each Function F with DISubprogram metadata:
 %   * Extract parameter types from debug info
 %   * For struct/composite types: walk DICompositeType to get field offsets
@@ -191,7 +191,7 @@
 % - Challenge: rustc bundles its own LLVM; cannot pass custom -fsanitize flags
 % - Solution: Post-compilation pipeline
 %   1. rustc --emit=llvm-ir (generates .ll with DWARF debug info)
-%   2. opt -passes=sancov-module -sanitizer-coverage-dataflow-args/ret
+%   2. opt -passes=sancov-module -sanitizer-coverage-trace-args/ret
 %   3. llc -filetype=obj → instrumented .o
 %   4. Normal module linking
 % - Why it works: LLVM IR is language-agnostic; our pass operates identically
@@ -300,7 +300,7 @@
 % 7.3 Upstream Path
 % - LLVM: submit as RFC to llvm-dev (SanitizerCoverage extension)
 % - Kernel: submit to linux-kernel@vger (KCOV maintainer: Dmitry Vyukov)
-% - Rust: propose -Zsanitizer-coverage=dataflow-args to rustc team
+% - Rust: propose -Zsanitizer-coverage=trace-args to rustc team
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% SECTION 8: RELATED WORK

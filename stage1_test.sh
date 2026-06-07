@@ -10,7 +10,7 @@ echo "=== Stage 1: LLVM Instrumentation Verification ==="
 # Step 1: Generate IR with trace-args and trace-ret
 echo "[1/4] Generating IR..."
 $CLANG -S -emit-llvm -g -O0 -fno-inline \
-  -fsanitize-coverage=dataflow-args,dataflow-ret \
+  -fsanitize-coverage=trace-args,trace-ret \
   test_target.c -o test_target.ll
 
 # Step 2: Verify callbacks are present in IR
@@ -36,7 +36,7 @@ fi
 # Step 3: Compile and link with mock
 echo "[3/4] Compiling mock binary..."
 $CLANG -g -O0 -fno-inline \
-  -fsanitize-coverage=dataflow-args,dataflow-ret \
+  -fsanitize-coverage=trace-args,trace-ret \
   test_target.c mock_kcov.c -o test_mock_binary
 
 # Step 4: Run and verify output

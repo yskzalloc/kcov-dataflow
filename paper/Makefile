@@ -1,20 +1,15 @@
-.PHONY: all arxiv ndss view-arxiv view-ndss clean
+.PHONY: all arxiv view clean zip
 
-all: arxiv ndss
+all: arxiv
 
 arxiv:
 	cd arxiv && latexmk -pdf -interaction=nonstopmode main.tex
 
-ndss:
-	cd ndss && latexmk -pdf -interaction=nonstopmode main.tex
-
-# Live-preview (auto-recompile on save, opens PDF viewer)
-view-arxiv:
+view:
 	cd arxiv && latexmk -pdf -pvc main.tex
 
-view-ndss:
-	cd ndss && latexmk -pdf -pvc main.tex
+zip: arxiv
+	./tex.sh
 
 clean:
 	cd arxiv && latexmk -C 2>/dev/null; true
-	cd ndss && latexmk -C 2>/dev/null; true

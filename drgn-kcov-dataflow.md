@@ -3,7 +3,7 @@
 ## Environment
 
 - **Compiler**: Custom LLVM/Clang v23 (`/home/debian-sid/llvm-project/build/bin/clang`)
-- **Flags**: `-fsanitize-coverage=dataflow-args,dataflow-ret -g -fno-inline` (auto-injected via `KCOV_DATAFLOW`)
+- **Flags**: `-fsanitize-coverage=trace-args,trace-ret -g -fno-inline` (auto-injected via `KCOV_DATAFLOW`)
 - **Kernel**: linux-next 7.1.0-rc4 with `CONFIG_KCOV_DATAFLOW_ARGS=y`, `CONFIG_KCOV_DATAFLOW_RET=y`
 - **Interface**: `/sys/kernel/debug/kcov_dataflow` (separate from legacy kcov)
 

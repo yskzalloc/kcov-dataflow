@@ -27,7 +27,7 @@ tr:nth-child(even){background:#f3f4f6}
 
 <h2>1. Environment</h2>
 <ul>
-<li><strong>Compiler:</strong> <code>/home/debian-sid/llvm-project/build/bin/clang</code> (v23, custom with <code>-fsanitize-coverage=dataflow-args,dataflow-ret</code>)</li>
+<li><strong>Compiler:</strong> <code>/home/debian-sid/llvm-project/build/bin/clang</code> (v23, custom with <code>-fsanitize-coverage=trace-args,trace-ret</code>)</li>
 <li><strong>libclang:</strong> <code>/home/debian-sid/llvm-project/build/lib/libclang.so.23</code></li>
 <li><strong>Kernel:</strong> linux-next 7.1.0-rc4 with <code>CONFIG_KCOV_DATAFLOW_ARGS=y</code>, <code>CONFIG_KCOV_DATAFLOW_RET=y</code></li>
 <li><strong>Interface:</strong> <code>/sys/kernel/debug/kcov_dataflow</code> (separate from legacy <code>/sys/kernel/debug/kcov</code>)</li>

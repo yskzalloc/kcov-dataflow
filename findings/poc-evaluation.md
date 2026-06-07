@@ -2,7 +2,7 @@
 ## Using Custom LLVM 23, Extended kcov-dataflow, and Custom rustc 1.98
 
 **Toolchain:**
-- Custom clang/LLVM 23: `/home/debian-sid/llvm-project/build/bin/clang` (with `dataflow-args`/`dataflow-ret` pass in SanitizerCoverage.cpp)
+- Custom clang/LLVM 23: `/home/debian-sid/llvm-project/build/bin/clang` (with `trace-args`/`trace-ret` pass in SanitizerCoverage.cpp)
 - Custom rustc 1.98.0-nightly: `/home/debian-sid/rust/build/x86_64-unknown-linux-gnu/stage1/bin/rustc` (linked against our LLVM 23)
 - Kernel: linux-next 7.1.0-rc4 with `CONFIG_KCOV_DATAFLOW_ARGS=y`, `CONFIG_KCOV_DATAFLOW_RET=y`
 - Device: `/sys/kernel/debug/kcov_dataflow` (separate from legacy KCOV)
@@ -39,8 +39,8 @@ The kernel build system (via our modified `scripts/Makefile.kcov`) passes:
 ```
 -Cpasses=sancov-module
 -Cllvm-args=-sanitizer-coverage-level=3
--Cllvm-args=-sanitizer-coverage-dataflow-args
--Cllvm-args=-sanitizer-coverage-dataflow-ret
+-Cllvm-args=-sanitizer-coverage-trace-args
+-Cllvm-args=-sanitizer-coverage-trace-ret
 -Cdebuginfo=2
 ```
 
@@ -136,7 +136,7 @@ KCOV_DATAFLOW_io_uring.o := y
 
 Compile with our custom clang:
 ```
-clang -fsanitize-coverage=dataflow-args,dataflow-ret -g -fno-inline
+clang -fsanitize-coverage=trace-args,trace-ret -g -fno-inline
 ```
 
 ### Case Study: Flag Field Mutation in io_req_set_rsrc_node()

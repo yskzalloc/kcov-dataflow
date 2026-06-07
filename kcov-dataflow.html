@@ -35,8 +35,8 @@ tr:nth-child(even){background:#f5f3ff}
 <h3>2.1 New Compiler Flags</h3>
 <table>
 <tr><th>Flag</th><th>Description</th></tr>
-<tr><td><code>-fsanitize-coverage=dataflow-args</code></td><td>Insert <code>__sanitizer_cov_trace_args()</code> at function entry for each argument</td></tr>
-<tr><td><code>-fsanitize-coverage=dataflow-ret</code></td><td>Insert <code>__sanitizer_cov_trace_ret()</code> before each return instruction</td></tr>
+<tr><td><code>-fsanitize-coverage=trace-args</code></td><td>Insert <code>__sanitizer_cov_trace_args()</code> at function entry for each argument</td></tr>
+<tr><td><code>-fsanitize-coverage=trace-ret</code></td><td>Insert <code>__sanitizer_cov_trace_ret()</code> before each return instruction</td></tr>
 </table>
 <p>Both imply <code>-fsanitize-coverage-type=3</code> (edge coverage) when used alone.</p>
 
@@ -147,7 +147,7 @@ struct task_struct {
 <h3>4.1 Kernel Makefile Infrastructure</h3>
 <pre>
 # scripts/Makefile.kcov
-export CFLAGS_KCOV_DATAFLOW := -fsanitize-coverage=dataflow-args,dataflow-ret -g -fno-inline
+export CFLAGS_KCOV_DATAFLOW := -fsanitize-coverage=trace-args,trace-ret -g -fno-inline
 
 # scripts/Makefile.lib
 _c_flags += $(if $(patsubst n%,,$(KCOV_DATAFLOW_$(target-stem).o)$(KCOV_DATAFLOW)), \
