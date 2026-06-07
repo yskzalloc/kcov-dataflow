@@ -83,7 +83,7 @@ obj-m := my_module.o
 KCOV_DATAFLOW_my_module.o := y
 ```
 
-The build system auto-injects `-fsanitize-coverage=dataflow-args,dataflow-ret -g`.
+The build system auto-injects `-fsanitize-coverage=trace-args,trace-ret -g`.
 
 ## Kernel Config
 
