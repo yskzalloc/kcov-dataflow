@@ -63,7 +63,7 @@ jobs:
         fetch-depth: 1
 
     - name: Clone rust submodule (shallow)
-      run: git submodule update --init --depth 1 rust
+      run: git submodule update --init --depth 1 rust llvm-project
 
     - name: Download custom LLVM
       uses: actions/download-artifact@v4
