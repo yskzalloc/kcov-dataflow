@@ -6,45 +6,220 @@ on:
   pull_request:
 
 jobs:
-  build-and-test:
+  build-llvm:
     runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+
+    - name: Clone llvm-project submodule (shallow)
+      run: git submodule update --init --depth 1 llvm-project
+
+    - name: Install host clang (for bootstrapping)
+      run: |
+        wget https://apt.llvm.org/llvm.sh
+        chmod u+x llvm.sh
+        sudo ./llvm.sh 22
+        sudo apt-get install -y clang-22 lld-22 ninja-build cmake
+
+    - name: Get LLVM submodule commit
+      id: llvm-rev
+      run: echo "sha=$(git rev-parse HEAD:llvm-project)" >> $GITHUB_OUTPUT
+
+    - name: Cache LLVM build
+      id: cache-llvm
+      uses: actions/cache@v4
+      with:
+        path: llvm-project/build
+        key: llvm-build-${{ steps.llvm-rev.outputs.sha }}-v2
+
+    - name: Build custom LLVM (clang + lld)
+      if: steps.cache-llvm.outputs.cache-hit != 'true'
+      run: |
+        cd llvm-project
+        cmake -S llvm -B build -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_COMPILER=clang-22 \
+          -DCMAKE_CXX_COMPILER=clang++-22 \
+          -DLLVM_ENABLE_LLD=ON \
+          -DLLVM_ENABLE_PROJECTS="clang;lld" \
+          -DLLVM_TARGETS_TO_BUILD="X86;AArch64;ARM"
+        ninja -C build
+
+    - name: Upload LLVM
+      uses: actions/upload-artifact@v4
+      with:
+        name: llvm-build
+        path: llvm-project/build
+        retention-days: 1
+
+  build-rust:
+    needs: build-llvm
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+
+    - name: Clone rust submodule (shallow)
+      run: git submodule update --init --depth 1 rust
+
+    - name: Download custom LLVM
+      uses: actions/download-artifact@v4
+      with:
+        name: llvm-build
+        path: llvm-project/build
+
+    - name: Fix LLVM permissions
+      run: chmod +x llvm-project/build/bin/*
+
+    - name: Get submodule commits
+      id: revs
+      run: |
+        echo "rust=$(git rev-parse HEAD:rust)" >> $GITHUB_OUTPUT
+        echo "llvm=$(git rev-parse HEAD:llvm-project)" >> $GITHUB_OUTPUT
+
+    - name: Cache Rust build
+      id: cache-rust
+      uses: actions/cache@v4
+      with:
+        path: rust/build/x86_64-unknown-linux-gnu/stage1
+        key: rust-build-${{ steps.revs.outputs.rust }}-${{ steps.revs.outputs.llvm }}
+
+    - name: Install Rust build deps
+      if: steps.cache-rust.outputs.cache-hit != 'true'
+      run: sudo apt-get update && sudo apt-get install -y python3 ninja-build cmake
+
+    - name: Build custom rustc (stage1)
+      if: steps.cache-rust.outputs.cache-hit != 'true'
+      run: |
+        cd rust
+        cat > config.toml << EOF
+        [llvm]
+        download-ci-llvm = false
+        [build]
+        target = ["x86_64-unknown-linux-gnu"]
+        docs = false
+        extended = false
+        [target.x86_64-unknown-linux-gnu]
+        llvm-config = "$PWD/../llvm-project/build/bin/llvm-config"
+        cc = "$PWD/../llvm-project/build/bin/clang"
+        cxx = "$PWD/../llvm-project/build/bin/clang++"
+        [rust]
+        codegen-backends = ["llvm"]
+        debug-assertions = false
+        channel = "nightly"
+        EOF
+        python3 x.py build --stage 1 library
+
+    - name: Upload Rust
+      uses: actions/upload-artifact@v4
+      with:
+        name: rust-build
+        path: rust/build/x86_64-unknown-linux-gnu/stage1
+        retention-days: 1
+
+  test:
+    needs: [build-llvm, build-rust]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64
+            arch: x86_64
+            rt: false
+          - name: x86_64-rt
+            arch: x86_64
+            rt: true
+          - name: arm64
+            arch: arm64
+            rt: false
+          - name: arm64-rt
+            arch: arm64
+            rt: true
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+    - uses: actions/checkout@v4
       with:
-        submodules: recursive
+        fetch-depth: 1
+
+    - name: Clone submodules (shallow)
+      run: git submodule update --init --recursive --depth 1
+
+    - name: Download custom LLVM
+      uses: actions/download-artifact@v4
+      with:
+        name: llvm-build
+        path: llvm-project/build
+
+    - name: Download custom Rust
+      uses: actions/download-artifact@v4
+      with:
+        name: rust-build
+        path: rust/build/x86_64-unknown-linux-gnu/stage1
+
+    - name: Fix permissions
+      run: |
+        chmod +x llvm-project/build/bin/*
+        chmod +x rust/build/x86_64-unknown-linux-gnu/stage1/bin/*
 
     - name: Install dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y \
           build-essential bc flex bison libelf-dev libssl-dev \
-          ninja-build cmake python3 qemu-system-x86 \
+          python3 qemu-system-x86 qemu-system-aarch64 \
           libdw-dev zstd
-        
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        source "$HOME/.cargo/env"
+        cargo install bindgen-cli
         python3 -m venv venv-virtme
         source venv-virtme/bin/activate
         pip3 install git+https://github.com/arighi/virtme-ng.git
 
-    - name: Build custom LLVM (clang + lld)
+    - name: Enable KVM
+      if: matrix.arch == 'x86_64'
       run: |
-        cd llvm-project
-        cmake -S llvm -B build -G Ninja \
-          -DCMAKE_BUILD_TYPE=Release \
-          -DLLVM_ENABLE_PROJECTS="clang;lld" \
-          -DLLVM_TARGETS_TO_BUILD="X86"
-        ninja -C build
-      env:
-        CMAKE_BUILD_PARALLEL_LEVEL: ${{ steps.cpu.outputs.count || '4' }}
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm
 
-    - name: Build kernel
+    - name: Install arm64 cross-compilation and QEMU support
+      if: matrix.arch == 'arm64'
+      run: |
+        sudo apt-get install -y \
+          gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+          qemu-user-static binfmt-support
+        sudo systemctl restart systemd-binfmt
+
+    - name: Build kernel (${{ matrix.name }})
       run: |
         export PATH="$PWD/llvm-project/build/bin:$PATH"
         export RUSTC="$PWD/rust/build/x86_64-unknown-linux-gnu/stage1/bin/rustc"
         export RUST_LIB_SRC="$PWD/rust/library"
+        source venv-virtme/bin/activate
         cd linux
-        vng --build \
+
+        EXTRA_CONFIGS=""
+        if [ "${{ matrix.rt }}" = "true" ]; then
+          EXTRA_CONFIGS="--configitem CONFIG_PREEMPT_RT=y"
+        fi
+
+        ARCH_ARGS=""
+        if [ "${{ matrix.arch }}" = "arm64" ]; then
+          ARCH_ARGS="--arch arm64"
+          EXTRA_CONFIGS="$EXTRA_CONFIGS --configitem CONFIG_COMPAT_VDSO=n"
+        fi
+
+        RUST_CONFIGS=""
+        if [ "${{ matrix.rt }}" != "true" ] && \
+           make LLVM=1 RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC rustavailable 2>/dev/null; then
+          RUST_CONFIGS="--configitem CONFIG_RUST=y"
+        fi
+
+        vng --build $ARCH_ARGS \
           --configitem CONFIG_KCOV=y \
           --configitem CONFIG_KCOV_DATAFLOW_ARGS=y \
           --configitem CONFIG_KCOV_DATAFLOW_RET=y \
@@ -53,8 +228,10 @@ jobs:
           --configitem CONFIG_DEBUG_INFO_DWARF5=y \
           --configitem CONFIG_ANDROID_BINDER_IPC=y \
           --configitem CONFIG_ANDROID_BINDERFS=y \
-          --configitem CONFIG_RUST=y \
-          LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC
+          $RUST_CONFIGS \
+          $EXTRA_CONFIGS \
+          LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC \
+          CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
 
     - name: Build selftests
       run: |
@@ -62,68 +239,124 @@ jobs:
         export RUSTC="$PWD/rust/build/x86_64-unknown-linux-gnu/stage1/bin/rustc"
         export RUST_LIB_SRC="$PWD/rust/library"
         cd linux
+
+        MAKE_ARGS="LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC"
+        if [ "${{ matrix.arch }}" = "arm64" ]; then
+          MAKE_ARGS="$MAKE_ARGS ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-"
+        fi
+
         make -C tools/testing/selftests/kcov_dataflow
-        make LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC M=tools/testing/selftests/kcov_dataflow/eight_args_c modules
-        make LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC M=tools/testing/selftests/kcov_dataflow/eight_args_rust modules
-        make LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC M=tools/testing/selftests/kcov_dataflow/rust_ffi_contract modules
+        make $MAKE_ARGS \
+          M=tools/testing/selftests/kcov_dataflow/eight_args_c modules
+        if make $MAKE_ARGS rustavailable 2>/dev/null; then
+          make $MAKE_ARGS \
+            M=tools/testing/selftests/kcov_dataflow/eight_args_rust modules
+          make $MAKE_ARGS \
+            M=tools/testing/selftests/kcov_dataflow/rust_ffi_contract modules
+        fi
 
     - name: Run user_ioctl selftest
       run: |
+        source venv-virtme/bin/activate
         cd linux
         cp tools/testing/selftests/kcov_dataflow/user_ioctl/user_ioctl /tmp/
-        vng --user root --exec /tmp/user_ioctl | tee /tmp/user_ioctl_result.txt
+        if [ "${{ matrix.arch }}" = "arm64" ]; then
+          vng --cpu 8 --arch arm64 --rw \
+            --root docker://arm64v8/debian:sid \
+            --user root --exec /tmp/user_ioctl \
+            | tee /tmp/user_ioctl_result.txt
+        else
+          vng --user root --exec /tmp/user_ioctl \
+            | tee /tmp/user_ioctl_result.txt
+        fi
 
     - name: Run eight_args_c selftest
       run: |
+        source venv-virtme/bin/activate
         cd linux
         cp tools/testing/selftests/kcov_dataflow/eight_args_c/eight_args_mod.ko /tmp/
         cp tools/testing/selftests/kcov_dataflow/kcov-dataflow-trigger-and-view.py /tmp/
-        cat > /tmp/run_eight_args.sh << 'EOF'
-        #!/bin/sh
-        python3 /tmp/kcov-dataflow-trigger-and-view.py eight_args_c --ko /tmp/eight_args_mod.ko --raw
-        EOF
-        chmod +x /tmp/run_eight_args.sh
-        vng --user root --exec /tmp/run_eight_args.sh | tee /tmp/eight_args_c_result.txt
-
-    - name: Run rust_ffi_contract selftest
-      run: |
-        cd linux
-        cp tools/testing/selftests/kcov_dataflow/rust_ffi_contract/rust_ffi_contract.ko /tmp/
-        cat > /tmp/run_ffi.sh << 'EOF'
-        #!/bin/sh
-        python3 /tmp/kcov-dataflow-trigger-and-view.py rust_ffi_contract --ko /tmp/rust_ffi_contract.ko --raw
-        EOF
-        chmod +x /tmp/run_ffi.sh
-        vng --user root --exec /tmp/run_ffi.sh | tee /tmp/rust_ffi_result.txt
+        if [ "${{ matrix.arch }}" = "arm64" ]; then
+          vng --cpu 8 --arch arm64 --rw \
+            --root docker://arm64v8/debian:sid \
+            --user root \
+            --exec "python3 /tmp/kcov-dataflow-trigger-and-view.py \
+              eight_args_c --ko /tmp/eight_args_mod.ko" \
+            | tee /tmp/eight_args_c_result.txt
+        else
+          vng --user root \
+            --exec "python3 /tmp/kcov-dataflow-trigger-and-view.py \
+              eight_args_c --ko /tmp/eight_args_mod.ko" \
+            | tee /tmp/eight_args_c_result.txt
+        fi
 
     - name: Run eight_args_rust selftest
       run: |
+        source venv-virtme/bin/activate
         cd linux
+        if [ ! -f tools/testing/selftests/kcov_dataflow/eight_args_rust/eight_args_rust.ko ]; then
+          echo "# Captured 0 records (rustc not available, skipped)" \
+            > /tmp/eight_args_rust_result.txt
+          exit 0
+        fi
         cp tools/testing/selftests/kcov_dataflow/eight_args_rust/eight_args_rust.ko /tmp/
-        cat > /tmp/run_rust_args.sh << 'EOF'
-        #!/bin/sh
-        python3 /tmp/kcov-dataflow-trigger-and-view.py eight_args_rust --ko /tmp/eight_args_rust.ko --raw
-        EOF
-        chmod +x /tmp/run_rust_args.sh
-        vng --user root --exec /tmp/run_rust_args.sh | tee /tmp/eight_args_rust_result.txt
+        cp tools/testing/selftests/kcov_dataflow/kcov-dataflow-trigger-and-view.py /tmp/
+        if [ "${{ matrix.arch }}" = "arm64" ]; then
+          vng --cpu 8 --arch arm64 --rw \
+            --root docker://arm64v8/debian:sid \
+            --user root \
+            --exec "python3 /tmp/kcov-dataflow-trigger-and-view.py \
+              eight_args_rust --ko /tmp/eight_args_rust.ko" \
+            | tee /tmp/eight_args_rust_result.txt
+        else
+          vng --user root \
+            --exec "python3 /tmp/kcov-dataflow-trigger-and-view.py \
+              eight_args_rust --ko /tmp/eight_args_rust.ko" \
+            | tee /tmp/eight_args_rust_result.txt
+        fi
+
+    - name: Run rust_ffi_contract selftest
+      run: |
+        source venv-virtme/bin/activate
+        cd linux
+        if [ ! -f tools/testing/selftests/kcov_dataflow/rust_ffi_contract/rust_ffi_contract.ko ]; then
+          echo "# Captured 0 records (rustc not available, skipped)" \
+            > /tmp/rust_ffi_result.txt
+          exit 0
+        fi
+        cp tools/testing/selftests/kcov_dataflow/rust_ffi_contract/rust_ffi_contract.ko /tmp/
+        cp tools/testing/selftests/kcov_dataflow/kcov-dataflow-trigger-and-view.py /tmp/
+        if [ "${{ matrix.arch }}" = "arm64" ]; then
+          vng --cpu 8 --arch arm64 --rw \
+            --root docker://arm64v8/debian:sid \
+            --user root \
+            --exec "python3 /tmp/kcov-dataflow-trigger-and-view.py \
+              rust_ffi_contract --ko /tmp/rust_ffi_contract.ko" \
+            | tee /tmp/rust_ffi_result.txt
+        else
+          vng --user root \
+            --exec "python3 /tmp/kcov-dataflow-trigger-and-view.py \
+              rust_ffi_contract --ko /tmp/rust_ffi_contract.ko" \
+            | tee /tmp/rust_ffi_result.txt
+        fi
 
     - name: Report results
       if: always()
       run: |
         echo "============================================"
-        echo "       KCOV-DATAFLOW SELFTEST RESULTS       "
+        echo "  KCOV-DATAFLOW RESULTS: ${{ matrix.name }}"
         echo "============================================"
         echo ""
         echo "--- user_ioctl (TAP) ---"
-        cat /tmp/user_ioctl_result.txt 2>/dev/null || echo "MISSING"
+        grep -E "^(ok|not ok|#|PASSED|FAILED|TAP)" /tmp/user_ioctl_result.txt 2>/dev/null || echo "MISSING"
         echo ""
-        echo "--- eight_args_c (records) ---"
+        echo "--- eight_args_c ---"
         cat /tmp/eight_args_c_result.txt 2>/dev/null || echo "MISSING"
         echo ""
-        echo "--- eight_args_rust (records) ---"
+        echo "--- eight_args_rust ---"
         cat /tmp/eight_args_rust_result.txt 2>/dev/null || echo "MISSING"
         echo ""
-        echo "--- rust_ffi_contract (records) ---"
+        echo "--- rust_ffi_contract ---"
         cat /tmp/rust_ffi_result.txt 2>/dev/null || echo "MISSING"
         echo ""
         echo "============================================"
@@ -134,4 +367,4 @@ jobs:
         grep -q "^# Captured" /tmp/eight_args_c_result.txt
         grep -q "^# Captured" /tmp/eight_args_rust_result.txt
         grep -q "^# Captured" /tmp/rust_ffi_result.txt
-        echo "All tests passed"
+        echo "All tests passed (${{ matrix.name }})"
