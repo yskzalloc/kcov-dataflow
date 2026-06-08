@@ -1,0 +1,137 @@
+name: kcov-dataflow kselftest
+
+on:
+  push:
+    branches: [main, kcov-dataflow-*]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential bc flex bison libelf-dev libssl-dev \
+          ninja-build cmake python3 qemu-system-x86 \
+          libdw-dev zstd
+        
+        python3 -m venv venv-virtme
+        source venv-virtme/bin/activate
+        pip3 install git+https://github.com/arighi/virtme-ng.git
+
+    - name: Build custom LLVM (clang + lld)
+      run: |
+        cd llvm-project
+        cmake -S llvm -B build -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DLLVM_ENABLE_PROJECTS="clang;lld" \
+          -DLLVM_TARGETS_TO_BUILD="X86"
+        ninja -C build
+      env:
+        CMAKE_BUILD_PARALLEL_LEVEL: ${{ steps.cpu.outputs.count || '4' }}
+
+    - name: Build kernel
+      run: |
+        export PATH="$PWD/llvm-project/build/bin:$PATH"
+        export RUSTC="$PWD/rust/build/x86_64-unknown-linux-gnu/stage1/bin/rustc"
+        export RUST_LIB_SRC="$PWD/rust/library"
+        cd linux
+        vng --build \
+          --configitem CONFIG_KCOV=y \
+          --configitem CONFIG_KCOV_DATAFLOW_ARGS=y \
+          --configitem CONFIG_KCOV_DATAFLOW_RET=y \
+          --configitem CONFIG_KCOV_DATAFLOW_INSTRUMENT_ALL=y \
+          --configitem CONFIG_DEBUG_INFO=y \
+          --configitem CONFIG_DEBUG_INFO_DWARF5=y \
+          --configitem CONFIG_ANDROID_BINDER_IPC=y \
+          --configitem CONFIG_ANDROID_BINDERFS=y \
+          --configitem CONFIG_RUST=y \
+          LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC
+
+    - name: Build selftests
+      run: |
+        export PATH="$PWD/llvm-project/build/bin:$PATH"
+        export RUSTC="$PWD/rust/build/x86_64-unknown-linux-gnu/stage1/bin/rustc"
+        export RUST_LIB_SRC="$PWD/rust/library"
+        cd linux
+        make -C tools/testing/selftests/kcov_dataflow
+        make LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC M=tools/testing/selftests/kcov_dataflow/eight_args_c modules
+        make LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC M=tools/testing/selftests/kcov_dataflow/eight_args_rust modules
+        make LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC M=tools/testing/selftests/kcov_dataflow/rust_ffi_contract modules
+
+    - name: Run user_ioctl selftest
+      run: |
+        cd linux
+        cp tools/testing/selftests/kcov_dataflow/user_ioctl/user_ioctl /tmp/
+        vng --user root --exec /tmp/user_ioctl | tee /tmp/user_ioctl_result.txt
+
+    - name: Run eight_args_c selftest
+      run: |
+        cd linux
+        cp tools/testing/selftests/kcov_dataflow/eight_args_c/eight_args_mod.ko /tmp/
+        cp tools/testing/selftests/kcov_dataflow/kcov-dataflow-trigger-and-view.py /tmp/
+        cat > /tmp/run_eight_args.sh << 'EOF'
+        #!/bin/sh
+        python3 /tmp/kcov-dataflow-trigger-and-view.py eight_args_c --ko /tmp/eight_args_mod.ko --raw
+        EOF
+        chmod +x /tmp/run_eight_args.sh
+        vng --user root --exec /tmp/run_eight_args.sh | tee /tmp/eight_args_c_result.txt
+
+    - name: Run rust_ffi_contract selftest
+      run: |
+        cd linux
+        cp tools/testing/selftests/kcov_dataflow/rust_ffi_contract/rust_ffi_contract.ko /tmp/
+        cat > /tmp/run_ffi.sh << 'EOF'
+        #!/bin/sh
+        python3 /tmp/kcov-dataflow-trigger-and-view.py rust_ffi_contract --ko /tmp/rust_ffi_contract.ko --raw
+        EOF
+        chmod +x /tmp/run_ffi.sh
+        vng --user root --exec /tmp/run_ffi.sh | tee /tmp/rust_ffi_result.txt
+
+    - name: Run eight_args_rust selftest
+      run: |
+        cd linux
+        cp tools/testing/selftests/kcov_dataflow/eight_args_rust/eight_args_rust.ko /tmp/
+        cat > /tmp/run_rust_args.sh << 'EOF'
+        #!/bin/sh
+        python3 /tmp/kcov-dataflow-trigger-and-view.py eight_args_rust --ko /tmp/eight_args_rust.ko --raw
+        EOF
+        chmod +x /tmp/run_rust_args.sh
+        vng --user root --exec /tmp/run_rust_args.sh | tee /tmp/eight_args_rust_result.txt
+
+    - name: Report results
+      if: always()
+      run: |
+        echo "============================================"
+        echo "       KCOV-DATAFLOW SELFTEST RESULTS       "
+        echo "============================================"
+        echo ""
+        echo "--- user_ioctl (TAP) ---"
+        cat /tmp/user_ioctl_result.txt 2>/dev/null || echo "MISSING"
+        echo ""
+        echo "--- eight_args_c (records) ---"
+        cat /tmp/eight_args_c_result.txt 2>/dev/null || echo "MISSING"
+        echo ""
+        echo "--- eight_args_rust (records) ---"
+        cat /tmp/eight_args_rust_result.txt 2>/dev/null || echo "MISSING"
+        echo ""
+        echo "--- rust_ffi_contract (records) ---"
+        cat /tmp/rust_ffi_result.txt 2>/dev/null || echo "MISSING"
+        echo ""
+        echo "============================================"
+
+    - name: Verify pass
+      run: |
+        grep -q "PASSED" /tmp/user_ioctl_result.txt
+        grep -q "^# Captured" /tmp/eight_args_c_result.txt
+        grep -q "^# Captured" /tmp/eight_args_rust_result.txt
+        grep -q "^# Captured" /tmp/rust_ffi_result.txt
+        echo "All tests passed"
