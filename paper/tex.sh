@@ -1,6 +1,7 @@
 #!/bin/bash
 set -e
-cd "$(dirname "$0")/arxiv"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/arxiv"
 
 echo "=== Building PDF ==="
 pdflatex -interaction=nonstopmode main.tex > /dev/null
@@ -25,8 +26,8 @@ cp main.bbl "$TMPDIR/"
 
 cd "$TMPDIR"
 zip -r arxiv.zip . > /dev/null
-mv arxiv.zip "$(dirname "$0")/../arxiv.zip"
+mv arxiv.zip "$SCRIPT_DIR/arxiv.zip"
 rm -rf "$TMPDIR"
 
-echo "ZIP: $(dirname "$0")/../arxiv.zip"
+echo "ZIP: $SCRIPT_DIR/arxiv.zip"
 echo "Done."
