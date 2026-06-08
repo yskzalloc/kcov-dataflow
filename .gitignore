@@ -82,3 +82,14 @@ GTAGS
 # paper
 *.pdf
 arxiv.zip
+
+# Build artifacts
+*.ko
+*.o
+*.mod
+*.mod.c
+*.mod.o
+.*.cmd
+Module.symvers
+modules.order
+.module-common.o

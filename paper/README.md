@@ -20,8 +20,8 @@ Required packages: `pdflatex`, `bibtex`, `zip`.
 ```
 
 Outputs:
-- `arxiv/main.pdf` — compiled paper
-- `arxiv.zip` — flat archive ready for arXiv submission
+- `arxiv/main.pdf` -- compiled paper
+- `arxiv.zip` -- flat archive ready for arXiv submission
 
 ## Structure
 
