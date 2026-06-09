@@ -1,5 +1,3 @@
-# RFC: [SanCov] Add `-fsanitize-coverage=trace-args,trace-ret`
-
 ## Summary
 
 I propose two new SanitizerCoverage instrumentation modes:
@@ -20,7 +18,7 @@ PR: https://github.com/llvm/llvm-project/pull/201410
 SanitizerCoverage currently provides control-flow observability:
 
 | Mode | What it captures |
-|------|-----------------|
+|----|----|
 | `trace-pc` | Which edges executed |
 | `trace-cmp` | Comparison operands |
 | `trace-pc-guard` | Edge with guard variable |
@@ -78,12 +76,11 @@ where arguments are explicit SSA values with type metadata intact.
 
 ### The Gap
 
-| | trace-pc | XRay | -finstrument-functions | DFSan | **trace-args/ret** |
-|---|---|---|---|---|---|
+|  | trace-pc | XRay | \-finstrument-functions | DFSan | **trace-args/ret** |
+|----|----|----|----|----|----|
 | Argument values | No | No | No | Taint only | **Yes** |
 | Struct field expansion | No | No | No | No | **Automatic** |
 | Works under -O2 | N/A | N/A | N/A | Yes | **Yes** |
-| Overhead | <5% | <1% idle | ~5% | 10-100x | **<10%** |
 | Language-agnostic (Rust/C) | Yes | No (needs mfentry) | Partial | No | **Yes** |
 
 ## Proposed Design
@@ -144,13 +141,54 @@ approach needs no backend changes.
 
 ### Edge cases
 
-- No `DISubprogram`: function skipped
-- Variadic: skipped
-- `naked`: skipped
-- `void` return: no `trace_ret`
-- Multiple returns: `EscapeEnumerator` finds all exit points
+* No `DISubprogram`: function skipped
+* Variadic: skipped
+* `naked`: skipped
+* `void` return: no `trace_ret`
+* Multiple returns: `EscapeEnumerator` finds all exit points
 
 ## Implementation
+
+### Purpose: What This Coverage Mode Is For
+
+`trace-args` and `trace-ret` exist to provide **runtime value observability
+at function boundaries**. The intended consumers are:
+
+1. **Coverage-guided fuzzers** that need finer-grained feedback than edge
+   coverage alone. A composite signal `(PC, arg_hash)` distinguishes
+   executions of the same path with different argument values, breaking
+   coverage saturation on stateful programs.
+2. **Runtime contract verifiers** that check captured `(args, ret)` tuples
+   against pre/postcondition predicates (e.g., "size ≤ buffer capacity")
+   to detect value-level violations that produce no crash or sanitizer
+   report.
+3. **Struct member verification** at runtime: when a function receives a
+   struct pointer, the expanded field values reveal whether the struct's
+   internal state matches what the function's logic requires—conditions
+   that depend on non-deterministic runtime state (heap pressure, RCU
+   epoch, concurrent modification) and cannot be validated at compile time.
+
+### Comparison with Existing LLVM Flags
+
+| Flag | What it captures | Argument values? | Struct fields? | Use case |
+|------|-----------------|-----------------|----------------|----------|
+| `-fsanitize-coverage=trace-pc` | Edge PCs | No | No | Edge coverage for fuzzers |
+| `-fsanitize-coverage=trace-cmp` | CMP operands | Partial (cmp only) | No | Magic-byte discovery |
+| `-fsanitize-coverage=trace-pc-guard` | Edge + guard | No | No | Custom coverage callbacks |
+| `-fxray-instrument` | Entry/exit timestamps | No | No | Latency profiling |
+| `-finstrument-functions` | Entry/exit addresses | No | No | Function-level profiling |
+| `-fsanitize=dataflow` | Byte-level taint | Taint labels | No | Full dataflow (10-100×) |
+| `-fpatchable-function-entry` | NOP sleds | No (runtime-dependent) | No | Dynamic patching (ftrace/eBPF) |
+| **`-fsanitize-coverage=trace-args`** | **Arg values + struct layout** | **Yes** | **Yes (automatic)** | **Value-aware fuzzing + Function contract verification** |
+| **`-fsanitize-coverage=trace-ret`** | **Return values + struct layout** | **Yes** | **Yes (automatic)** | **Postcondition checking** |
+
+The key architectural difference: existing modes either capture
+*control-flow topology* (trace-pc), *individual comparison operands*
+(trace-cmp), or *timing* (XRay). None capture the complete function
+parameter state including composite type decomposition. `trace-args/ret`
+fills this gap with <10% per-module overhead.
+
+### Files Changed
 
 ~270 LOC in `SanitizerCoverage.cpp`, ~170 LOC tests/docs.
 
@@ -170,24 +208,24 @@ Tests:
 
 ## Impact on LLVM
 
-- Extends `SanitizerCoverage.cpp` only (~270 LOC)
-- No changes to: optimizer, codegen, linker, other sanitizers
-- No new metadata kinds or propagation requirements
-- Fully backward compatible: existing `trace-pc`/`trace-cmp` unchanged
-- Works with any LLVM-based frontend (clang, rustc via IR pipeline)
+* Extends `SanitizerCoverage.cpp` only (\~270 LOC)
+* No changes to: optimizer, codegen, linker, other sanitizers
+* No new metadata kinds or propagation requirements
+* Fully backward compatible: existing `trace-pc`/`trace-cmp` unchanged
+* Works with any LLVM-based frontend (clang, rustc via IR pipeline)
 
 ## Performance
 
-Per-callback: ~27 ns (dominated by memory spill + indirect call).
-With whole-program instrumentation: +133% (comparable to KASAN +100-200%).
+Per-callback: \~27 ns (dominated by memory spill + indirect call).
+With whole-program instrumentation: +133%.
 Per-module opt-in: +8.3% on instrumented paths; zero on uninstrumented.
 
 ## Current status
 
-- 4 commits: core pass, clang tests, LLVM IR tests, documentation
-- Deployed with a Linux kernel runtime consumer (KCOV backend)
-- Tested with both C and Rust-generated LLVM IR
-- Kernel patch series under review (demonstrates real-world viability)
+* 4 commits: core pass, clang tests, LLVM IR tests, documentation
+* Deployed with a Linux kernel runtime consumer (KCOV backend)
+* Tested with both C and Rust-generated LLVM IR
+* Kernel patch series under review (demonstrates real-world viability)
 
 ## Open questions
 

@@ -1152,6 +1152,174 @@ postcondition violated ($\mathit{ret} = -22 \neq -4096$). Linux RV cannot
 catch this: no tracepoint exists inside \texttt{from\_errno}, and it is a Rust
 function invisible to C-based tracing infrastructure.
 
+\subsection{Struct Member Contract Verification}\label{sec:struct-contract}
+
+Beyond scalar argument bounds, \toolname{}'s automatic struct field expansion
+enables \emph{struct member contracts}: predicates over relationships between
+fields that must hold for a function's internal logic to operate correctly.
+
+\paragraph{The problem.} Most kernel functions receive struct pointers whose
+fields encode complex state (flags, sizes, pointers, reference counts). The
+function's internal logic assumes these fields satisfy certain relationships
+(e.g., \texttt{buf\_len $\geq$ data\_offset + data\_size}). These
+relationships are typically enforced by conditional checks inside the function,
+but:
+\begin{itemize}[nosep]
+  \item Checks may be missing for uncommon field combinations.
+  \item Concurrent modification may invalidate a field between the check and
+        its use (TOCTOU).
+  \item The caller may construct a struct in an inconsistent state that passes
+        individual field validation but violates cross-field invariants.
+\end{itemize}
+
+Compile-time type systems cannot detect these: the struct is well-typed
+regardless of whether its fields are internally consistent. The correct state
+depends on runtime conditions (which allocator path was taken, whether a lock
+is held, what RCU grace period is active).
+
+\paragraph{Formalization.} Extend the boundary contract to include a
+\emph{struct consistency predicate} $\mathcal{S}$ over fields of a struct
+parameter:
+$$\mathcal{S}(\mathit{fields}): \bigwedge_i \phi_i(f_1, f_2, \ldots, f_n)$$
+
+\noindent\textbf{Example:} For \texttt{smb2\_create\_req *req}:
+\begin{align*}
+\mathcal{S}&: \mathit{req.NameLength} \leq \mathit{req.BufferLength} \\
+           &\wedge\ \mathit{req.CreateContextsOffset} + \mathit{req.CreateContextsLength}
+              \leq \mathit{req.StructureSize}
+\end{align*}
+
+\paragraph{Detection mechanism.} At function entry, \toolname{} captures all
+struct fields simultaneously (one atomic record per parameter). The offline
+verifier evaluates $\mathcal{S}$ over the captured field values. A violation
+means the function received a struct whose internal state is inconsistent with
+what its logic requires---either the caller constructed it incorrectly, or
+concurrent modification corrupted it between construction and use.
+
+\paragraph{Concrete example.} Consider a kernel network handler:
+\begin{lstlisting}[numbers=none]
+[ENTRY] process_msg(struct{.hdr_len=20, .payload_len=4096,
+                           .total_len=100, .flags=0x3})
+\end{lstlisting}
+Contract: $\mathit{hdr\_len} + \mathit{payload\_len} \leq \mathit{total\_len}$.
+Captured: $20 + 4096 = 4116 > 100$ --- violation. The function will either
+read out-of-bounds or silently produce incorrect output. No crash occurs
+(the buffer may be large enough by coincidence), no KASAN report fires,
+and edge coverage sees the same path regardless of field values.
+
+\paragraph{Why this matters.} These bugs are among the hardest to find:
+\begin{itemize}[nosep]
+  \item They produce no immediate crash (data is read, just incorrectly).
+  \item Sanitizers do not fire (the access is technically in-bounds of the
+        allocation, just semantically wrong).
+  \item Static analysis cannot reason about runtime struct state.
+  \item They often manifest only under specific timing or workload conditions.
+\end{itemize}
+Struct member contract verification with \toolname{} is the only automated
+method that can detect these violations at runtime with zero source annotation,
+by comparing the actual field values against the cross-field predicates that
+the function's conditional logic implicitly assumes.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  node distance=0.4cm and 0.6cm,
+  box/.style={rectangle, draw, rounded corners, minimum width=2.4cm, minimum height=0.6cm, font=\scriptsize, align=center},
+  struct/.style={rectangle, draw, thick, fill=yellow!10, minimum width=2.8cm, font=\scriptsize, align=left, inner sep=4pt},
+  check/.style={diamond, draw, fill=orange!10, minimum width=1.2cm, minimum height=0.8cm, font=\scriptsize, align=center, inner sep=1pt},
+  arrow/.style={-{Stealth[length=2mm]}, thick},
+  note/.style={font=\tiny\itshape, text=gray}
+]
+% Function entry
+\node[box, fill=blue!8] (entry) {$f(\texttt{struct}\ S\ *s, \mathit{globals})$};
+
+% Struct state
+\node[struct, below left=0.8cm and 0.3cm of entry] (sinput) {%
+  \texttt{s->len} = 4096\\
+  \texttt{s->cap} = 256\\
+  \texttt{s->flags} = 0x3};
+\node[note, above=0.05cm of sinput] {Input struct state};
+
+% Global state
+\node[struct, below right=0.8cm and 0.3cm of entry] (gstate) {%
+  \texttt{pool\_free} = 128\\
+  \texttt{rcu\_epoch} = 7\\
+  \texttt{lock\_held} = 0};
+\node[note, above=0.05cm of gstate] {Runtime global state};
+
+% Contract check
+\node[check, below=2.2cm of entry] (verify) {$\mathcal{S} \wedge \mathcal{G}$\\valid?};
+
+% Outcomes
+\node[box, fill=green!15, below left=0.8cm and 0.2cm of verify] (pass) {$\checkmark$ Consistent\\safe to proceed};
+\node[box, fill=red!15, below right=0.8cm and 0.2cm of verify] (fail) {$\times$ Violation\\flag for review};
+
+% Arrows
+\draw[arrow] (entry.south) -- ++(0,-0.3) -| (sinput.north);
+\draw[arrow] (entry.south) -- ++(0,-0.3) -| (gstate.north);
+\draw[arrow] (sinput.south) |- (verify.west);
+\draw[arrow] (gstate.south) |- (verify.east);
+\draw[arrow] (verify.south) -- ++(0,-0.3) -| (pass.north) node[pos=0.3, left, note] {yes};
+\draw[arrow] (verify.south) -- ++(0,-0.3) -| (fail.north) node[pos=0.3, right, note] {no};
+
+% Capture annotation
+\draw[decorate, decoration={brace, amplitude=3pt, mirror, raise=15pt}, gray]
+  (sinput.south west) -- (gstate.south east)
+  node[midway, below=18pt, font=\tiny\itshape, text=black] {captured by \toolname{} at function entry};
+\end{tikzpicture}
+\caption{Struct member and global state verification at function entry.
+\toolname{} captures the struct fields and observable global state;
+the offline verifier evaluates the consistency predicate
+$\mathcal{S} \wedge \mathcal{G}$.}\label{fig:struct-verify}
+\end{figure}
+
+\paragraph{Formal model.}
+Let a function $f$ receive a struct parameter $s$ with fields
+$(f_1, \ldots, f_n)$ and access global kernel state $G = (g_1, \ldots, g_m)$.
+Define the \emph{functional verification predicate}:
+$$\mathcal{V}(f) = \mathcal{S}(f_1, \ldots, f_n) \wedge
+  \mathcal{G}(f_1, \ldots, f_n, g_1, \ldots, g_m)$$
+where:
+\begin{itemize}[nosep]
+  \item $\mathcal{S}$: \emph{structural consistency} --- cross-field invariants
+        that must hold regardless of runtime state
+        (e.g., $\mathit{len} \leq \mathit{cap}$,
+        $\mathit{offset} + \mathit{size} \leq \mathit{total}$).
+  \item $\mathcal{G}$: \emph{state-dependent validity} --- predicates that
+        relate struct fields to runtime kernel state
+        (e.g., $\mathit{alloc\_size} \leq \mathit{pool\_free}$,
+        $\mathit{flags} \wedge \mathtt{LOCKED} \implies \mathit{lock\_held} = 1$).
+\end{itemize}
+
+\noindent A \emph{violation} $\neg\mathcal{V}(f)$ at function entry means the
+function's internal conditional logic will either:
+\begin{enumerate}[nosep]
+  \item Take an unanticipated branch (missing check $\to$ silent corruption), or
+  \item Produce semantically incorrect output (wrong branch $\to$ logic bug).
+\end{enumerate}
+
+\paragraph{What \toolname{} captures.} For struct fields, all values are
+captured via \texttt{DICompositeType} expansion at entry (Section~\ref{sec:llvm-pass}).
+For globals accessed by the function, they appear as arguments if passed
+explicitly, or can be captured at a wrapper boundary. The key insight is that
+\toolname{} provides a \emph{snapshot} of the state at the exact moment the
+function is invoked---before any internal check can mask the inconsistency.
+
+\paragraph{Classification of violations.}
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Violation type} & \textbf{Predicate} & \textbf{Consequence} \\
+\midrule
+Cross-field overflow & $\mathit{off} + \mathit{len} > \mathit{cap}$ & OOB read/write \\
+Flag-state mismatch & $\mathit{flags} \wedge F \neq 0 \wedge \neg\mathit{ready}$ & Use-before-init \\
+Size-resource conflict & $\mathit{req\_sz} > \mathit{avail}$ & Allocation failure \\
+Epoch staleness & $\mathit{s.epoch} < \mathit{global\_epoch}$ & Stale data use \\
+\bottomrule
+\end{tabular}
+\end{center}
+
 \subsection{Toward Post-Mortem Formal Verification}\label{sec:postmortem}
 
 Classical formal verification proves properties for \emph{all} inputs
@@ -1345,7 +1513,9 @@ $(\mathit{PC}, \mathit{arg\_hash})$ pairs provide finer-grained state
 discrimination than unique edges alone.
 
 \paragraph{Upstream Path.} The LLVM pass has been submitted as a pull
-request\footnote{\url{https://github.com/llvm/llvm-project/pull/201410}};
+request\footnote{\url{https://github.com/llvm/llvm-project/pull/201410}} with
+an RFC on LLVM
+Discourse\footnote{\url{https://discourse.llvm.org/t/rfc-sanitizercoverage-add-fsanitize-coverage-trace-args-trace-ret/91026}};
 LLVM maintainers have requested a formal RFC per the LLVM RFC
 process\footnote{\url{https://llvm.org/docs/RFCProcess.html}} given the
 complexity of extending \sancov with a new instrumentation mode.
