@@ -44,7 +44,7 @@ jobs:
           -DCMAKE_CXX_COMPILER=clang++-22 \
           -DLLVM_ENABLE_LLD=ON \
           -DLLVM_ENABLE_PROJECTS="clang;lld" \
-          -DLLVM_TARGETS_TO_BUILD="X86;AArch64;ARM"
+          -DLLVM_TARGETS_TO_BUILD="X86;AArch64"
         ninja -C build
 
     - name: Upload LLVM
@@ -190,7 +190,7 @@ jobs:
       if: matrix.arch == 'arm64'
       run: |
         sudo apt-get install -y \
-          gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+          gcc-aarch64-linux-gnu \
           qemu-user-static binfmt-support
         sudo systemctl restart systemd-binfmt
 
@@ -210,7 +210,7 @@ jobs:
         ARCH_ARGS=""
         if [ "${{ matrix.arch }}" = "arm64" ]; then
           ARCH_ARGS="--arch arm64"
-          EXTRA_CONFIGS="$EXTRA_CONFIGS --configitem CONFIG_COMPAT_VDSO=n"
+          EXTRA_CONFIGS="$EXTRA_CONFIGS --configitem CONFIG_COMPAT=n"
         fi
 
         RUST_CONFIGS=""
@@ -230,8 +230,7 @@ jobs:
           --configitem CONFIG_ANDROID_BINDERFS=y \
           $RUST_CONFIGS \
           $EXTRA_CONFIGS \
-          LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC \
-          CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+          LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC
 
     - name: Build selftests
       run: |

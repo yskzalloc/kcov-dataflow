@@ -53,6 +53,19 @@ paper/                                          LaTeX paper (arxiv + overleaf)
 - QEMU (for virtme-ng boot testing)
 - Python 3 + virtme-ng (`pip install virtme-ng`)
 
+### Clone
+
+```bash
+git clone --recursive --depth 1 --shallow-submodules \
+  --jobs $(nproc) https://github.com/yskzalloc/kcov-dataflow.git
+cd kcov-dataflow
+```
+
+Or if already cloned without `--recursive`:
+```bash
+git submodule update --init --recursive
+```
+
 ### Step 1: Build Custom LLVM
 
 ```bash
