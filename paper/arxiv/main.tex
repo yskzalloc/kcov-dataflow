@@ -76,7 +76,7 @@ only runtime methods for capturing Rust function arguments given that
 
 \section{Introduction}\label{sec:intro}
 
-The Linux kernel exceeds 40 million lines of code, integrates Rust(~397k Lines) as a second
+The Linux kernel exceeds 40 million lines of code, integrates Rust(($\sim$397k Lines) Lines) as a second
 systems language, and implements complex locking hierarchies
 (\texttt{rwsem}, \texttt{mutex}, RCU) that create deep state spaces unreachable
 by coverage-guided fuzzing alone. syzkaller~\cite{vyukov2015syzkaller} has
@@ -271,8 +271,8 @@ Data-flow extraction reveals the security-relevant difference.}\label{fig:blind-
 \node[ret]   (lc) at (0,-4.4) {\colorbox{green!20}{0x4} = do\_sys\_openat2()};
 
 % Annotation
-\draw[decorate, decoration={brace, amplitude=4pt, mirror, raise=3pt}]
-  ([xshift=7.5cm]l1.north east) -- ([xshift=7.5cm]lc.south east)
+\draw[decorate, decoration={brace, amplitude=4pt, raise=3pt}]
+  (8.5,0.1) -- (8.5,-4.5)
   node[midway, right=7pt, font=\scriptsize\itshape, align=left] {Captured\\per-task\\at runtime};
 \end{tikzpicture}
 \caption{Actual \toolname{} output for \texttt{open("/etc/shadow", O\_WRONLY|O\_TRUNC)}.
@@ -287,7 +287,7 @@ process with access to the syscall interface attempts to trigger memory
 corruption in kernel subsystems. KASAN/KMSAN detect the corruption once
 triggered; my tool provides the \emph{path to triggering} it and the
 \emph{data for triaging} it. I assume the kernel is compiled with debug
-information (\texttt{-g}) for full struct field expansion, though the system
+information for full struct field expansion, though the system
 degrades gracefully to scalar-only capture without it.
 
 
@@ -459,7 +459,7 @@ This works because LLVM IR is language-agnostic: my pass operates identically
 on Rust-generated IR. The text format (\texttt{.ll}) avoids bitcode version
 incompatibilities between LLVM~22 and~23. Struct field expansion works on Rust
 \texttt{\#[repr(C)]} types whose \texttt{DICompositeType} metadata is preserved
-by \texttt{rustc -g}.
+by \texttt{rustc} with debug info enabled.
 
 \begin{figure}[t]
 \centering
@@ -546,22 +546,26 @@ parameters, resolving each to its \texttt{DILocalVariable} via the
 \texttt{DISubprogram} attached to~$F$. For each parameter whose type resolves
 (through \texttt{stripDITypedefs()}) to a \texttt{DICompositeType}, the pass
 calls \texttt{getStructFieldOffsets()} which:
-(a)~walks the composite's member list extracting byte offsets and sizes,
-(b)~computes an FNV-1a hash of the struct's name (stored at index~0 of the
-offsets array for type deduplication), and
-(c)~creates a module-level \texttt{ConstantArray} global.
+\begin{enumerate}[nosep,label=(\alph*)]
+  \item Walks the composite's member list extracting byte offsets and sizes.
+  \item Computes an FNV-1a hash of the struct's name (stored at index~0 of the
+        offsets array for type deduplication).
+  \item Creates a module-level \texttt{ConstantArray} global.
+\end{enumerate}
 
 \texttt{InjectTraceForRet(Function \&F)} uses \texttt{EscapeEnumerator} to find
 all function exit points and inserts the return-value callback before each
 \texttt{ReturnInst}.
 
 Integration into the clang driver required changes to:
-\texttt{CodeGenOptions.def} (two new \texttt{CODEGENOPT} flags),
-\texttt{SanitizerArgs.cpp} (parsing \texttt{"trace-args"}/\texttt{"trace-ret"}
-with enum values $1\ll20$ and $1\ll21$),
-\texttt{BackendUtil.cpp} (wiring to \texttt{SanitizerCoverageOptions}), and
-\texttt{Instrumentation.h} (adding \texttt{DataflowArgs}/\texttt{DataflowRet}
-booleans).
+\begin{itemize}[nosep]
+  \item \texttt{CodeGenOptions.def}: two new \texttt{CODEGENOPT} flags
+  \item \texttt{SanitizerArgs.cpp}: parse \texttt{"trace-args"}/\texttt{"trace-ret"}
+        (enum values $1\ll20$ and $1\ll21$)
+  \item \texttt{BackendUtil.cpp}: wire to \texttt{SanitizerCoverageOptions}
+  \item \texttt{Instrumentation.h}: add \texttt{DataflowArgs}/\texttt{DataflowRet}
+        booleans
+\end{itemize}
 
 \subsection{Kernel Backend (350~LOC)}
 
@@ -625,11 +629,17 @@ I evaluate \toolname{} on linux-next 7.1.0-rc6 (next-20260604) compiled with
 my custom clang/LLVM~23 (commit \texttt{322873d}, trunk plus the dataflow
 pass). Rust modules are compiled with rustc~1.98.0-nightly (2026-05-22), built
 against the same LLVM~23 to share the dataflow instrumentation passes. The
-kernel is configured with \texttt{CONFIG\_KASAN=y}, \texttt{CONFIG\_KCOV=y},
-\texttt{CONFIG\_KCOV\_DATAFLOW\_ARGS=y}, \texttt{CONFIG\_KCOV\_DATAFLOW\_RET=y},
-\texttt{CONFIG\_RUST=y}, \texttt{CONFIG\_ANDROID\_BINDER\_IPC=y}, and
-\texttt{CONFIG\_SAMPLE\_RUST\_MISC\_DEVICE=y}. Tests run under virtme-ng
-(QEMU/KVM) with 8~vCPUs and 1\,GB RAM.
+kernel is configured with:
+\begin{itemize}[nosep]
+  \item \texttt{CONFIG\_KASAN=y}
+  \item \texttt{CONFIG\_KCOV=y}
+  \item \texttt{CONFIG\_KCOV\_DATAFLOW\_ARGS=y}
+  \item \texttt{CONFIG\_KCOV\_DATAFLOW\_RET=y}
+  \item \texttt{CONFIG\_RUST=y}
+  \item \texttt{CONFIG\_ANDROID\_BINDER\_IPC=y}
+  \item \texttt{CONFIG\_SAMPLE\_RUST\_MISC\_DEVICE=y}
+\end{itemize}
+Tests run under virtme-ng (QEMU/KVM) with 8~vCPUs and 1\,GB RAM.
 
 Four selftest kernel modules (2 Rust, 2 C) exercise argument capture
 correctness, and additional purpose-built modules in \texttt{findings/}
@@ -648,24 +658,39 @@ Table~\ref{tab:correctness} shows that \toolname{} correctly captures
 pre-corruption (ENTRY) and post-corruption (RET) argument values for all five
 cases, matching \texttt{printk} ground truth.
 
-\begin{table*}[t]
+\begin{table}[t]
 \centering
-\caption{Correctness verification across five vulnerability classes.}\label{tab:correctness}
+\caption{Captured values at function ENTRY and RET.}\label{tab:correctness}
 \small
-\resizebox{\textwidth}{!}{%
-\begin{tabular}{@{}lllll@{}}
+\begin{tabular}{@{}lll@{}}
 \toprule
-\textbf{Case} & \textbf{ENTRY Captured} & \textbf{RET Captured} & \textbf{drgn} & \textbf{KASAN} \\
+\textbf{Case} & \textbf{ENTRY} & \textbf{RET} \\
 \midrule
-OOB Write (C) & \texttt{struct\{id=0x1337, buf="initial\_", size=15\}} & \texttt{struct\{id=0x1337, \_, size=32\}} & \cmark & slab-out-of-bounds \\
-UAF Write (C) & \texttt{struct\{id=0, buf=poison(0xfd), size=16\}} & \texttt{struct\{0x41414141, "UAF\_CORR", 0xdead\}} & \cmark & slab-use-after-free \\
-Double-Free (C) & \texttt{struct\{id=0, buf=poison(0xff), size=99\}} & \texttt{struct\{0xdf00df00, "DOUBLEFR", 0xdf\}} & \cmark & double-free \\
-10-Deep Chain (C) & offset propagation: $16\to48\to24\to8$ & \texttt{commit\_write(idx=8)} OOB & \cmark & slab-out-of-bounds \\
-Rust Module & \texttt{struct\{0xcafe, 0xdeadbeef.., 0xa\}}, mult=3, cookie=0x1111.. & \texttt{ret=0xefbed00023456789} & \xmark & N/A \\
+OOB Write & id=0x1337, size=15 & size=32 \\
+UAF Write & buf=poison(0xfd) & 0x41414141 \\
+Double-Free & buf=poison(0xff) & 0xdf00df00 \\
+10-Deep Chain & offset: $16\to48\to24\to8$ & idx=8 (OOB) \\
+Rust Module & 0xcafe, mult=3 & 0xefbed000... \\
 \bottomrule
-\end{tabular}%
-}
-\end{table*}
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Tool comparison per vulnerability class.}\label{tab:correctness-tools}
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Case} & \textbf{drgn} & \textbf{KASAN} & \textbf{\toolname{}} \\
+\midrule
+OOB Write (C) & \cmark & slab-oob & \cmark \\
+UAF Write (C) & \cmark & slab-uaf & \cmark \\
+Double-Free (C) & \cmark & double-free & \cmark \\
+10-Deep Chain (C) & \cmark & slab-oob & \cmark \\
+Rust Module & \xmark & N/A & \cmark \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \subsection{Information Gain Over Existing Tools}
 
@@ -817,15 +842,66 @@ The \texttt{eight\_args\_rust} module defines 8 functions with 1--8 arguments
 of mixed types (u64, u32, struct pointer), exercising both register-passed
 (arguments 1--6 on x86-64) and stack-passed (arguments 7--8) parameters:
 
-\begin{lstlisting}[numbers=none]
-rdf_func1(0x1111111111111111)
-  0x1111111111111111 = rdf_func1()
-rdf_func2(0x1111111111111111, 0x22222222)
-  0x33333333 = rdf_func2()
-    ...
-rdf_func8(0x1111.., 0x2222.., ..., struct{.x=0xaaaa, .y=0xbbbb}, 0x8888..)
-  0x22222222eef05552 = rdf_func8()
-\end{lstlisting}
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  node distance=0.12cm,
+  entry/.style={font=\ttfamily\scriptsize, anchor=west, text=blue!70!black},
+  ret/.style={font=\ttfamily\scriptsize, anchor=west, text=red!60!black},
+  val/.style={font=\ttfamily\scriptsize, fill=yellow!20, rounded corners=1pt, inner sep=1pt},
+]
+\node[entry] (e1) at (0,0) {rdf\_func1(\colorbox{yellow!20}{0x1111111111111111})};
+\node[ret]   (r1) at (0.3,-0.35) {\colorbox{green!15}{0x1111111111111111} = rdf\_func1()};
+\node[entry] (e2) at (0,-0.75) {rdf\_func2(\colorbox{yellow!20}{0x1111..}, \colorbox{yellow!20}{0x22222222})};
+\node[ret]   (r2) at (0.3,-1.1) {\colorbox{green!15}{0x33333333} = rdf\_func2()};
+\node[entry, text=gray] (dots) at (0,-1.5) {\quad ...};
+\node[entry] (e8) at (0,-1.9) {rdf\_func8(\colorbox{yellow!20}{0x1111..}, \colorbox{yellow!20}{0x2222..}, ..., \colorbox{orange!20}{struct\{.x=0xaaaa, .y=0xbbbb\}}, \colorbox{yellow!20}{0x8888..})};
+\node[ret]   (r8) at (0.3,-2.3) {\colorbox{green!15}{0x22222222eef05552} = rdf\_func8()};
+
+% Legend
+\node[font=\tiny, anchor=west] at (0,-2.8) {%
+  \colorbox{yellow!20}{arg values}\quad
+  \colorbox{orange!20}{struct expansion}\quad
+  \colorbox{green!15}{return values}};
+\end{tikzpicture}
+\caption{Captured output from \texttt{eight\_args\_rust} module. Each function
+shows ENTRY arguments (yellow) with struct field expansion (orange) and
+RET values (green). All 8 arguments captured on both x86-64 and
+arm64.}\label{fig:eight-args}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  node distance=0.5cm,
+  funcbox/.style={rectangle, draw, thick, rounded corners, fill=blue!8, minimum width=6cm, minimum height=0.6cm, font=\scriptsize\bfseries, align=center},
+  fieldbox/.style={rectangle, draw, fill=yellow!15, minimum width=5.6cm, font=\ttfamily\scriptsize, align=left, inner sep=4pt},
+  instlabel/.style={rectangle, draw=green!60!black, fill=green!10, font=\tiny\bfseries, inner sep=2pt, rounded corners=1pt},
+  checkbox/.style={rectangle, draw, thick, fill=orange!10, rounded corners, minimum width=5cm, minimum height=0.6cm, font=\scriptsize, align=center},
+  failbox/.style={rectangle, draw, thick, fill=red!15, rounded corners, minimum width=5cm, minimum height=0.6cm, font=\scriptsize\bfseries, align=center},
+  globalbox/.style={rectangle, draw, dashed, fill=gray!8, minimum width=2.5cm, font=\scriptsize\itshape, align=center, inner sep=4pt},
+  arrow/.style={-{Stealth[length=2mm]}, thick},
+]
+\node[funcbox] (func) {f(struct msg *m)};
+\node[instlabel, anchor=south east] at ([xshift=-2pt, yshift=2pt]func.north east) {instrumented};
+\node[fieldbox, below=0.8cm of func] (fields) {%
+  m->hdr\_len\quad\;\; = 20\\
+  m->payload\_len = 4096\\
+  m->total\_len\quad = 100\\
+  m->flags\qquad\;\;\;\, = 0x3};
+\node[instlabel, anchor=north east] at ([xshift=-2pt, yshift=-2pt]fields.south east) {captured at ENTRY};
+\node[checkbox, below=1.0cm of fields] (check) {$\mathcal{S}$: hdr\_len + payload\_len $\leq$ total\_len ?};
+\node[failbox, below=0.6cm of check] (fail) {20 + 4096 = 4116 $>$ 100 $\to$ VIOLATION};
+\draw[arrow] (func) -- node[left, font=\tiny\itshape, text=black!60] {copy\_from\_kernel\_nofault} (fields);
+\draw[arrow] (fields) -- node[left, font=\tiny\itshape, text=black!60] {offline verifier} (check);
+\draw[arrow] (check) -- (fail);
+\node[globalbox, right=0.8cm of check] (global) {global state\\(not captured\\unless passed\\as argument)};
+\draw[dashed, gray, -{Stealth[length=1.5mm]}] (func.east) -- ++(1.8,0) |- (global.north);
+\end{tikzpicture}
+\caption{Struct member contract verification. Instrumented function captures
+struct fields at ENTRY; the offline verifier checks cross-field predicates.
+Global state is opaque unless passed as a parameter.}\label{fig:struct-verify}
+\end{figure}
 
 All 8 argument values are captured individually with correct sizes. Struct
 field expansion works on arg[6] (pointer to \texttt{\#[repr(C)] struct Pair}).
@@ -841,12 +917,39 @@ A Rust function prepares a \texttt{\#[repr(C)]} struct and passes it to a C
 callee. The C function silently modifies a field that the Rust caller assumes
 is immutable:
 
-\begin{lstlisting}[numbers=none]
-[ENTRY] rust_caller(struct{.id=0xcafe, .buf_ptr=0xffff8880.., .len=10})
-  [ENTRY] c_callee(struct{.id=0xcafe, .buf_ptr=0xffff8880.., .len=10})
-  [RET]   c_callee() = 0
-[RET]   rust_caller() = 0xcafe
-\end{lstlisting}
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  node distance=0.4cm,
+  funcbox/.style={rectangle, draw, thick, rounded corners, fill=blue!8, minimum width=7.5cm, minimum height=0.6cm, font=\scriptsize\bfseries, align=left, inner sep=4pt},
+  innerbox/.style={rectangle, draw, rounded corners, fill=purple!8, minimum width=6.8cm, minimum height=0.6cm, font=\scriptsize\bfseries, align=left, inner sep=4pt},
+  retbox/.style={rectangle, draw, rounded corners, fill=green!10, minimum width=6.8cm, minimum height=0.45cm, font=\scriptsize, align=left, inner sep=3pt},
+  instlabel/.style={rectangle, draw=green!60!black, fill=green!10, font=\tiny\bfseries, inner sep=2pt, rounded corners=1pt},
+  arrow/.style={-{Stealth[length=2mm]}, thick},
+]
+% Rust caller ENTRY
+\node[funcbox] (rcall) {[ENTRY] rust\_caller(\colorbox{yellow!25}{.id=0xcafe}, \colorbox{yellow!25}{.buf\_ptr=0xffff8880..}, \colorbox{yellow!25}{.len=10})};
+\node[instlabel, anchor=south east] at ([xshift=-2pt, yshift=2pt]rcall.north east) {Rust};
+
+% C callee ENTRY (nested)
+\node[innerbox, below=0.5cm of rcall] (ccall) {\quad [ENTRY] c\_callee(\colorbox{orange!25}{.id=0xcafe}, \colorbox{orange!25}{.buf\_ptr=0xffff8880..}, \colorbox{orange!25}{.len=10})};
+\node[instlabel, anchor=south east] at ([xshift=-2pt, yshift=2pt]ccall.north east) {C};
+
+% C callee RET
+\node[retbox, below=0.4cm of ccall] (cret) {\quad [RET] \quad c\_callee() = \colorbox{green!20}{0}};
+
+% Rust caller RET
+\node[retbox, below=0.4cm of cret, minimum width=7.5cm, fill=green!10] (rret) {[RET] \quad rust\_caller() = \colorbox{green!20}{0xcafe}};
+
+% FFI boundary marker
+\draw[thick, red!60, dashed] ([xshift=-0.3cm, yshift=0.15cm]ccall.north west) -- ([xshift=0.3cm, yshift=0.15cm]ccall.north east)
+  node[pos=1, right, font=\tiny\bfseries, text=red!60] {FFI boundary};
+\end{tikzpicture}
+\caption{Rust FFI contract auditing. \toolname{} captures struct fields at
+the Rust$\to$C boundary (yellow: Rust side, orange: C side). A verifier
+compares fields across the FFI boundary to detect silent contract
+violations.}\label{fig:ffi-contract}
+\end{figure}
 
 The captured records show the exact struct state at the FFI boundary.
 A post-hoc verifier can compare ENTRY fields of \texttt{c\_callee} against
@@ -1093,11 +1196,27 @@ given valid inputs (callee bug).
 
 When a user-space process calls \texttt{write(binder\_fd, data, len)}, it
 triggers a chain of kernel functions:
-\begin{lstlisting}[numbers=none]
-sys_write -> vfs_write -> binder_write ->
-  binder_thread_write -> binder_transaction ->
-  binder_alloc_buf -> ...
-\end{lstlisting}
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=0.25cm,
+  call/.style={rectangle, draw, rounded corners, fill=blue!5, minimum height=0.45cm, font=\ttfamily\scriptsize, inner sep=3pt},
+  arrow/.style={-{Stealth[length=1.5mm]}, thick, gray},
+]
+\node[call] (s1) {sys\_write};
+\node[call, below=of s1] (s2) {vfs\_write};
+\node[call, below=of s2] (s3) {binder\_write};
+\node[call, below=of s3] (s4) {binder\_thread\_write};
+\node[call, below=of s4] (s5) {binder\_transaction};
+\node[call, below=of s5, fill=orange!10] (s6) {binder\_alloc\_buf};
+\draw[arrow] (s1) -- (s2);
+\draw[arrow] (s2) -- (s3);
+\draw[arrow] (s3) -- (s4);
+\draw[arrow] (s4) -- (s5);
+\draw[arrow] (s5) -- (s6);
+\node[font=\tiny\itshape, right=0.3cm of s6, text=red!60!black] {contract checked here};
+\end{tikzpicture}
+\end{center}
 
 The user cannot predict which functions will execute. Linux
 RV~\cite{dealmeida2019rv} requires
@@ -1142,10 +1261,22 @@ $$\mathcal{P}: -4095 \leq \mathit{errno} \leq -1$$
 $$\mathcal{Q}: \mathit{ret.code} = \mathit{errno}$$
 
 \toolname{} capture:
-\begin{lstlisting}[numbers=none]
-[ENTRY] pc=from_errno arg[0] = -4096  // P violated
-[RET]   pc=from_errno ret = -22       // Q violated
-\end{lstlisting}
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=0.3cm,
+  funcbox/.style={rectangle, draw, thick, rounded corners, fill=blue!8, minimum width=7cm, minimum height=0.5cm, font=\scriptsize\bfseries, align=left, inner sep=4pt},
+  retbox/.style={rectangle, draw, rounded corners, fill=green!10, minimum width=7cm, minimum height=0.5cm, font=\scriptsize, align=left, inner sep=4pt},
+  violabel/.style={rectangle, draw=red!70, fill=red!10, font=\tiny\bfseries, inner sep=2pt, rounded corners=1pt},
+  arrow/.style={-{Stealth[length=2mm]}, thick},
+]
+\node[funcbox] (entry) {[ENTRY] from\_errno(\colorbox{red!20}{arg[0] = -4096})};
+\node[violabel, anchor=west] at ([xshift=3pt]entry.east) {$\mathcal{P}$ violated};
+\node[retbox, below=0.35cm of entry] (ret) {[RET]\quad\; from\_errno() = \colorbox{red!20}{-22}};
+\node[violabel, anchor=west] at ([xshift=3pt]ret.east) {$\mathcal{Q}$ violated};
+\draw[arrow] (entry) -- (ret);
+\end{tikzpicture}
+\end{center}
 
 Verifier output: precondition violated ($-4096 \notin [-4095, -1]$) and
 postcondition violated ($\mathit{ret} = -22 \neq -4096$). Linux RV cannot
@@ -1220,76 +1351,14 @@ method that can detect these violations at runtime with zero source annotation,
 by comparing the actual field values against the cross-field predicates that
 the function's conditional logic implicitly assumes.
 
-\begin{figure}[t]
-\centering
-\begin{tikzpicture}[
-  node distance=0.4cm and 0.6cm,
-  box/.style={rectangle, draw, rounded corners, minimum width=2.4cm, minimum height=0.6cm, font=\scriptsize, align=center},
-  struct/.style={rectangle, draw, thick, fill=yellow!10, minimum width=2.8cm, font=\scriptsize, align=left, inner sep=4pt},
-  check/.style={diamond, draw, fill=orange!10, minimum width=1.2cm, minimum height=0.8cm, font=\scriptsize, align=center, inner sep=1pt},
-  arrow/.style={-{Stealth[length=2mm]}, thick},
-  note/.style={font=\tiny\itshape, text=gray}
-]
-% Function entry
-\node[box, fill=blue!8] (entry) {$f(\texttt{struct}\ S\ *s, \mathit{globals})$};
-
-% Struct state
-\node[struct, below left=0.8cm and 0.3cm of entry] (sinput) {%
-  \texttt{s->len} = 4096\\
-  \texttt{s->cap} = 256\\
-  \texttt{s->flags} = 0x3};
-\node[note, above=0.05cm of sinput] {Input struct state};
-
-% Global state
-\node[struct, below right=0.8cm and 0.3cm of entry] (gstate) {%
-  \texttt{pool\_free} = 128\\
-  \texttt{rcu\_epoch} = 7\\
-  \texttt{lock\_held} = 0};
-\node[note, above=0.05cm of gstate] {Runtime global state};
-
-% Contract check
-\node[check, below=2.2cm of entry] (verify) {$\mathcal{S} \wedge \mathcal{G}$\\valid?};
-
-% Outcomes
-\node[box, fill=green!15, below left=0.8cm and 0.2cm of verify] (pass) {$\checkmark$ Consistent\\safe to proceed};
-\node[box, fill=red!15, below right=0.8cm and 0.2cm of verify] (fail) {$\times$ Violation\\flag for review};
-
-% Arrows
-\draw[arrow] (entry.south) -- ++(0,-0.3) -| (sinput.north);
-\draw[arrow] (entry.south) -- ++(0,-0.3) -| (gstate.north);
-\draw[arrow] (sinput.south) |- (verify.west);
-\draw[arrow] (gstate.south) |- (verify.east);
-\draw[arrow] (verify.south) -- ++(0,-0.3) -| (pass.north) node[pos=0.3, left, note] {yes};
-\draw[arrow] (verify.south) -- ++(0,-0.3) -| (fail.north) node[pos=0.3, right, note] {no};
-
-% Capture annotation
-\draw[decorate, decoration={brace, amplitude=3pt, mirror, raise=15pt}, gray]
-  (sinput.south west) -- (gstate.south east)
-  node[midway, below=18pt, font=\tiny\itshape, text=black] {captured by \toolname{} at function entry};
-\end{tikzpicture}
-\caption{Struct member and global state verification at function entry.
-\toolname{} captures the struct fields and observable global state;
-the offline verifier evaluates the consistency predicate
-$\mathcal{S} \wedge \mathcal{G}$.}\label{fig:struct-verify}
-\end{figure}
-
 \paragraph{Formal model.}
 Let a function $f$ receive a struct parameter $s$ with fields
-$(f_1, \ldots, f_n)$ and access global kernel state $G = (g_1, \ldots, g_m)$.
-Define the \emph{functional verification predicate}:
-$$\mathcal{V}(f) = \mathcal{S}(f_1, \ldots, f_n) \wedge
-  \mathcal{G}(f_1, \ldots, f_n, g_1, \ldots, g_m)$$
-where:
-\begin{itemize}[nosep]
-  \item $\mathcal{S}$: \emph{structural consistency} --- cross-field invariants
-        that must hold regardless of runtime state
-        (e.g., $\mathit{len} \leq \mathit{cap}$,
-        $\mathit{offset} + \mathit{size} \leq \mathit{total}$).
-  \item $\mathcal{G}$: \emph{state-dependent validity} --- predicates that
-        relate struct fields to runtime kernel state
-        (e.g., $\mathit{alloc\_size} \leq \mathit{pool\_free}$,
-        $\mathit{flags} \wedge \mathtt{LOCKED} \implies \mathit{lock\_held} = 1$).
-\end{itemize}
+$(f_1, \ldots, f_n)$. Define the \emph{structural verification predicate}:
+$$\mathcal{V}(f) = \mathcal{S}(f_1, \ldots, f_n)$$
+where $\mathcal{S}$ encodes cross-field invariants that must hold for the
+function's logic to operate correctly
+(e.g., $\mathit{len} \leq \mathit{cap}$,
+$\mathit{offset} + \mathit{size} \leq \mathit{total}$).
 
 \noindent A \emph{violation} $\neg\mathcal{V}(f)$ at function entry means the
 function's internal conditional logic will either:
@@ -1298,12 +1367,14 @@ function's internal conditional logic will either:
   \item Produce semantically incorrect output (wrong branch $\to$ logic bug).
 \end{enumerate}
 
-\paragraph{What \toolname{} captures.} For struct fields, all values are
-captured via \texttt{DICompositeType} expansion at entry (Section~\ref{sec:llvm-pass}).
-For globals accessed by the function, they appear as arguments if passed
-explicitly, or can be captured at a wrapper boundary. The key insight is that
-\toolname{} provides a \emph{snapshot} of the state at the exact moment the
-function is invoked---before any internal check can mask the inconsistency.
+\paragraph{Scope of capture.} \toolname{} captures struct fields reached
+through pointer arguments via one level of dereference
+(Section~\ref{sec:deref}). It does \emph{not} capture global kernel state
+(e.g., slab pressure, lock state) unless that state is passed as an explicit
+function argument. The verification predicate $\mathcal{S}$ is therefore
+limited to relationships between fields \emph{within the same struct}---which
+is precisely where most silent bugs reside, since the kernel trusts that
+callers construct structs consistently.
 
 \paragraph{Classification of violations.}
 \begin{center}
@@ -1313,9 +1384,9 @@ function is invoked---before any internal check can mask the inconsistency.
 \textbf{Violation type} & \textbf{Predicate} & \textbf{Consequence} \\
 \midrule
 Cross-field overflow & $\mathit{off} + \mathit{len} > \mathit{cap}$ & OOB read/write \\
-Flag-state mismatch & $\mathit{flags} \wedge F \neq 0 \wedge \neg\mathit{ready}$ & Use-before-init \\
-Size-resource conflict & $\mathit{req\_sz} > \mathit{avail}$ & Allocation failure \\
-Epoch staleness & $\mathit{s.epoch} < \mathit{global\_epoch}$ & Stale data use \\
+Length inconsistency & $\mathit{hdr} + \mathit{payload} > \mathit{total}$ & Truncation/overread \\
+Flag-field mismatch & $\mathit{flags} \wedge F \neq 0 \wedge \mathit{ptr} = 0$ & NULL deref \\
+Size exceeds bound & $\mathit{req\_sz} > \mathit{max\_allowed}$ & Allocation overflow \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -1435,28 +1506,33 @@ through root-cause analysis.}\label{fig:workflow}
 \begin{figure}[t]
 \centering
 \begin{tikzpicture}[
-  node distance=0.4cm,
-  box/.style={rectangle, draw, rounded corners, minimum width=3cm, minimum height=0.7cm, font=\scriptsize, align=center},
+  node distance=0.6cm,
+  box/.style={rectangle, draw, thick, rounded corners, minimum width=3.2cm, minimum height=0.7cm, font=\scriptsize, align=center},
   arrow/.style={-{Stealth[length=2mm]}, thick},
 ]
 % Top: capture
-\node[box, fill=yellow!15] (cap) {User action $\to$ \toolname{} capture\\(PC, args, ret, struct fields)};
+\node[box, fill=yellow!15] (cap) {\toolname{} capture\\(PC, args, ret, struct fields)};
 
-% Split
-\node[box, fill=green!10, below left=0.8cm and -0.5cm of cap] (audit) {Security Audit\\identify contract violations};
-\node[box, fill=red!8, below right=0.8cm and -0.5cm of cap] (fuzz) {Guided Fuzzing\\constrain mutation ranges};
+% Two branches
+\node[box, fill=green!12, below left=1cm and 0.3cm of cap] (audit) {Security Audit\\contract violations};
+\node[box, fill=red!10, below right=1cm and 0.3cm of cap] (fuzz) {Guided Fuzzing\\value-aware mutation};
 
-% Bottom
-\node[box, fill=blue!8, below=1.5cm of cap, yshift=-1cm] (result) {Confirmed finding with\\reproducible evidence};
+% Bottom: converge
+\node[box, fill=blue!10, below=2.5cm of cap] (result) {Confirmed finding\\reproducible evidence};
 
-\draw[arrow] (cap.south) -- ++(0,-0.3) -| (audit.north);
-\draw[arrow] (cap.south) -- ++(0,-0.3) -| (fuzz.north);
-\draw[arrow] (audit.south) -- ++(0,-0.3) -| (result.north);
-\draw[arrow] (fuzz.south) -- ++(0,-0.3) -| (result.north);
+% Arrows
+\draw[arrow] (cap.south) -- ++(0,-0.25) -| (audit.north);
+\draw[arrow] (cap.south) -- ++(0,-0.25) -| (fuzz.north);
+\draw[arrow] (audit.south) -- ++(0,-0.25) -| (result.north);
+\draw[arrow] (fuzz.south) -- ++(0,-0.25) -| (result.north);
+
+% Labels on edges
+\node[font=\tiny\itshape, text=black!60] at (-2.2,-1.0) {offline};
+\node[font=\tiny\itshape, text=black!60] at (2.2,-1.0) {online};
 \end{tikzpicture}
 \caption{Dual utility: the same captured records serve both manual security
-auditing and automated fuzzing guidance, converging on confirmed findings
-with reproducible evidence.}\label{fig:dual}
+auditing (offline) and automated fuzzing guidance (online), converging on
+confirmed findings with reproducible evidence.}\label{fig:dual}
 \end{figure}
 
 \paragraph{Key property.} The dataflow records are a \emph{deterministic
@@ -1476,7 +1552,7 @@ analyzes observed records rather than speculating about behavior---findings are
 grounded in physical execution regardless of reasoning quality.
 
 \paragraph{Debug Info Requirement.} Full struct field expansion requires
-\texttt{CONFIG\_DEBUG\_INFO} (\texttt{-g}); without it, only scalar argument
+\texttt{CONFIG\_DEBUG\_INFO}; without it, only scalar argument
 values are captured. This is not a practical limitation for kernel fuzzing
 (KASAN already requires debug info).
 
@@ -1607,6 +1683,7 @@ Source code is available at \anonrepo{}.
     \State $T \gets \mathrm{stripTypedefs}(\mathit{DI}.\mathrm{getType}(i))$
     \If{$T$ is \texttt{DICompositeType}}
       \State $\mathit{offsets} \gets \mathrm{getStructFieldOffsets}(T)$
+      \State $\mathit{nfields} \gets |T.\mathrm{getElements()}|$
       \State $\mathit{hash} \gets \mathrm{FNV1a}(T.\mathrm{getName()})$
       \State Create global: $[\mathit{hash}, \mathit{off}_0, \mathit{sz}_0, \ldots]$
     \Else
