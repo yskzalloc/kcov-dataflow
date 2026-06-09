@@ -245,7 +245,11 @@ jobs:
           MAKE_ARGS="$MAKE_ARGS ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-"
         fi
 
-        make -C tools/testing/selftests/kcov_dataflow
+        if [ "${{ matrix.arch }}" = "arm64" ]; then
+          make -C tools/testing/selftests/kcov_dataflow CC=aarch64-linux-gnu-gcc
+        else
+          make -C tools/testing/selftests/kcov_dataflow
+        fi
         make $MAKE_ARGS \
           M=tools/testing/selftests/kcov_dataflow/eight_args_c modules
         if [ "${{ matrix.rt }}" != "true" ] && [ "${{ matrix.arch }}" = "x86_64" ] && \
@@ -265,7 +269,8 @@ jobs:
           vng --cpu 8 --arch arm64 --rw \
             --root docker://arm64v8/debian:sid \
             --rwdir=/tests=$SELFTEST \
-            --user root --exec /tests/user_ioctl/user_ioctl \
+            --user root \
+            --exec "sh -c /tests/user_ioctl/user_ioctl" \
             | tee /tmp/user_ioctl_result.txt
         else
           vng --user root --exec $SELFTEST/user_ioctl/user_ioctl \
@@ -282,8 +287,8 @@ jobs:
             --root docker://arm64v8/debian:sid \
             --rwdir=/tests=$SELFTEST \
             --user root \
-            --exec "python3 /tests/kcov-dataflow-trigger-and-view.py \
-              eight_args_c --ko /tests/eight_args_c/eight_args_mod.ko" \
+            --exec "sh -c 'python3 /tests/kcov-dataflow-trigger-and-view.py \
+              eight_args_c --ko /tests/eight_args_c/eight_args_mod.ko'" \
             | tee /tmp/eight_args_c_result.txt
         else
           vng --user root \
@@ -307,8 +312,8 @@ jobs:
             --root docker://arm64v8/debian:sid \
             --rwdir=/tests=$SELFTEST \
             --user root \
-            --exec "python3 /tests/kcov-dataflow-trigger-and-view.py \
-              eight_args_rust --ko /tests/eight_args_rust/eight_args_rust.ko" \
+            --exec "sh -c 'python3 /tests/kcov-dataflow-trigger-and-view.py \
+              eight_args_rust --ko /tests/eight_args_rust/eight_args_rust.ko'" \
             | tee /tmp/eight_args_rust_result.txt
         else
           vng --user root \
@@ -332,8 +337,8 @@ jobs:
             --root docker://arm64v8/debian:sid \
             --rwdir=/tests=$SELFTEST \
             --user root \
-            --exec "python3 /tests/kcov-dataflow-trigger-and-view.py \
-              rust_ffi_contract --ko /tests/rust_ffi_contract/rust_ffi_contract.ko" \
+            --exec "sh -c 'python3 /tests/kcov-dataflow-trigger-and-view.py \
+              rust_ffi_contract --ko /tests/rust_ffi_contract/rust_ffi_contract.ko'" \
             | tee /tmp/rust_ffi_result.txt
         else
           vng --user root \
