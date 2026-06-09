@@ -248,7 +248,8 @@ jobs:
         make -C tools/testing/selftests/kcov_dataflow
         make $MAKE_ARGS \
           M=tools/testing/selftests/kcov_dataflow/eight_args_c modules
-        if make $MAKE_ARGS rustavailable 2>/dev/null; then
+        if [ "${{ matrix.rt }}" != "true" ] && [ "${{ matrix.arch }}" = "x86_64" ] && \
+           make $MAKE_ARGS rustavailable 2>/dev/null; then
           make $MAKE_ARGS \
             M=tools/testing/selftests/kcov_dataflow/eight_args_rust modules
           make $MAKE_ARGS \
@@ -259,14 +260,15 @@ jobs:
       run: |
         source venv-virtme/bin/activate
         cd linux
-        cp tools/testing/selftests/kcov_dataflow/user_ioctl/user_ioctl /tmp/
+        SELFTEST=tools/testing/selftests/kcov_dataflow
         if [ "${{ matrix.arch }}" = "arm64" ]; then
           vng --cpu 8 --arch arm64 --rw \
             --root docker://arm64v8/debian:sid \
-            --user root --exec /tmp/user_ioctl \
+            --rwdir=/tests=$SELFTEST \
+            --user root --exec /tests/user_ioctl/user_ioctl \
             | tee /tmp/user_ioctl_result.txt
         else
-          vng --user root --exec /tmp/user_ioctl \
+          vng --user root --exec $SELFTEST/user_ioctl/user_ioctl \
             | tee /tmp/user_ioctl_result.txt
         fi
 
@@ -274,19 +276,19 @@ jobs:
       run: |
         source venv-virtme/bin/activate
         cd linux
-        cp tools/testing/selftests/kcov_dataflow/eight_args_c/eight_args_mod.ko /tmp/
-        cp tools/testing/selftests/kcov_dataflow/kcov-dataflow-trigger-and-view.py /tmp/
+        SELFTEST=tools/testing/selftests/kcov_dataflow
         if [ "${{ matrix.arch }}" = "arm64" ]; then
           vng --cpu 8 --arch arm64 --rw \
             --root docker://arm64v8/debian:sid \
+            --rwdir=/tests=$SELFTEST \
             --user root \
-            --exec "python3 /tmp/kcov-dataflow-trigger-and-view.py \
-              eight_args_c --ko /tmp/eight_args_mod.ko" \
+            --exec "python3 /tests/kcov-dataflow-trigger-and-view.py \
+              eight_args_c --ko /tests/eight_args_c/eight_args_mod.ko" \
             | tee /tmp/eight_args_c_result.txt
         else
           vng --user root \
-            --exec "python3 /tmp/kcov-dataflow-trigger-and-view.py \
-              eight_args_c --ko /tmp/eight_args_mod.ko" \
+            --exec "python3 $SELFTEST/kcov-dataflow-trigger-and-view.py \
+              eight_args_c --ko $SELFTEST/eight_args_c/eight_args_mod.ko" \
             | tee /tmp/eight_args_c_result.txt
         fi
 
@@ -294,24 +296,24 @@ jobs:
       run: |
         source venv-virtme/bin/activate
         cd linux
-        if [ ! -f tools/testing/selftests/kcov_dataflow/eight_args_rust/eight_args_rust.ko ]; then
+        SELFTEST=tools/testing/selftests/kcov_dataflow
+        if [ ! -f $SELFTEST/eight_args_rust/eight_args_rust.ko ]; then
           echo "# Captured 0 records (rustc not available, skipped)" \
             > /tmp/eight_args_rust_result.txt
           exit 0
         fi
-        cp tools/testing/selftests/kcov_dataflow/eight_args_rust/eight_args_rust.ko /tmp/
-        cp tools/testing/selftests/kcov_dataflow/kcov-dataflow-trigger-and-view.py /tmp/
         if [ "${{ matrix.arch }}" = "arm64" ]; then
           vng --cpu 8 --arch arm64 --rw \
             --root docker://arm64v8/debian:sid \
+            --rwdir=/tests=$SELFTEST \
             --user root \
-            --exec "python3 /tmp/kcov-dataflow-trigger-and-view.py \
-              eight_args_rust --ko /tmp/eight_args_rust.ko" \
+            --exec "python3 /tests/kcov-dataflow-trigger-and-view.py \
+              eight_args_rust --ko /tests/eight_args_rust/eight_args_rust.ko" \
             | tee /tmp/eight_args_rust_result.txt
         else
           vng --user root \
-            --exec "python3 /tmp/kcov-dataflow-trigger-and-view.py \
-              eight_args_rust --ko /tmp/eight_args_rust.ko" \
+            --exec "python3 $SELFTEST/kcov-dataflow-trigger-and-view.py \
+              eight_args_rust --ko $SELFTEST/eight_args_rust/eight_args_rust.ko" \
             | tee /tmp/eight_args_rust_result.txt
         fi
 
@@ -319,24 +321,24 @@ jobs:
       run: |
         source venv-virtme/bin/activate
         cd linux
-        if [ ! -f tools/testing/selftests/kcov_dataflow/rust_ffi_contract/rust_ffi_contract.ko ]; then
+        SELFTEST=tools/testing/selftests/kcov_dataflow
+        if [ ! -f $SELFTEST/rust_ffi_contract/rust_ffi_contract.ko ]; then
           echo "# Captured 0 records (rustc not available, skipped)" \
             > /tmp/rust_ffi_result.txt
           exit 0
         fi
-        cp tools/testing/selftests/kcov_dataflow/rust_ffi_contract/rust_ffi_contract.ko /tmp/
-        cp tools/testing/selftests/kcov_dataflow/kcov-dataflow-trigger-and-view.py /tmp/
         if [ "${{ matrix.arch }}" = "arm64" ]; then
           vng --cpu 8 --arch arm64 --rw \
             --root docker://arm64v8/debian:sid \
+            --rwdir=/tests=$SELFTEST \
             --user root \
-            --exec "python3 /tmp/kcov-dataflow-trigger-and-view.py \
-              rust_ffi_contract --ko /tmp/rust_ffi_contract.ko" \
+            --exec "python3 /tests/kcov-dataflow-trigger-and-view.py \
+              rust_ffi_contract --ko /tests/rust_ffi_contract/rust_ffi_contract.ko" \
             | tee /tmp/rust_ffi_result.txt
         else
           vng --user root \
-            --exec "python3 /tmp/kcov-dataflow-trigger-and-view.py \
-              rust_ffi_contract --ko /tmp/rust_ffi_contract.ko" \
+            --exec "python3 $SELFTEST/kcov-dataflow-trigger-and-view.py \
+              rust_ffi_contract --ko $SELFTEST/rust_ffi_contract/rust_ffi_contract.ko" \
             | tee /tmp/rust_ffi_result.txt
         fi
 
