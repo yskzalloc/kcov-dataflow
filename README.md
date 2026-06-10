@@ -30,7 +30,7 @@ linux/                                          Kernel tree (submodule)
   scripts/Makefile.kcov                         Build system flags
   scripts/Makefile.lib                          Per-module opt-in logic
   tools/testing/selftests/kcov_dataflow/        Selftests
-    kcov-dataflow-trigger-and-view.py           Visualization tool
+    trigger-view.py                             Visualization tool
     user_ioctl/user_ioctl.c                     Automated ioctl test (TAP)
     eight_args_c/                               C 1-8 arg stress test
     eight_args_rust/                            Rust equivalent
@@ -40,7 +40,7 @@ llvm-project/                                   Custom LLVM (submodule)
 rust/                                           Custom rustc (submodule)
 
 findings/                                       PoC evaluation modules
-paper/                                          LaTeX paper (arxiv + overleaf)
+paper/                                          LaTeX paper (arxiv)
 ```
 
 ## Testing Guide
@@ -48,10 +48,29 @@ paper/                                          LaTeX paper (arxiv + overleaf)
 ### Prerequisites
 
 - Linux host (x86_64 or arm64)
-- cmake, ninja-build
-- Host clang (for bootstrapping LLVM build)
-- QEMU (for virtme-ng boot testing)
-- Python 3 + virtme-ng (`pip install virtme-ng`)
+- Python 3 + virtme-ng
+
+Install build dependencies:
+```bash
+# Debian/Ubuntu
+sudo apt-get install -y \
+  build-essential bc flex bison libelf-dev libssl-dev \
+  cmake ninja-build clang lld \
+  python3 python3-pip python3-venv \
+  qemu-system-x86 qemu-system-arm libdw-dev zstd
+
+# virtme-ng (for booting kernel in QEMU without a rootfs)
+python3 -m venv venv-virtme
+source venv-virtme/bin/activate
+pip install virtme-ng
+```
+
+For Rust module support (optional):
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+cargo install bindgen-cli
+```
 
 ### Clone
 
@@ -76,15 +95,14 @@ cmake -S llvm -B build -G Ninja \
   -DCMAKE_CXX_COMPILER=clang++ \
   -DLLVM_ENABLE_LLD=ON \
   -DLLVM_ENABLE_PROJECTS="clang;lld" \
-  -DLLVM_TARGETS_TO_BUILD="X86;AArch64;ARM"
+  -DLLVM_TARGETS_TO_BUILD="X86;AArch64"
 ninja -C build
 cd ..
 ```
 
-For native arm64 builds, replace targets with `"AArch64;ARM"` (ARM needed
-for vdso32 Thumb compilation).
+For native arm64, use `"AArch64"` only.
 
-Verify the custom passes are available:
+Verify the custom passes:
 ```bash
 llvm-project/build/bin/opt --help-hidden | grep trace-args
 # Expected: --sanitizer-coverage-trace-args
@@ -99,6 +117,7 @@ export PATH="$PWD/llvm-project/build/bin:$PATH"
 ### Step 3: Build and Boot Kernel
 
 ```bash
+source venv-virtme/bin/activate
 cd linux
 vng --build \
   --configitem CONFIG_KCOV=y \
@@ -110,16 +129,6 @@ vng --build \
   LLVM=1 CC=clang
 ```
 
-For arm64 cross-compilation from x86_64 host:
-```bash
-vng --build --arch arm64 \
-  --configitem CONFIG_KCOV=y \
-  --configitem CONFIG_KCOV_DATAFLOW_ARGS=y \
-  --configitem CONFIG_KCOV_DATAFLOW_RET=y \
-  --configitem CONFIG_COMPAT_VDSO=n \
-  LLVM=1 CC=clang CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
-```
-
 ### Step 4: Run Selftests
 
 #### user_ioctl (TAP test, 9 cases)
@@ -128,7 +137,7 @@ make -C tools/testing/selftests/kcov_dataflow
 vng --user root --exec tools/testing/selftests/kcov_dataflow/user_ioctl/user_ioctl
 ```
 
-Expected output:
+Expected:
 ```
 TAP version 13
 1..9
@@ -142,8 +151,8 @@ ok 9 kcov_dataflow.records_captured
 ```bash
 make LLVM=1 CC=clang M=tools/testing/selftests/kcov_dataflow/eight_args_c modules
 vng --user root --exec \
-  "python3 tools/testing/selftests/kcov_dataflow/kcov-dataflow-trigger-and-view.py \
-    eight_args_c --ko tools/testing/selftests/kcov_dataflow/eight_args_c/eight_args_mod.ko"
+  "python3 tools/testing/selftests/kcov_dataflow/trigger-view.py \
+    eight_args_c --ko tools/testing/selftests/kcov_dataflow/eight_args_c/eight_args_c.ko"
 ```
 
 Expected: `# Captured N words` with N > 0.
@@ -182,19 +191,22 @@ Then rebuild the kernel with `CONFIG_RUST=y` and build Rust selftests:
 cd linux
 make LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC \
   M=tools/testing/selftests/kcov_dataflow/eight_args_rust modules
+make LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC \
+  M=tools/testing/selftests/kcov_dataflow/rust_ffi_contract modules
 ```
 
 ## CI Pipeline
 
-The GitHub Actions workflow (`.github/workflows/ci.yml`) runs a 3-stage pipeline:
+GitHub Actions workflow (`.github/workflows/ci.yml`):
 
-1. **build-llvm**: Builds custom LLVM/Clang with X86+AArch64+ARM targets
-2. **build-rust**: Builds rustc stage1 against custom LLVM
-3. **test** (4x matrix): Builds kernel and runs selftests
-   - x86_64 (KVM)
-   - x86_64-rt (KVM, PREEMPT_RT)
-   - arm64 (TCG, docker rootfs)
-   - arm64-rt (TCG, docker rootfs, PREEMPT_RT)
+1. **build** (per-arch): Custom LLVM + rustc on native runners
+2. **test** (4x matrix): Kernel build + selftests
+   - x86_64 (`ubuntu-latest`, KVM)
+   - x86_64-rt (`ubuntu-latest`, KVM, PREEMPT_RT)
+   - arm64 (`ubuntu-24.04-arm`, native)
+   - arm64-rt (`ubuntu-24.04-arm`, native, PREEMPT_RT)
+
+CI results: https://github.com/yskzalloc/kcov-dataflow/actions
 
 ## Enabling for a Module
 
@@ -238,6 +250,8 @@ Each record (3 + N words):
 | LLVM PR | https://github.com/llvm/llvm-project/pull/201410 |
 | LLVM RFC | https://discourse.llvm.org/t/rfc-sanitizercoverage-add-fsanitize-coverage-trace-args-trace-ret/91026 |
 | Kernel v2 | https://lore.kernel.org/all/20260603-kcov-dataflow-next-20260603-v2-0-fee0939de2c4@est.tech/ |
+| Paper | https://arxiv.org/pdf/2606.00455 |
+| CI | https://github.com/yskzalloc/kcov-dataflow/actions |
 | Custom LLVM | https://github.com/yskzalloc/llvm-project |
 | Custom rustc | https://github.com/yskzalloc/rust |
 | Kernel | https://github.com/yskzalloc/linux |

@@ -258,8 +258,8 @@ jobs:
         cd linux
         SELFTEST=tools/testing/selftests/kcov_dataflow
         vng --user root \
-          --exec "python3 $SELFTEST/kcov-dataflow-trigger-and-view.py \
-            eight_args_c --ko $SELFTEST/eight_args_c/eight_args_mod.ko" \
+          --exec "python3 $SELFTEST/trigger-view.py \
+            eight_args_c -C 8 --ko $SELFTEST/eight_args_c/eight_args_c.ko" \
           | tee /tmp/eight_args_c_result.txt
 
     - name: Run eight_args_rust selftest
@@ -273,8 +273,8 @@ jobs:
           exit 0
         fi
         vng --user root \
-          --exec "python3 $SELFTEST/kcov-dataflow-trigger-and-view.py \
-            eight_args_rust --ko $SELFTEST/eight_args_rust/eight_args_rust.ko" \
+          --exec "python3 $SELFTEST/trigger-view.py \
+            eight_args_rust -C 8 --ko $SELFTEST/eight_args_rust/eight_args_rust.ko" \
           | tee /tmp/eight_args_rust_result.txt
 
     - name: Run rust_ffi_contract selftest
@@ -288,8 +288,8 @@ jobs:
           exit 0
         fi
         vng --user root \
-          --exec "python3 $SELFTEST/kcov-dataflow-trigger-and-view.py \
-            rust_ffi_contract --ko $SELFTEST/rust_ffi_contract/rust_ffi_contract.ko" \
+          --exec "python3 $SELFTEST/trigger-view.py \
+            rust_ffi_contract -C 8 --ko $SELFTEST/rust_ffi_contract/rust_ffi_contract.ko" \
           | tee /tmp/rust_ffi_result.txt
 
     # --- Results ---
@@ -322,6 +322,8 @@ jobs:
           { echo "FAIL: user_ioctl did not pass"; exit 1; }
         grep -q "Captured" /tmp/eight_args_c_result.txt || \
           { echo "FAIL: eight_args_c no captures"; exit 1; }
+        grep -q "showing [1-9]" /tmp/eight_args_c_result.txt || \
+          { echo "FAIL: eight_args_c no context records shown"; exit 1; }
         grep -qE "Captured|skipped" /tmp/eight_args_rust_result.txt || \
           { echo "FAIL: eight_args_rust"; exit 1; }
         grep -qE "Captured|skipped" /tmp/rust_ffi_result.txt || \
