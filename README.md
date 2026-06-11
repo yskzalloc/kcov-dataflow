@@ -249,7 +249,7 @@ Each record (3 + N words):
 |----------|-----|
 | LLVM PR | https://github.com/llvm/llvm-project/pull/201410 |
 | LLVM RFC | https://discourse.llvm.org/t/rfc-sanitizercoverage-add-fsanitize-coverage-trace-args-trace-ret/91026 |
-| Kernel v2 | https://lore.kernel.org/all/20260603-kcov-dataflow-next-20260603-v2-0-fee0939de2c4@est.tech/ |
+| Kernel v2 | https://lore.kernel.org/all/20260611-b4-kcov-dataflow-v2-v2-0-0a261da3987c@est.tech/ |
 | Paper | https://arxiv.org/pdf/2606.00455 |
 | CI | https://github.com/yskzalloc/kcov-dataflow/actions |
 | Custom LLVM | https://github.com/yskzalloc/llvm-project |
