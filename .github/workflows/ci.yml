@@ -213,6 +213,8 @@ jobs:
           --configitem CONFIG_KCOV_DATAFLOW_INSTRUMENT_ALL=y \
           --configitem CONFIG_DEBUG_INFO=y \
           --configitem CONFIG_DEBUG_INFO_DWARF5=y \
+          --configitem CONFIG_ANDROID_BINDER_IPC=y \
+          --configitem CONFIG_ANDROID_BINDERFS=y \
           $RUST_CONFIGS \
           $EXTRA_CONFIGS \
           LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC
@@ -226,8 +228,9 @@ jobs:
 
         MAKE_ARGS="LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC"
 
-        # Build user_ioctl (native)
+        # Build user_ioctl and binderfs (native)
         make -C tools/testing/selftests/kcov_dataflow
+        make -C tools/testing/selftests/kcov_dataflow/binderfs
 
         # C module
         make $MAKE_ARGS \
@@ -292,6 +295,14 @@ jobs:
             rust_ffi_contract -C 8 --ko $SELFTEST/rust_ffi_contract/rust_ffi_contract.ko" \
           | tee /tmp/rust_ffi_result.txt
 
+    - name: Run binderfs selftest
+      run: |
+        source venv-virtme/bin/activate
+        cd linux
+        SELFTEST=tools/testing/selftests/kcov_dataflow
+        vng --user root --exec $SELFTEST/binderfs/binderfs_test \
+          | tee /tmp/binderfs_result.txt
+
     # --- Results ---
 
     - name: Report results
@@ -313,6 +324,9 @@ jobs:
         echo "--- rust_ffi_contract ---"
         cat /tmp/rust_ffi_result.txt 2>/dev/null || echo "MISSING"
         echo ""
+        echo "--- binderfs ---"
+        cat /tmp/binderfs_result.txt 2>/dev/null || echo "MISSING"
+        echo ""
         echo "============================================"
 
     - name: Verify pass
@@ -328,4 +342,6 @@ jobs:
           { echo "FAIL: eight_args_rust"; exit 1; }
         grep -qE "Captured|skipped" /tmp/rust_ffi_result.txt || \
           { echo "FAIL: rust_ffi_contract"; exit 1; }
+        grep -qE "ok [1-9]|SKIP" /tmp/binderfs_result.txt || \
+          { echo "FAIL: binderfs"; exit 1; }
         echo "All tests passed (${{ matrix.name }})"
