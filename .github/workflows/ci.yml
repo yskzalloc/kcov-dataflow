@@ -243,7 +243,13 @@ jobs:
             M=tools/testing/selftests/kcov_dataflow/eight_args_rust modules
           make $MAKE_ARGS \
             M=tools/testing/selftests/kcov_dataflow/rust_ffi_contract modules
+          make $MAKE_ARGS \
+            M=tools/testing/selftests/kcov_dataflow/eight_struct_args_rust modules
         fi
+
+        # C struct args module
+        make $MAKE_ARGS \
+          M=tools/testing/selftests/kcov_dataflow/eight_struct_args_c modules
 
     # --- Test execution (native on both arches) ---
 
@@ -303,6 +309,31 @@ jobs:
         vng --user root --exec $SELFTEST/binderfs/binderfs_test \
           | tee /tmp/binderfs_result.txt
 
+    - name: Run eight_struct_args_c selftest
+      run: |
+        source venv-virtme/bin/activate
+        cd linux
+        SELFTEST=tools/testing/selftests/kcov_dataflow
+        vng --user root \
+          --exec "python3 $SELFTEST/trigger-view.py \
+            eight_struct_args_c -C 8 --ko $SELFTEST/eight_struct_args_c/eight_struct_args_c.ko" \
+          | tee /tmp/eight_struct_args_c_result.txt
+
+    - name: Run eight_struct_args_rust selftest
+      run: |
+        source venv-virtme/bin/activate
+        cd linux
+        SELFTEST=tools/testing/selftests/kcov_dataflow
+        if [ ! -f $SELFTEST/eight_struct_args_rust/eight_struct_args_rust.ko ]; then
+          echo "# Captured 0 records (rustc not available, skipped)" \
+            > /tmp/eight_struct_args_rust_result.txt
+          exit 0
+        fi
+        vng --user root \
+          --exec "python3 $SELFTEST/trigger-view.py \
+            eight_struct_args_rust -C 8 --ko $SELFTEST/eight_struct_args_rust/eight_struct_args_rust.ko" \
+          | tee /tmp/eight_struct_args_rust_result.txt
+
     # --- Results ---
 
     - name: Report results
@@ -327,6 +358,12 @@ jobs:
         echo "--- binderfs ---"
         cat /tmp/binderfs_result.txt 2>/dev/null || echo "MISSING"
         echo ""
+        echo "--- eight_struct_args_c ---"
+        cat /tmp/eight_struct_args_c_result.txt 2>/dev/null || echo "MISSING"
+        echo ""
+        echo "--- eight_struct_args_rust ---"
+        cat /tmp/eight_struct_args_rust_result.txt 2>/dev/null || echo "MISSING"
+        echo ""
         echo "============================================"
 
     - name: Verify pass
@@ -344,4 +381,8 @@ jobs:
           { echo "FAIL: rust_ffi_contract"; exit 1; }
         grep -qE "ok [1-9]|SKIP" /tmp/binderfs_result.txt || \
           { echo "FAIL: binderfs"; exit 1; }
+        grep -qE "Captured|skipped" /tmp/eight_struct_args_c_result.txt || \
+          { echo "FAIL: eight_struct_args_c"; exit 1; }
+        grep -qE "Captured|skipped" /tmp/eight_struct_args_rust_result.txt || \
+          { echo "FAIL: eight_struct_args_rust"; exit 1; }
         echo "All tests passed (${{ matrix.name }})"
