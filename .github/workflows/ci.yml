@@ -213,6 +213,7 @@ jobs:
           --configitem CONFIG_KCOV_DATAFLOW_INSTRUMENT_ALL=y \
           --configitem CONFIG_DEBUG_INFO=y \
           --configitem CONFIG_DEBUG_INFO_DWARF5=y \
+          --configitem CONFIG_DEBUG_INFO_REDUCED=n \
           --configitem CONFIG_ANDROID_BINDER_IPC=y \
           --configitem CONFIG_ANDROID_BINDERFS=y \
           $RUST_CONFIGS \
