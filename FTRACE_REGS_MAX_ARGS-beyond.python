@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""
+Count kernel functions with >6 parameters (beyond FTRACE_REGS_MAX_ARGS).
+
+Requires: semcode database indexed for the kernel tree.
+Usage:
+    # 1. Dump functions from semcode
+    cd /path/to/linux
+    semcode -q "dump-functions /tmp/funcs.json"
+
+    # 2. Run this script
+    python3 FTRACE_REGS_MAX_ARGS-beyond.python /tmp/funcs.json
+"""
+import json
+import sys
+from collections import Counter
+
+FTRACE_MAX = 6
+
+def main():
+    path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/funcs.json"
+    with open(path) as f:
+        funcs = json.load(f)
+
+    over = []
+    for func in funcs:
+        params = func.get("parameters", [])
+        fp = func.get("file_path", "")
+        if len(params) > FTRACE_MAX and not fp.startswith("tools/") and not fp.startswith("samples/"):
+            over.append((func["name"], len(params), fp))
+
+    over.sort(key=lambda x: (-x[1], x[0]))
+    total = sum(1 for f in funcs if not f.get("file_path", "").startswith(("tools/", "samples/")))
+
+    subsystems = Counter()
+    for _, _, fp in over:
+        parts = fp.split("/")
+        subsystems["/".join(parts[:2]) if len(parts) >= 2 else fp] += 1
+
+    param_counts = Counter(c for _, c, _ in over)
+
+    print(f"Total kernel functions: {total:,}")
+    print(f"Functions with >{FTRACE_MAX} args: {len(over):,} ({100*len(over)/total:.2f}%)")
+    print()
+    print("Distribution:")
+    for n in sorted(param_counts):
+        print(f"  {n:2d} args: {param_counts[n]:5d} functions (ftrace misses {n - FTRACE_MAX} args)")
+    print()
+    print("Top subsystems:")
+    for subsys, cnt in subsystems.most_common(20):
+        print(f"  {cnt:5d}  {subsys}")
+    print()
+    print("Top 50 functions:")
+    for name, cnt, fp in over[:50]:
+        print(f"  {cnt:2d} args: {name:50s} {fp}")
+
+if __name__ == "__main__":
+    main()

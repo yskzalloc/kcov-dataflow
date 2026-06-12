@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""
+Find kernel functions with >6 args that are NOT inlined (verified via vmlinux symbols).
+
+Inlined functions don't exist as callable symbols -- ftrace can't trace them either.
+Only non-inlined functions matter for the ftrace vs kcov_dataflow comparison.
+
+Usage:
+    # 1. Dump functions from semcode
+    cd /path/to/linux
+    semcode -q "dump-functions /tmp/funcs.json"
+
+    # 2. Extract symbols from vmlinux
+    nm vmlinux | awk '$2 ~ /[tT]/ {print $3}' > /tmp/vmlinux_syms.txt
+    # Or from /proc/kallsyms:
+    # awk '$2 ~ /[tT]/ {print $3}' /proc/kallsyms > /tmp/vmlinux_syms.txt
+
+    # 3. Run this script
+    python3 FTRACE_REGS_MAX_ARGS-beyond-no-inline.python /tmp/funcs.json /tmp/vmlinux_syms.txt
+"""
+import json
+import sys
+from collections import Counter
+
+FTRACE_MAX = 6
+
+def main():
+    funcs_path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/funcs.json"
+    syms_path = sys.argv[2] if len(sys.argv) > 2 else "/tmp/vmlinux_syms.txt"
+
+    # Load vmlinux symbols (text section = actual compiled functions)
+    with open(syms_path) as f:
+        vmlinux_syms = set(line.strip() for line in f if line.strip())
+    print(f"Loaded {len(vmlinux_syms):,} symbols from vmlinux")
+
+    with open(funcs_path) as f:
+        funcs = json.load(f)
+
+    over6 = []
+    inlined = 0
+    for func in funcs:
+        params = func.get("parameters", [])
+        fp = func.get("file_path", "")
+        name = func["name"]
+        if len(params) > FTRACE_MAX and not fp.startswith(("tools/", "samples/")):
+            if name in vmlinux_syms:
+                over6.append((name, len(params), fp))
+            else:
+                inlined += 1
+
+    over6.sort(key=lambda x: (-x[1], x[0]))
+    total_syms = sum(1 for f in funcs if not f.get("file_path", "").startswith(("tools/", "samples/")))
+
+    subsystems = Counter()
+    for _, _, fp in over6:
+        parts = fp.split("/")
+        subsystems["/".join(parts[:2]) if len(parts) >= 2 else fp] += 1
+
+    param_counts = Counter(c for _, c, _ in over6)
+
+    # Write output
+    out_path = "/home/debian-sid/kcov-dataflow/FTRACE_REGS_MAX_ARGS-beyond-no-inline.md"
+    with open(out_path, "w") as out:
+        out.write("# Functions Beyond FTRACE_REGS_MAX_ARGS (>6 parameters) -- Non-Inlined Only\n\n")
+        out.write("Generated from Linux kernel source (semcode) cross-referenced with vmlinux symbols.\n")
+        out.write("Only functions that appear as symbols in vmlinux are listed (i.e., NOT inlined).\n\n")
+        out.write("## Method\n\n")
+        out.write("1. semcode indexes all function definitions from source\n")
+        out.write("2. `nm vmlinux` extracts text symbols (actual compiled, non-inlined functions)\n")
+        out.write("3. Cross-reference: only functions present in BOTH are real callable targets\n")
+        out.write("4. These are functions ftrace CAN trace but CANNOT fully capture args for\n\n")
+        out.write("## Summary\n\n")
+        out.write(f"- Total source functions indexed: {total_syms:,}\n")
+        out.write(f"- Functions with >6 params (source): {len(over6) + inlined:,}\n")
+        out.write(f"- Inlined (not in vmlinux, excluded): {inlined:,}\n")
+        out.write(f"- **Non-inlined with >6 params: {len(over6):,}**\n\n")
+        out.write("## Distribution by parameter count\n\n")
+        out.write("| Args | Functions | ftrace misses |\n")
+        out.write("|------|-----------|---------------|\n")
+        for n in sorted(param_counts.keys()):
+            out.write(f"| {n} | {param_counts[n]:,} | {n - FTRACE_MAX} |\n")
+        out.write("\n## By subsystem (top 30)\n\n")
+        out.write("| Subsystem | Count |\n")
+        out.write("|-----------|-------|\n")
+        for subsys, cnt in subsystems.most_common(30):
+            out.write(f"| `{subsys}` | {cnt} |\n")
+        out.write("\n## Full list\n\n")
+        out.write("| Args | Function | File |\n")
+        out.write("|------|----------|------|\n")
+        for name, cnt, fp in over6:
+            out.write(f"| {cnt} | `{name}` | `{fp}` |\n")
+        out.write("\n## Notes\n\n")
+        out.write("- Functions marked `static inline` in headers are excluded (not in vmlinux)\n")
+        out.write("- Functions the compiler chose to inline (LTO, -O2 heuristics) are also excluded\n")
+        out.write("- Remaining functions are real call targets: ftrace CAN hook them but MISSES args 7+\n")
+        out.write("- kcov_dataflow captures ALL args for these functions at the LLVM IR level\n")
+
+    print(f"Non-inlined functions with >6 args: {len(over6):,}")
+    print(f"Inlined (excluded): {inlined:,}")
+    print(f"Output: {out_path}")
+
+if __name__ == "__main__":
+    main()
