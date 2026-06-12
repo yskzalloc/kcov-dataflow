@@ -211,6 +211,7 @@ jobs:
           --configitem CONFIG_KCOV_DATAFLOW_ARGS=y \
           --configitem CONFIG_KCOV_DATAFLOW_RET=y \
           --configitem CONFIG_KCOV_DATAFLOW_INSTRUMENT_ALL=y \
+          --configitem CONFIG_KCOV_DATAFLOW_NO_INLINE=y \
           --configitem CONFIG_DEBUG_INFO=y \
           --configitem CONFIG_DEBUG_INFO_DWARF5=y \
           --configitem CONFIG_DEBUG_INFO_REDUCED=n \
@@ -269,7 +270,7 @@ jobs:
         SELFTEST=tools/testing/selftests/kcov_dataflow
         vng --user root \
           --exec "python3 $SELFTEST/trigger-view.py \
-            eight_args_c -C 8 --ko $SELFTEST/eight_args_c/eight_args_c.ko" \
+            eight_args_c -C 64 --ko $SELFTEST/eight_args_c/eight_args_c.ko" \
           | tee /tmp/eight_args_c_result.txt
 
     - name: Run eight_args_rust selftest
@@ -284,7 +285,7 @@ jobs:
         fi
         vng --user root \
           --exec "python3 $SELFTEST/trigger-view.py \
-            eight_args_rust -C 8 --ko $SELFTEST/eight_args_rust/eight_args_rust.ko" \
+            eight_args_rust -C 64 --ko $SELFTEST/eight_args_rust/eight_args_rust.ko" \
           | tee /tmp/eight_args_rust_result.txt
 
     - name: Run rust_ffi_contract selftest
@@ -299,7 +300,7 @@ jobs:
         fi
         vng --user root \
           --exec "python3 $SELFTEST/trigger-view.py \
-            rust_ffi_contract -C 8 --ko $SELFTEST/rust_ffi_contract/rust_ffi_contract.ko" \
+            rust_ffi_contract -C 64 --ko $SELFTEST/rust_ffi_contract/rust_ffi_contract.ko" \
           | tee /tmp/rust_ffi_result.txt
 
     - name: Run binderfs selftest
@@ -317,7 +318,7 @@ jobs:
         SELFTEST=tools/testing/selftests/kcov_dataflow
         vng --user root \
           --exec "python3 $SELFTEST/trigger-view.py \
-            eight_struct_args_c -C 8 --ko $SELFTEST/eight_struct_args_c/eight_struct_args_c.ko" \
+            eight_struct_args_c -C 64 --ko $SELFTEST/eight_struct_args_c/eight_struct_args_c.ko" \
           | tee /tmp/eight_struct_args_c_result.txt
 
     - name: Run eight_struct_args_rust selftest
@@ -332,7 +333,7 @@ jobs:
         fi
         vng --user root \
           --exec "python3 $SELFTEST/trigger-view.py \
-            eight_struct_args_rust -C 8 --ko $SELFTEST/eight_struct_args_rust/eight_struct_args_rust.ko" \
+            eight_struct_args_rust -C 64 --ko $SELFTEST/eight_struct_args_rust/eight_struct_args_rust.ko" \
           | tee /tmp/eight_struct_args_rust_result.txt
 
     # --- Results ---
