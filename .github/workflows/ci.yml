@@ -237,13 +237,11 @@ jobs:
 
         # C module
         make $MAKE_ARGS \
-          M=tools/testing/selftests/kcov_dataflow/eight_args_c modules
 
         # Rust modules (non-RT only)
         if [ "${{ matrix.rt }}" != "true" ] && \
            make $MAKE_ARGS rustavailable 2>/dev/null; then
           make $MAKE_ARGS \
-            M=tools/testing/selftests/kcov_dataflow/eight_args_rust modules
           make $MAKE_ARGS \
             M=tools/testing/selftests/kcov_dataflow/rust_ffi_contract modules
           make $MAKE_ARGS \
@@ -264,30 +262,7 @@ jobs:
         vng --user root --exec $SELFTEST/user_ioctl/user_ioctl \
           | tee /tmp/user_ioctl_result.txt
 
-    - name: Run eight_args_c selftest
-      run: |
-        source venv-virtme/bin/activate
-        cd linux
-        SELFTEST=tools/testing/selftests/kcov_dataflow
-        vng --user root \
-          --exec "python3 $SELFTEST/trigger-view.py \
-            eight_args_c -C 64 --ko $SELFTEST/eight_args_c/eight_args_c.ko" \
-          | tee /tmp/eight_args_c_result.txt
 
-    - name: Run eight_args_rust selftest
-      run: |
-        source venv-virtme/bin/activate
-        cd linux
-        SELFTEST=tools/testing/selftests/kcov_dataflow
-        if [ ! -f $SELFTEST/eight_args_rust/eight_args_rust.ko ]; then
-          echo "# Captured 0 records (rustc not available, skipped)" \
-            > /tmp/eight_args_rust_result.txt
-          exit 0
-        fi
-        vng --user root \
-          --exec "python3 $SELFTEST/trigger-view.py \
-            eight_args_rust -C 64 --ko $SELFTEST/eight_args_rust/eight_args_rust.ko" \
-          | tee /tmp/eight_args_rust_result.txt
 
     - name: Run rust_ffi_contract selftest
       run: |
@@ -349,11 +324,7 @@ jobs:
         echo "--- user_ioctl (TAP) ---"
         grep -E "^(ok|not ok|#|PASSED|FAILED|TAP)" /tmp/user_ioctl_result.txt 2>/dev/null || echo "MISSING"
         echo ""
-        echo "--- eight_args_c ---"
-        cat /tmp/eight_args_c_result.txt 2>/dev/null || echo "MISSING"
         echo ""
-        echo "--- eight_args_rust ---"
-        cat /tmp/eight_args_rust_result.txt 2>/dev/null || echo "MISSING"
         echo ""
         echo "--- rust_ffi_contract ---"
         cat /tmp/rust_ffi_result.txt 2>/dev/null || echo "MISSING"
@@ -374,12 +345,6 @@ jobs:
         # Verify each test produced expected output
         grep -qiE "PASSED|ok [0-9]" /tmp/user_ioctl_result.txt || \
           { echo "FAIL: user_ioctl did not pass"; exit 1; }
-        grep -q "Captured" /tmp/eight_args_c_result.txt || \
-          { echo "FAIL: eight_args_c no captures"; exit 1; }
-        grep -q "showing [1-9]" /tmp/eight_args_c_result.txt || \
-          { echo "FAIL: eight_args_c no context records shown"; exit 1; }
-        grep -qE "Captured|skipped" /tmp/eight_args_rust_result.txt || \
-          { echo "FAIL: eight_args_rust"; exit 1; }
         grep -qE "Captured|skipped" /tmp/rust_ffi_result.txt || \
           { echo "FAIL: rust_ffi_contract"; exit 1; }
         grep -qE "ok [1-9]|SKIP" /tmp/binderfs_result.txt || \

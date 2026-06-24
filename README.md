@@ -32,8 +32,8 @@ linux/                                          Kernel tree (submodule)
   tools/testing/selftests/kcov_dataflow/        Selftests
     trigger-view.py                             Visualization tool
     user_ioctl/user_ioctl.c                     Automated ioctl test (TAP)
-    eight_args_c/                               C 1-8 arg stress test
-    eight_args_rust/                            Rust equivalent
+    eight_struct_args_c/                               C 1-8 arg stress test
+    eight_struct_args_rust/                            Rust equivalent
     rust_ffi_contract/                          FFI contract violation demo
 
 llvm-project/                                   Custom LLVM (submodule)
@@ -148,12 +148,12 @@ ok 9 kcov_dataflow.records_captured
 # PASSED: 9 / 9 tests passed.
 ```
 
-#### eight_args_c (module capture)
+#### eight_struct_args_c (module capture)
 ```bash
-make LLVM=1 CC=clang M=tools/testing/selftests/kcov_dataflow/eight_args_c modules
+make LLVM=1 CC=clang M=tools/testing/selftests/kcov_dataflow/eight_struct_args_c modules
 vng --user root --exec \
   "python3 tools/testing/selftests/kcov_dataflow/trigger-view.py \
-    eight_args_c --ko tools/testing/selftests/kcov_dataflow/eight_args_c/eight_args_c.ko"
+    eight_struct_args_c --ko tools/testing/selftests/kcov_dataflow/eight_struct_args_c/eight_struct_args_c.ko"
 ```
 
 Expected: `# Captured N words` with N > 0.
@@ -191,7 +191,7 @@ Then rebuild the kernel with `CONFIG_RUST=y` and build Rust selftests:
 ```bash
 cd linux
 make LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC \
-  M=tools/testing/selftests/kcov_dataflow/eight_args_rust modules
+  M=tools/testing/selftests/kcov_dataflow/eight_struct_args_rust modules
 make LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC \
   M=tools/testing/selftests/kcov_dataflow/rust_ffi_contract modules
 ```
