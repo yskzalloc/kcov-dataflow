@@ -235,22 +235,20 @@ jobs:
         make -C tools/testing/selftests/kcov_dataflow
         make -C tools/testing/selftests/kcov_dataflow/binderfs
 
-        # C module
+        # C struct args module
         make $MAKE_ARGS \
+          M=tools/testing/selftests/kcov_dataflow/eight_struct_args_c modules
 
         # Rust modules (non-RT only)
         if [ "${{ matrix.rt }}" != "true" ] && \
            make $MAKE_ARGS rustavailable 2>/dev/null; then
           make $MAKE_ARGS \
-          make $MAKE_ARGS \
             M=tools/testing/selftests/kcov_dataflow/rust_ffi_contract modules
           make $MAKE_ARGS \
             M=tools/testing/selftests/kcov_dataflow/eight_struct_args_rust modules
+          make $MAKE_ARGS \
+            M=tools/testing/selftests/kcov_dataflow/rust_kworker_remote modules
         fi
-
-        # C struct args module
-        make $MAKE_ARGS \
-          M=tools/testing/selftests/kcov_dataflow/eight_struct_args_c modules
 
     # --- Test execution (native on both arches) ---
 
@@ -312,6 +310,21 @@ jobs:
             eight_struct_args_rust -C 64 --ko $SELFTEST/eight_struct_args_rust/eight_struct_args_rust.ko" \
           | tee /tmp/eight_struct_args_rust_result.txt
 
+    - name: Run rust_kworker_remote selftest
+      run: |
+        source venv-virtme/bin/activate
+        cd linux
+        SELFTEST=tools/testing/selftests/kcov_dataflow
+        if [ ! -f $SELFTEST/rust_kworker_remote/rust_kworker_remote.ko ]; then
+          echo "# Captured 0 records (rustc not available, skipped)" \
+            > /tmp/rust_kworker_remote_result.txt
+          exit 0
+        fi
+        vng --user root \
+          --exec "python3 $SELFTEST/trigger-view.py \
+            rust_kworker_remote --ko $SELFTEST/rust_kworker_remote/rust_kworker_remote.ko --remote" \
+          | tee /tmp/rust_kworker_remote_result.txt
+
     # --- Results ---
 
     - name: Report results
@@ -338,6 +351,9 @@ jobs:
         echo "--- eight_struct_args_rust ---"
         cat /tmp/eight_struct_args_rust_result.txt 2>/dev/null || echo "MISSING"
         echo ""
+        echo "--- rust_kworker_remote ---"
+        cat /tmp/rust_kworker_remote_result.txt 2>/dev/null || echo "MISSING"
+        echo ""
         echo "============================================"
 
     - name: Verify pass
@@ -353,4 +369,6 @@ jobs:
           { echo "FAIL: eight_struct_args_c"; exit 1; }
         grep -qE "Captured|skipped" /tmp/eight_struct_args_rust_result.txt || \
           { echo "FAIL: eight_struct_args_rust"; exit 1; }
+        grep -qE "Captured|skipped" /tmp/rust_kworker_remote_result.txt || \
+          { echo "FAIL: rust_kworker_remote"; exit 1; }
         echo "All tests passed (${{ matrix.name }})"
