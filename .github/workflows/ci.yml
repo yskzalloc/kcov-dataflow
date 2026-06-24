@@ -236,18 +236,14 @@ jobs:
         make -C tools/testing/selftests/kcov_dataflow/binderfs
 
         # C struct args module
-        make $MAKE_ARGS \
-          M=tools/testing/selftests/kcov_dataflow/eight_struct_args_c modules
+        make $MAKE_ARGS M=tools/testing/selftests/kcov_dataflow/eight_struct_args_c modules
 
         # Rust modules (non-RT only)
         if [ "${{ matrix.rt }}" != "true" ] && \
            make $MAKE_ARGS rustavailable 2>/dev/null; then
-          make $MAKE_ARGS \
-            M=tools/testing/selftests/kcov_dataflow/rust_ffi_contract modules
-          make $MAKE_ARGS \
-            M=tools/testing/selftests/kcov_dataflow/eight_struct_args_rust modules
-          make $MAKE_ARGS \
-            M=tools/testing/selftests/kcov_dataflow/rust_kworker_remote modules
+          make $MAKE_ARGS M=tools/testing/selftests/kcov_dataflow/rust_ffi_contract modules
+          make $MAKE_ARGS M=tools/testing/selftests/kcov_dataflow/eight_struct_args_rust modules
+          make $MAKE_ARGS M=tools/testing/selftests/kcov_dataflow/rust_kworker_remote modules
         fi
 
     # --- Test execution (native on both arches) ---
