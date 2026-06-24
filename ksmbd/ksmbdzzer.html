@@ -2,144 +2,206 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>ksmbdzzer Architecture</title>
+<title>ksmbdzzer — scalable SMB-procedure fuzzer</title>
 <style>
-body { font-family: -apple-system, sans-serif; margin: 2rem; background: #1a1a2e; color: #e0e0e0; }
-h1 { color: #76ff03; }
-h2 { color: #40c4ff; margin-top: 2rem; }
-canvas { border: 1px solid #333; border-radius: 8px; display: block; margin: 1rem 0; }
-.info { background: #16213e; padding: 1rem; border-radius: 6px; margin: 1rem 0; font-size: 0.9rem; }
-table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
-th, td { border: 1px solid #333; padding: 0.5rem; text-align: left; font-size: 0.85rem; }
-th { background: #16213e; color: #76ff03; }
-.finding { background: #1b3a1b; border-left: 4px solid #76ff03; padding: 1rem; margin: 1rem 0; }
+body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 2em; line-height: 1.5; max-width: 1100px; margin: 0 auto; }
+h1 { color: #4a9; }
+h2 { color: #6cf; margin-top: 2em; border-bottom: 1px solid #333; padding-bottom: .3em; }
+h3 { color: #9cf; margin-top: 1.4em; }
+pre { background: #0d0d1a; padding: 1em; overflow-x: auto; border-left: 3px solid #4a9; }
+.metric { color: #0f0; font-weight: bold; }
+.new { color: #ff0; }
+.warn { color: #f96; }
+.principle { color: #6cf; font-weight: bold; }
+table { border-collapse: collapse; margin: 1em 0; width: 100%; }
+td, th { border: 1px solid #444; padding: 0.4em 0.8em; text-align: left; vertical-align: top; }
+th { background: #2a2a4e; color: #9cf; }
+ol.principles > li { margin: .6em 0; }
+blockquote { border-left: 3px solid #f96; padding-left: 1em; color: #ccc; }
+code { color: #9f9; }
 </style>
 </head>
 <body>
-<h1>ksmbdzzer — KSMBD Write-Side LPE Fuzzer</h1>
-<p>trace-args/ret (kcov_dataflow) + libFuzzer + privilege bypass detection</p>
+<h1>ksmbdzzer — a scalable SMB-procedure fuzzer for KSMBD</h1>
 
-<h2>Architecture</h2>
-<canvas id="arch" width="900" height="500"></canvas>
-<script>
-const c = document.getElementById('arch').getContext('2d');
+<p>A <b>high-level, SMB-procedure-level</b> coverage-guided fuzzer for the Linux
+in-kernel SMB server (ksmbd), targeting <b>write-side privilege escalation and
+non-crashing logic bugs</b>. Steered by <b>kcov-dataflow</b> — kernel function
+argument/return <i>values</i> plus <b>trace_cmp operand pairs</b>, not just edges.
+The grain fleet now covers the <b>whole SMB1/2/3 procedure surface (95 grains)</b>,
+grains are <b>combined on a shared object</b>, and a <b>second pc-only engine</b>
+lets the dataflow steering be measured head-to-head.</p>
 
-// Background
-c.fillStyle = '#0f0f1a';
-c.fillRect(0, 0, 900, 500);
+<blockquote>
+<b>Not a syzkaller.</b> syzkaller fuzzes <i>syscalls</i> with edge coverage and finds
+<i>crashes</i>. ksmbdzzer fuzzes one layer up — at the <i>SMB procedure</i> level —
+with dataflow argument/return values, procedure combination, and a contract oracle for
+non-crashing access-control bugs. Different targets; not comparable.
+</blockquote>
 
-// Phase boxes
-function box(x, y, w, h, color, label, sublabel) {
-    c.fillStyle = color + '20';
-    c.strokeStyle = color;
-    c.lineWidth = 2;
-    c.beginPath(); c.roundRect(x, y, w, h, 8); c.fill(); c.stroke();
-    c.fillStyle = color;
-    c.font = 'bold 13px monospace';
-    c.fillText(label, x + 10, y + 20);
-    if (sublabel) { c.font = '11px sans-serif'; c.fillStyle = '#aaa'; c.fillText(sublabel, x + 10, y + 38); }
-}
+<h2>Design principles</h2>
+<ol class="principles">
+<li><span class="principle">SMB-procedure level, not syscall level.</span> The atom is an SMB procedure (CREATE, WRITE, SET_INFO, IOCTL…), not a syscall.</li>
+<li><span class="principle">trace-args/ret is the primary signal.</span> kcov-dataflow reports the <i>values</i> a kernel function saw/returned — the differentiator, and the thesis: turn a "deny"→"allow" value into a proving case. With <code>CONFIG_KCOV_ENABLE_COMPARISONS</code> the same buffer also carries <b>trace_cmp operand pairs</b> — the correct substrate for RedQueen input-to-state.</li>
+<li><span class="principle">KCOV path coverage for the bulk; trace-args/ret only when stuck.</span> Cheap path coverage drives most mutation; capture the dataflow stuck point only at saturation — not every input.</li>
+<li><span class="principle">Grain = a working scenario.</span> Fixed valid negotiate+auth+CREATE prefix, fuzz only the last target PDU → <i>deep by construction</i>, past the SMB2 parser wall.</li>
+<li><span class="principle">Capture normal behavior first.</span> Seed from legitimate deep coverage; anything beyond that baseline is anomalous by construction.</li>
+<li><span class="principle">Four-phase round loop.</span> P1 enumerate → P2 saturate → P3 combine → P4 save/feed-forward.</li>
+<li><span class="principle">Performance fuzzing in the C harness; Python only manages.</span> The mutation/execution/feedback loop is in the LibFuzzer program; Python enumerates, launches, aggregates.</li>
+<li><span class="principle">LibFuzzer must see kernel coverage.</span> Harness folds kernel KCOV into <code>__libfuzzer_extra_counters</code> so LibFuzzer's own engine is steered by kernel coverage.</li>
+<li><span class="principle">Alignment is the most important step.</span> An element is only as good as its prefix — keep ALIGNED (ft≥100), drop misaligned. Grains satisfy this by design.</li>
+<li><span class="principle">Anti-monkey selection.</span> Keep/combine only mutations that beat the grain's own baseline ft0 (PRODUCTIVE); mutations adding nothing over the bare scenario are dropped.</li>
+<li><span class="principle">Oracles are checks, not phases.</span> crash · stability (a normal grain that stops working = destabilization bug) · contract (write-side LPE that syzkaller is blind to).</li>
+<li><span class="principle">Scale via parallel map-reduce.</span> -procs=all CPUs; per-grain loopback IP = own coverage buffer; idle cores run mutation replicas sharing one corpus.</li>
+<li><span class="principle">Feed-forward across generations.</span> Persistent per-grain corpus + value pool replayed each round → starts deeper.</li>
+<li><span class="principle">Escape the legacy low-level fuzz smell.</span> Old 12/8-phase random tactics → clean deep-by-construction grain loop.</li>
+<li><span class="principle">Lightweight data-flow-guided input-to-state steering.</span> RedQueen driven by real <b>trace_cmp operand pairs</b>: input holds one operand → overwrite with the other → flip the branch (<code>mutate_i2s</code> pass 0). Eclipser/GREYONE boundary steering + arg/ret single-value substitution as fallbacks. No SMT, no symbolic, no byte-taint (infeasible in-kernel). cmp <i>operands</i> feed the mutator only — excluded from the coverage map (would explode it).</li>
+<li><span class="principle">Comparable, not just assertible.</span> A second pc-only engine (edge coverage + i2s-or-havoc) runs the same grains so the dataflow steering is <i>measured</i>, not claimed: <code>dataflow</code> vs <code>pc-i2s</code> = value-coverage payoff; <code>pc-i2s</code> vs <code>pc-havoc</code> = i2s payoff.</li>
+</ol>
 
-function arrow(x1, y1, x2, y2, color) {
-    c.strokeStyle = color || '#666';
-    c.lineWidth = 2;
-    c.beginPath(); c.moveTo(x1, y1); c.lineTo(x2, y2); c.stroke();
-    // arrowhead
-    const a = Math.atan2(y2-y1, x2-x1);
-    c.beginPath(); c.moveTo(x2, y2);
-    c.lineTo(x2 - 10*Math.cos(a-0.4), y2 - 10*Math.sin(a-0.4));
-    c.lineTo(x2 - 10*Math.cos(a+0.4), y2 - 10*Math.sin(a+0.4));
-    c.closePath(); c.fill();
-}
+<h2>Architecture — the 4-phase grain loop (<code>gfuzz</code>)</h2>
+<pre>
+ksmbdzzer.py — ORCHESTRATOR ONLY (enumerate, launch, aggregate; no per-input work)
+    │
+    │  P1 enumerate grains ── lib grains + raw-PDU grains + v2 HYBRID grains
+    │  P2 saturate each ────── one LibFuzzer element / grain, map-reduce parallel
+    │  P3 combine ──────────── ALL-PAIRS combination on a SHARED object (combo2)
+    │  P4 save ─────────────── persistent per-grain corpus + value pool → next round
+    │
+    ├─ element/gen.py — LibFuzzer C harness engine  (was sniper/)
+    │     generate_grain_elements()   one harness per lib grain
+    │     generate_grain_combo_pool() ONE combo harness + per-pair symlinks
+    │     run_elements()  per-element loopback IP · replicas · compile cache
+    │
+    ├─ element/common.h — raw-grain harness: KCOV path + mutate_i2s (RedQueen
+    │     from trace_cmp pairs) + KSMBDZZER_ENGINE comparison switch
+    │
+    └─ ctypes ─► libksmbdzzer.so
+                   libsmbclient (NTLMv2 auth)  ── valid deep prefixes
+                   kcov-dataflow mmap          ── arg/ret VALUES + trace_cmp pairs + KCOV
+                   GRAINS[] (95 scenarios)     ── whole SMB1/2/3 surface (GRAIN.md)
+                   raw authed PDU injection    ── fuzz only the last target PDU
+                   pfz_grain_combo2()          ── grains A+B on a SHARED fid/handle
+                   librdmacm + libibverbs      ── SMBDirect / RDMA transport
+</pre>
 
-// Python orchestrator
-box(20, 20, 250, 120, '#ffab00', 'Phase 1-5: Python', '11 VFS ops, 5000 iters/round');
-c.font = '10px monospace'; c.fillStyle = '#ccc';
-c.fillText('• kcov_df_remote_enable/disable', 30, 80);
-c.fillText('• ret=0 → 2× rank (bypass signal)', 30, 95);
-c.fillText('• builds value_pool + corpus', 30, 110);
+<h3>The hybrid mutator (principle 3 &amp; 8, entirely in the C harness)</h3>
+<pre>
+LLVMFuzzerTestOneInput(data):
+    run the target PDU                       <span class="warn"># deep by construction (grain prefix valid)</span>
+    fold kernel coverage -&gt; ctr[]             <span class="warn"># KCOV path + arg/ret VALUES; cmp = PC-only</span>
+    if new path:  g_stuck = 0   else:  g_stuck++
 
-// Snipers
-box(320, 20, 280, 120, '#76ff03', 'Phase 6: libFuzzer Snipers (C)', '15 harnesses, raw TCP');
-c.font = '10px monospace'; c.fillStyle = '#ccc';
-c.fillText('• __libfuzzer_extra_counters', 330, 80);
-c.fillText('• ret=0 → ctr += 3 (weight signal)', 330, 95);
-c.fillText('• persistent corpus across rounds', 330, 110);
+LLVMFuzzerCustomMutator(data):
+    <span class="new"># pass 0 (RedQueen / trace_cmp): for each cmp operand pair (a1,a2) in df_buf,</span>
+    <span class="new">#   if input holds a1 -&gt; overwrite with a2 (&amp; vice-versa) -&gt; flip the branch</span>
+    then cheap KCOV-bulk havoc; at SATURATION drive an observed arg value to a boundary.
+</pre>
+<p><code>KSMBDZZER_ENGINE</code> selects coverage+mutator so one harness runs as
+<code>dataflow</code> (value coverage + i2s) / <code>pc-i2s</code> (pc-only + i2s) /
+<code>pc-havoc</code> (pc-only + havoc) for the engine comparison.</p>
 
-// kcov_dataflow kernel
-box(650, 20, 230, 120, '#ff5252', 'Kernel: kcov_dataflow', 'per-task ring buffer');
-c.font = '10px monospace'; c.fillStyle = '#ccc';
-c.fillText('• trace-args: fn(arg1, arg2...)', 660, 80);
-c.fillText('• trace-ret: fn() → retval', 660, 95);
-c.fillText('• KSMBD worker thread capture', 660, 110);
+<h3>The grain (deep by construction)</h3>
+<p>Each grain runs negotiate → authenticate → tree-connect → CREATE as a <b>fixed
+valid prefix</b> (never fuzzed), then hands LibFuzzer the <b>raw target PDU</b>. Every
+input reaches deep ksmbd code on the first try. <b>95 grains</b> cover the whole
+upstream SMB surface: all 19 SMB2 commands, every FSCTL and SET_INFO/QUERY_INFO class,
+all CREATE contexts, SMB3 features (encryption/compression/multichannel/lease-v2/
+durable-v2/RDMA), SMB1 legacy opcodes (version-conflict surface), and the ksmbd blind
+spots (IPC netlink, signing crypto, deep DACL, RPC opnums). Canonical map: <code>GRAIN.md</code>.
+<b>P3 combines</b> grains pairwise on a <i>shared</i> handle/path — sequential,
+interleaved, or forked-concurrent (<code>pfz_grain_combo2</code>) — so interaction bugs
+(B abusing a lock/lease/handle A left) can surface.</p>
 
-// Arrows
-arrow(270, 80, 320, 80, '#ffab00');  // Python → Snipers
-arrow(600, 80, 650, 80, '#76ff03');  // Snipers → Kernel
-arrow(780, 140, 780, 180, '#ff5252'); // Kernel → KSMBD
+<h2>Phases</h2>
+<table>
+<tr><th>Phase</th><th>What it does</th><th>Principle</th></tr>
+<tr><td>P1 enumerate</td><td>Build the grain set (lib + raw + v2 hybrid); compile cache skips unchanged harnesses</td><td>4, 14</td></tr>
+<tr><td>P2 saturate</td><td>One LibFuzzer element per grain; KCOV bulk mutation, trace-args/ret at stuck; ALIGNED + PRODUCTIVE gate</td><td>3, 7, 8, 9, 10</td></tr>
+<tr><td>P3 combine</td><td>ALL-PAIRS combination of grains on a SHARED object (sequential / interleaved / forked-concurrent); one compiled harness + per-pair symlinks (final round)</td><td>10, 11</td></tr>
+<tr><td>P4 save</td><td>Persist per-grain corpus + value pool; carried into the next generation (ft0 starts higher)</td><td>13</td></tr>
+<tr><td>oracles</td><td>crash (KASAN/lockdep) · stability (grain re-run) · contract (dataflow deny→allow) — run <i>alongside</i>, not as a phase</td><td>11</td></tr>
+</table>
 
-// KSMBD
-box(650, 180, 230, 100, '#e040fb', 'KSMBD (fs/smb/server/)', 'smb2_write, smb2_lock, smb2_set_info');
-c.font = '10px monospace'; c.fillStyle = '#ccc';
-c.fillText('• ksmbd_vfs_write()', 660, 230);
-c.fillText('• smb_check_perm_dacl()', 660, 245);
-c.fillText('• KASAN detects OOB/UAF', 660, 260);
+<h2>Scalability engineering</h2>
+<table>
+<tr><th>Mechanism</th><th>Why</th></tr>
+<tr><td>Per-element loopback IP <code>127.0.0.&lt;slot&gt;</code></td><td>ksmbd derives the kcov handle from the dest IP → unique IP = own coverage buffer, no collision. Basis for parallel map-reduce.</td></tr>
+<tr><td>Map-reduce replicas</td><td>When grains &lt; cores, idle cores run extra mutation instances of the same grain sharing one corpus.</td></tr>
+<tr><td>Compile cache (source-hash + dep-mtime)</td><td>Unchanged harness ⇒ no <code>clang</code>. Multi-round runs compile once; later rounds go straight to fuzzing. Value pool rides the <code>.dict</code>, not the C source.</td></tr>
+<tr><td>Lightened ksmbd restart</td><td>Reset only before the first wave or after a wave with a 0-exec (session-setup death) element — not per wave. Removes restart latency and stops re-triggering the SMBDirect cleanup path each wave.</td></tr>
+</table>
 
-// Feedback loop
-arrow(650, 240, 450, 240, '#40c4ff');
-c.fillStyle = '#40c4ff'; c.font = '10px monospace';
-c.fillText('trace-args/ret records', 490, 235);
+<h2>Bug detection</h2>
+<pre>
+vng --append "console=ttyS0 nokaslr panic=1 oops=panic" --exec '...'
+   panic=1 oops=panic       any oops -&gt; VM exits (host detects)
+   panic_on_warn=1          even a WARN() -&gt; panic (aggressive)
+grep -E "BUG:|KASAN:|UBSAN:|WARNING:|recursive locking|Oops"  &lt;kernel log&gt;
+</pre>
+<table>
+<tr><th>Detector</th><th>Class</th><th>Oracle</th></tr>
+<tr><td>KASAN</td><td>UAF / OOB / double-free</td><td>crash</td></tr>
+<tr><td>LOCKDEP</td><td>deadlock / recursive-lock / ABBA</td><td>crash</td></tr>
+<tr><td>UBSAN</td><td>integer overflow / array OOB</td><td>crash</td></tr>
+<tr><td>DEBUG_LIST</td><td>list corruption</td><td>crash</td></tr>
+<tr><td>grain re-run</td><td>scenario stopped working</td><td class="new">stability (non-crashing)</td></tr>
+<tr><td>dataflow contract</td><td>check deny → allow</td><td class="new">contract (write-side LPE)</td></tr>
+</table>
 
-// Live dict
-box(320, 180, 280, 60, '#40c4ff', 'Live Dictionary', 'value_pool → sniper dict per-round');
-
-// Priv bypass
-box(20, 180, 250, 80, '#ff9100', 'Privilege Bypass Detection', 'sniper_priv_bypass on [privtest]');
-c.font = '10px monospace'; c.fillStyle = '#ccc';
-c.fillText('• READ-only → LOCK/DELETE_ON_CLOSE', 30, 225);
-c.fillText('• ret=0 → 10× weight (BYPASS!)', 30, 240);
-
-// Sharp
-box(20, 300, 250, 80, '#7c4dff', 'Phase 7: Sharp Analysis', 'binary search + anomaly + trust');
-c.font = '10px monospace'; c.fillStyle = '#ccc';
-c.fillText('• boundary: exact ret 0→error', 30, 340);
-c.fillText('• anomaly: ret=0 for arg > 2× max', 30, 355);
-
-// Result
-box(320, 300, 280, 80, '#00e676', 'Output', '');
-c.font = '10px monospace'; c.fillStyle = '#ccc';
-c.fillText('• /tmp/ksmbdzzer_crashes/ (reproducers)', 330, 335);
-c.fillText('• /tmp/ksmbdzzer_report.csv (histogram)', 330, 350);
-c.fillText('• find.md (confirmed findings)', 330, 365);
-
-// Key insight box
-box(20, 420, 860, 60, '#ffab00', 'KEY: trace-args/ret → libFuzzer feedback', '');
-c.font = '12px monospace'; c.fillStyle = '#fff';
-c.fillText('smb2_write(offset=0xFFF0) → ret=0  ⇒  ctr[hash(PC,0xFFF0)] += 3  ⇒  libFuzzer explores more near 0xFFF0', 30, 460);
-</script>
+<h2>Engine comparison (measured, not claimed)</h2>
+<p>The same grains on the same kernel run under two engines / three arms
+(<code>KSMBDZZER_ENGINE</code> — a controlled ablation, identical instrumentation);
+<code>~/engine_compare_campagin.sh</code> prints a diff table.</p>
+<table>
+<tr><th>Arm</th><th>Engine</th><th>Coverage</th><th>Mutator</th></tr>
+<tr><td><code>dataflow</code></td><td>1st</td><td>value-sensitive (pc,val) + cmp</td><td class="new">i2s (RedQueen)</td></tr>
+<tr><td><code>pc-i2s</code></td><td>2nd</td><td>pc-only</td><td>i2s (RedQueen)</td></tr>
+<tr><td><code>pc-havoc</code></td><td>2nd</td><td>pc-only</td><td>pure havoc</td></tr>
+</table>
+<p><code>dataflow</code> vs <code>pc-i2s</code> = the <b>value-coverage</b> payoff;
+<code>pc-i2s</code> vs <code>pc-havoc</code> = the <b>i2s</b> payoff.</p>
 
 <h2>Findings</h2>
-<div class="finding">
-<strong>Finding 1:</strong> Exclusive lock without WRITE access (MS-SMB2 3.3.5.14)<br>
-<strong>Finding 2:</strong> DELETE_ON_CLOSE without DELETE access (MS-SMB2 3.3.5.9) — unauthorized file deletion
-</div>
+<pre>
+Kernel defects surfaced by the campaign (write-side / RDMA teardown):
+  1. <span class="new">ksmbd oplock lev-II break deadlock</span> — break sent under m_lock, inverting
+     srv_mutex→session_lock→m_lock→srv_mutex.  FIXED (collect-under-lock) — oplock.c
+  2. <span class="new">SMBDirect smbdirect_socket_destroy_sync recursive handler_mutex</span> —
+     listener held its cm_id handler lock while releasing children (which recurse into
+     the child's handler lock) → lockdep deadlock; the 3h round-6 hang.  FIXED
+     (defer child release past the handler unlock) — socket.c
+  3. SMBDirect recv_io / mem-pool teardown null-deref (BUG 1)     FIXED — accept.c
+  4. SMBDirect recursive &amp;sc-&gt;listen.lock on listener teardown   FIXED (splice-then-unlock)
+  5. <span class="warn">SMBDirect cm_id UAF in _cma_cancel_listens (BUG 2)</span>      OPEN — rare, hard RDMA-CM fix
 
-<h2>Usage</h2>
-<div class="info">
-<code>python3 ksmbdzzer.py fuzz -t 5h -procs 2 -target write -sniper-time 60</code><br><br>
-<b>-t 5h</b>: total runtime (graceful shutdown)<br>
-<b>-sniper-time 60</b>: seconds per sniper per round (higher = deeper corpus, increase as budget allows)<br>
-<b>-target write</b>: raw_write + dacl + compound + mt_race + read_after_write
-</div>
+Dataflow contract-oracle (MS-SMB2 access-control): lock-without-WRITE /
+DELETE_ON_CLOSE-without-DELETE / OVERWRITE_IF-without-WRITE are real missing SMB-layer
+checks but <b>Unix-gated</b> (ksmbd authorizes at the VFS/POSIX layer). The oracle now
+uses a cross-user (root-owned) victim so it can only flag a genuine LPE denial.
+</pre>
 
-<h2>Snipers</h2>
-<table>
-<tr><th>Sniper</th><th>Coverage</th><th>Target</th><th>Bypass Signal</th></tr>
-<tr><td>priv_bypass</td><td>21 cov</td><td>[privtest] with NTLMv2</td><td>ret=0 on denied op → 10× weight</td></tr>
-<tr><td>mt_race</td><td>29 cov</td><td>WRITE+CLOSE (shared fid)</td><td>ret=0 during race = UAF</td></tr>
-<tr><td>raw_write</td><td>18 cov</td><td>streams + negative offsets</td><td>ret=0 = write accepted</td></tr>
-<tr><td>dh_trust</td><td>30 ft</td><td>DH2C forged reconnect</td><td>ret=0 = trust bypass</td></tr>
-<tr><td>compound</td><td>20 cov</td><td>WRITE+TRUNCATE+CLOSE</td><td>AllocationSize overflow</td></tr>
-</table>
+<h2>Quick start</h2>
+<p>100% guest-internal loopback (each worker dials <code>127.0.0.&lt;octet&gt;</code>) —
+<b>no <code>--network</code> flag needed</b>.</p>
+<pre>
+vng --user root --memory 16G --rw --cpus 8 \
+  --append "nokaslr hung_task_panic=1 hung_task_timeout_secs=60" \
+  --exec 'mount -t debugfs none /sys/kernel/debug; sysctl -w kernel.kptr_restrict=0;
+          python3 ../ksmbd/ksmbdzzer.py init &amp;&amp;
+          python3 ../ksmbd/ksmbdzzer.py <span class="new">gfuzz -r 30 --element-max 32</span>'
+
+  gfuzz -r N             generations (each carries strong grains + corpus forward)
+        -procs N         parallel workers (default: ALL CPUs)
+        --element-max S  ceiling (s) per grain element if it never saturates
+        --element-sat R  LibFuzzer saturation ratio per element (default 0.02)
+
+  runners:  ~/run_campaign.sh [ROUNDS] [ELEMENT_MAX]        full hunting campaign
+            ~/engine_compare_campagin.sh [ROUNDS] [ELEMENT_MAX]  2-engine comparison
+</pre>
+<p class="warn">The old <code>ksmbdzzer.py fuzz</code> (8-phase random-tactic worker +
+differential failslab) is <b>legacy</b> — retained for the failslab error-path
+campaign, superseded by <code>gfuzz</code> for the procedure-fuzzing architecture.</p>
+
 </body>
 </html>

@@ -1,9 +1,9 @@
 /*
- * sniper_ntlmv2.h — NTLMv2 computation for snipers (requires -lcrypto).
+ * grain_ntlmv2.h — NTLMv2 computation for grains (requires -lcrypto).
  * Call ntlmv2_auth_response() to get valid LM + NT response for fuzz:fuzz.
  */
-#ifndef SNIPER_NTLMV2_H
-#define SNIPER_NTLMV2_H
+#ifndef GRAIN_NTLMV2_H
+#define GRAIN_NTLMV2_H
 
 #include <openssl/md4.h>
 #include <openssl/hmac.h>
@@ -18,7 +18,14 @@ static void nt_hash(const char *password, uint8_t out[16]) {
     for (int i = 0; password[i] && len < 250; i++) {
         utf16[len++] = password[i]; utf16[len++] = 0;
     }
+    /* MD4 is deprecated in OpenSSL 3.0 but MANDATED by the NTLM protocol (the NT
+     * hash is defined as MD4(UTF16LE(password)) — there is no substitute). The
+     * one-shot MD4() still works; the EVP path would need the legacy provider
+     * loaded (not default) and would silently return NULL. Suppress locally. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     MD4(utf16, len, out);
+#pragma GCC diagnostic pop
 }
 
 /* NTLMv2 hash = HMAC-MD5(NT_hash, UPPER(user) + domain in UTF16LE) */
@@ -82,4 +89,4 @@ static int ntlmv2_response(const uint8_t server_chal[8],
     return 0;
 }
 
-#endif /* SNIPER_NTLMV2_H */
+#endif /* GRAIN_NTLMV2_H */

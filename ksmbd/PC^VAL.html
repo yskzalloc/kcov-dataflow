@@ -1,0 +1,1033 @@
+<title>PC ⊕ VAL — Coverage That Remembers What Flowed</title>
+<style>
+  :root{
+    --paper:#ece5d4; --panel:#f2ecdd; --fig-bg:#f4eee0;
+    --ink:#24282f; --muted:#7c7566; --faint:#a49b88;
+    --amber:#a86c14; --amber-soft:#c99327; --cyan:#136c7d; --reward:#bd4128;
+    --lamp-off:#d9d1bd; --rule:rgba(36,40,47,.14); --rule-strong:rgba(36,40,47,.28);
+    --code-bg:#e7e0cd; --shadow:rgba(36,40,47,.10);
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --paper:#0c0f16; --panel:#12161f; --fig-bg:#10141d;
+      --ink:#d9dde3; --muted:#8b9080; --faint:#5f6472;
+      --amber:#e6a53d; --amber-soft:#f0be63; --cyan:#4bc3d1; --reward:#ef7368;
+      --lamp-off:#20252f; --rule:rgba(217,221,227,.13); --rule-strong:rgba(217,221,227,.26);
+      --code-bg:#161b25; --shadow:rgba(0,0,0,.4);
+    }
+  }
+  :root[data-theme="light"]{
+    --paper:#ece5d4; --panel:#f2ecdd; --fig-bg:#f4eee0;
+    --ink:#24282f; --muted:#7c7566; --faint:#a49b88;
+    --amber:#a86c14; --amber-soft:#c99327; --cyan:#136c7d; --reward:#bd4128;
+    --lamp-off:#d9d1bd; --rule:rgba(36,40,47,.14); --rule-strong:rgba(36,40,47,.28);
+    --code-bg:#e7e0cd; --shadow:rgba(36,40,47,.10);
+  }
+  :root[data-theme="dark"]{
+    --paper:#0c0f16; --panel:#12161f; --fig-bg:#10141d;
+    --ink:#d9dde3; --muted:#8b9080; --faint:#5f6472;
+    --amber:#e6a53d; --amber-soft:#f0be63; --cyan:#4bc3d1; --reward:#ef7368;
+    --lamp-off:#20252f; --rule:rgba(217,221,227,.13); --rule-strong:rgba(217,221,227,.26);
+    --code-bg:#161b25; --shadow:rgba(0,0,0,.4);
+  }
+
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--paper); color:var(--ink);
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    font-size:18px; line-height:1.65; letter-spacing:.005em;
+    background-image:
+      linear-gradient(var(--rule) 1px,transparent 1px),
+      linear-gradient(90deg,var(--rule) 1px,transparent 1px);
+    background-size:2.2rem 2.2rem; background-position:center top;
+  }
+  ::selection{background:var(--amber);color:var(--paper)}
+
+  .wrap{max-width:1040px;margin:0 auto;padding:0 clamp(1.1rem,4vw,2.6rem)}
+  .measure{max-width:44rem;margin-left:auto;margin-right:auto}
+
+  /* ---------- type ---------- */
+  .serif{font-family:Georgia,"Iowan Old Style","Times New Roman",serif}
+  .mono{font-family:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace}
+  .eyebrow{
+    font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+    text-transform:uppercase; letter-spacing:.22em; font-size:.72rem;
+    color:var(--amber); font-weight:600;
+  }
+  h1,h2,h3{font-family:Georgia,"Iowan Old Style","Times New Roman",serif;font-weight:700;text-wrap:balance;line-height:1.08}
+  h2{font-size:clamp(1.7rem,4vw,2.5rem);letter-spacing:-.01em;margin:0 0 .3em}
+  h3{font-size:1.32rem;letter-spacing:-.005em;margin:2.2em 0 .2em}
+  p{margin:0 0 1.15em}
+  a{color:var(--cyan);text-underline-offset:3px;text-decoration-thickness:1px}
+  strong{color:var(--ink);font-weight:700}
+  em.term{font-style:normal;color:var(--amber);font-weight:600}
+  em.val{font-style:normal;color:var(--cyan);font-weight:600}
+  code{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:.86em;
+    background:var(--code-bg);padding:.08em .34em;border-radius:4px;
+    font-variant-numeric:tabular-nums}
+
+  /* ---------- hero ---------- */
+  header.hero{padding:clamp(3rem,9vh,6rem) 0 2.4rem;border-bottom:1px solid var(--rule-strong)}
+  .hero .eq{
+    font-family:Georgia,serif;font-weight:700;
+    font-size:clamp(3.2rem,13vw,7.5rem);line-height:.9;letter-spacing:-.02em;
+    margin:.1em 0 .1em;display:flex;align-items:baseline;gap:.12em;flex-wrap:wrap
+  }
+  .hero .eq .pc{color:var(--amber)}
+  .hero .eq .op{color:var(--muted);font-size:.7em}
+  .hero .eq .val{color:var(--cyan)}
+  .hero .lede{font-size:clamp(1.05rem,2.4vw,1.32rem);color:var(--muted);max-width:36rem;margin-top:.4rem}
+  .hero .lede b{color:var(--ink);font-weight:600}
+  #heroCanvas{width:100%;height:132px;display:block;margin-top:2rem;border-radius:8px;
+    background:var(--fig-bg);border:1px solid var(--rule)}
+
+  /* ---------- sections ---------- */
+  section{padding:2.8rem 0}
+  section+section{border-top:1px solid var(--rule)}
+  .kicker{display:flex;align-items:center;gap:.7rem;margin-bottom:1.4rem}
+  .kicker .n{font-family:ui-monospace,monospace;font-size:.72rem;letter-spacing:.15em;
+    color:var(--paper);background:var(--amber);padding:.2em .5em;border-radius:3px;font-weight:600}
+  .kicker .line{flex:1;height:1px;background:var(--rule)}
+
+  /* ---------- figure plates ---------- */
+  figure{margin:2rem 0;background:var(--fig-bg);border:1px solid var(--rule-strong);
+    border-radius:12px;overflow:hidden;box-shadow:0 1px 0 var(--shadow)}
+  figure .plate-head{display:flex;justify-content:space-between;align-items:baseline;
+    gap:1rem;padding:.9rem 1.15rem .7rem;border-bottom:1px solid var(--rule);flex-wrap:wrap}
+  figure .plate-head .tag{font-family:ui-monospace,monospace;font-size:.7rem;letter-spacing:.16em;
+    text-transform:uppercase;color:var(--amber);font-weight:600}
+  figure .plate-head .ttl{font-family:Georgia,serif;font-weight:700;font-size:1.05rem;color:var(--ink)}
+  figure .body{padding:1.15rem}
+  figcaption{padding:.2rem 1.15rem 1.1rem;color:var(--muted);font-size:.9rem;line-height:1.55}
+  figcaption b{color:var(--ink)}
+
+  .controls{display:flex;flex-wrap:wrap;gap:.6rem;align-items:center;margin:0 0 1rem}
+  button.ctl{
+    font:inherit;font-size:.9rem;font-weight:600;cursor:pointer;
+    background:var(--amber);color:var(--paper);border:none;border-radius:7px;
+    padding:.5rem .9rem;transition:transform .08s ease,filter .15s ease}
+  button.ctl:hover{filter:brightness(1.07)}
+  button.ctl:active{transform:translateY(1px)}
+  button.ctl.ghost{background:transparent;color:var(--ink);border:1px solid var(--rule-strong)}
+  button.ctl.cyan{background:var(--cyan)}
+  button.ctl:focus-visible,input:focus-visible{outline:2px solid var(--cyan);outline-offset:2px}
+  .readout{font-family:ui-monospace,monospace;font-size:.82rem;color:var(--muted);
+    font-variant-numeric:tabular-nums}
+  .readout b{color:var(--ink)}
+  .swatch{display:inline-block;width:.72em;height:.72em;border-radius:2px;vertical-align:-.03em;margin-right:.3em}
+
+  canvas.fig{width:100%;display:block;border-radius:8px}
+  .twoGrid{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+  @media(max-width:620px){.twoGrid{grid-template-columns:1fr}}
+  .panelLabel{font-family:ui-monospace,monospace;font-size:.72rem;letter-spacing:.12em;
+    text-transform:uppercase;color:var(--muted);margin:0 0 .45rem;display:flex;
+    justify-content:space-between;align-items:baseline}
+  .panelLabel .hit{color:var(--ink);font-weight:600}
+
+  /* range input */
+  input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:5px;
+    background:var(--rule-strong);border-radius:99px;outline-offset:4px}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;
+    border-radius:50%;background:var(--cyan);cursor:pointer;border:3px solid var(--fig-bg)}
+  input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;
+    background:var(--cyan);cursor:pointer;border:3px solid var(--fig-bg)}
+
+  /* code block */
+  pre{background:var(--code-bg);border:1px solid var(--rule);border-radius:10px;
+    padding:1rem 1.15rem;overflow-x:auto;font-size:.82rem;line-height:1.6;margin:1.4rem 0}
+  pre code{background:none;padding:0;font-size:inherit}
+  .tok-k{color:var(--amber);font-weight:600}
+  .tok-c{color:var(--faint);font-style:italic}
+  .tok-v{color:var(--cyan)}
+  .tok-n{color:var(--reward)}
+
+  /* callout */
+  .note{border-left:3px solid var(--amber);background:var(--panel);border-radius:0 8px 8px 0;
+    padding:.9rem 1.1rem;margin:1.5rem 0;font-size:.95rem;color:var(--muted)}
+  .note b{color:var(--ink)}
+
+  /* metaphor card row */
+  .cards{display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin:1.6rem 0}
+  @media(max-width:620px){.cards{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--rule);border-radius:12px;padding:1.15rem 1.2rem}
+  .card h4{margin:.1rem 0 .5rem;font-family:Georgia,serif;font-size:1.08rem}
+  .card.amber{border-top:3px solid var(--amber)}
+  .card.cyan{border-top:3px solid var(--cyan)}
+  .card p{font-size:.92rem;color:var(--muted);margin:0}
+  .card p b{color:var(--ink)}
+
+  /* refs */
+  .refs{display:grid;gap:.9rem;margin:1.4rem 0}
+  .ref{display:grid;grid-template-columns:auto 1fr;gap:.8rem;font-size:.92rem;color:var(--muted)}
+  .ref .yr{font-family:ui-monospace,monospace;font-size:.78rem;color:var(--amber);
+    padding-top:.15rem;font-variant-numeric:tabular-nums}
+  .ref b{color:var(--ink)}
+  footer{padding:3rem 0 4rem;color:var(--faint);font-size:.85rem;text-align:center}
+  footer .mono{color:var(--muted)}
+
+  /* comparison table */
+  .tbl-wrap{overflow-x:auto;margin:1.7rem auto;border:1px solid var(--rule);border-radius:12px}
+  table.cmp{border-collapse:collapse;width:100%;min-width:560px;font-size:.9rem}
+  table.cmp th,table.cmp td{padding:.72rem .9rem;text-align:left;vertical-align:top;border-bottom:1px solid var(--rule)}
+  table.cmp thead th{font-family:ui-monospace,monospace;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);background:var(--panel)}
+  table.cmp thead th.pccol{color:var(--amber)}
+  table.cmp thead th.dfcol{color:var(--cyan)}
+  table.cmp tbody th{font-weight:600;color:var(--ink);font-size:.86rem;width:10.5rem}
+  table.cmp tbody tr:last-child td,table.cmp tbody tr:last-child th{border-bottom:none}
+  .win{color:var(--ink);font-weight:500}
+  .win.bad,.win.neu{color:var(--muted)}
+  .win::before{font-family:ui-monospace,monospace;font-weight:700;margin-right:.45em}
+  .win.good::before{content:"✓";color:var(--cyan)}
+  .win.bad::before{content:"✗";color:var(--reward)}
+  .win.neu::before{content:"±";color:var(--faint)}
+
+  /* formula boxes */
+  .cmpword{color:var(--reward);font-weight:600}
+  .formulae{display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin:1.7rem 0}
+  @media(max-width:640px){.formulae{grid-template-columns:1fr}}
+  .fbox{border:1px solid var(--rule-strong);border-radius:12px;padding:1.1rem 1.15rem;background:var(--panel)}
+  .fbox.a{border-top:3px solid var(--reward)}
+  .fbox.b{border-top:3px solid var(--cyan)}
+  .fbox .flabel{font-family:ui-monospace,monospace;font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-bottom:.45rem}
+  .fbox .formula{font-family:ui-monospace,monospace;font-size:1.05rem;margin:.1rem 0 .7rem;line-height:1.4}
+  .fbox .formula .pc{color:var(--amber)}
+  .fbox .formula .cmp{color:var(--reward)}
+  .fbox .formula .val{color:var(--cyan)}
+  .fbox .formula .op{color:var(--muted)}
+  .fbox p{font-size:.85rem;color:var(--muted);margin:.3rem 0 0}
+  .fbox .verdict{font-size:.8rem;font-weight:600;margin-top:.7rem}
+  .fbox.a .verdict{color:var(--reward)}
+  .fbox.b .verdict{color:var(--cyan)}
+
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+
+<div class="wrap">
+
+  <header class="hero">
+    <div class="eyebrow">Coverage, but with a memory of what flowed</div>
+    <div class="eq"><span class="pc">PC</span><span class="op">⊕</span><span class="val">VAL</span></div>
+    <p class="lede serif">How a Linux kernel fuzzer turns <b>“which line of code ran”</b> into
+      <b>“which line ran, carrying which value”</b> — and why that one <span class="mono">XOR</span>
+      is the difference between a fuzzer that gets bored and one that keeps digging.</p>
+    <canvas id="heroCanvas" aria-hidden="true"></canvas>
+  </header>
+
+  <!-- ========== 1. THE BORED LAMPLIGHTER ========== -->
+  <section>
+    <div class="kicker measure"><span class="n">01</span><span class="eyebrow">The problem</span><span class="line"></span></div>
+    <div class="measure">
+      <h2 class="serif">The lamplighter who runs out of streets</h2>
+      <p>Picture a fuzzer as a <em class="term">lamplighter</em> walking through a city — the city
+        being all the code inside a program. Every street is a branch in the code. The lamplighter's
+        job: light a lamp on every street he manages to walk down. The wall of lit lamps is his
+        <strong>coverage map</strong>, and it's how he judges progress. A test input that lights a
+        brand-new lamp was <em>interesting</em> — keep it, mutate it, walk further. An input that
+        lights nothing new gets thrown away.</p>
+      <p>This is <strong>edge coverage</strong>, the idea behind AFL and, in the kernel, behind
+        <code>kcov</code> + syzkaller. It works astonishingly well… until the wall fills up. Once the
+        lamplighter has walked every reachable street, <strong>every input lights zero new lamps</strong>.
+        He's technically still working, but he's bored: he can't tell a boring input from a
+        dangerous one, because both light the same already-lit lamps.</p>
+      <p>Here's the catch that matters for finding bugs. A function like
+        <code>smb2_read(len, offset)</code> is <em>one street</em>. Walking it with
+        <code>len = 8</code> and walking it with <code>len = 0xFFFFFFFF</code> lights the
+        <em>same lamp</em> — yet only one of those is going to smash something. Edge coverage is
+        <strong>value-blind</strong>. It sees <em>where</em> you went, never <em>what you carried</em>.</p>
+    </div>
+
+    <figure>
+      <div class="plate-head">
+        <span class="tag">Fig. 01 — interactive</span>
+        <span class="ttl">Same path, again and again</span>
+      </div>
+      <div class="body">
+        <div class="controls">
+          <button class="ctl" id="f1send">Send an input down the same path →</button>
+          <button class="ctl ghost" id="f1reset">Reset walls</button>
+          <span class="readout" id="f1runs">inputs sent: <b>0</b></span>
+        </div>
+        <div class="twoGrid">
+          <div>
+            <div class="panelLabel"><span><span class="swatch" style="background:var(--amber)"></span>Edge coverage — PC only</span><span class="hit" id="f1eNew">+0 new</span></div>
+            <canvas class="fig" id="f1edge" style="height:150px"></canvas>
+          </div>
+          <div>
+            <div class="panelLabel"><span><span class="swatch" style="background:var(--cyan)"></span>Dataflow — PC ⊕ VAL</span><span class="hit" id="f1dNew">+0 new</span></div>
+            <canvas class="fig" id="f1data" style="height:150px"></canvas>
+          </div>
+        </div>
+        <canvas class="fig" id="f1chart" style="height:130px;margin-top:1rem"></canvas>
+      </div>
+      <figcaption>Both walls watch the <b>same code path</b>. Each input takes the identical route but
+        carries a <b>different value</b>. <span style="color:var(--amber)">Edge</span> lights its
+        streets once, then flatlines — every later input is “nothing new.”
+        <span style="color:var(--cyan)">Dataflow</span> lights the same amber streets <i>and</i> a fresh
+        cyan lamp for each new value seen along the way, so its curve keeps climbing. That climb is the
+        fuzzer staying curious.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ========== 2. THE IDEA ========== -->
+  <section>
+    <div class="kicker measure"><span class="n">02</span><span class="eyebrow">The idea</span><span class="line"></span></div>
+    <div class="measure">
+      <h2 class="serif">Give every lamp a combination lock</h2>
+      <p>The fix is deceptively small. Instead of one lamp per street, wire each lamp to a
+        <em class="term">combination lock</em> that takes <strong>two</strong> numbers: the
+        <em class="term">street address</em> (the program counter, <code>PC</code> — <i>where</i> in the
+        code we are) and the <em class="val">cargo</em> (the runtime <code>value</code> that flowed
+        through that spot — an argument, a struct field, a return value).</p>
+      <p>The combination that picks which lamp lights is simply:</p>
+      <p style="text-align:center;font-family:Georgia,serif;font-size:1.5rem;margin:1.2rem 0">
+        <span style="color:var(--amber)">PC</span>
+        <span style="color:var(--muted)">&nbsp;⊕&nbsp;</span>
+        <span style="color:var(--cyan)">value</span>
+        <span style="color:var(--muted)">&nbsp;→&nbsp;</span>
+        which&nbsp;lamp</p>
+      <p>Now the coverage map no longer records a set of <em>places</em>
+        <span class="mono">{PC}</span>. It records a set of <strong>place–value pairs</strong>
+        <span class="mono">{(PC, value)}</span>. Same street, same cargo → same lamp → nothing new,
+        as before. But <strong>same street, new cargo → a different lamp lights</strong> → the fuzzer
+        registers a discovery and keeps the input that produced it. Suddenly “walk
+        <code>smb2_read</code> with a monstrous length” is a genuinely new frontier, not a re-run.</p>
+
+      <div class="cards">
+        <div class="card amber">
+          <h4>PC — the street address</h4>
+          <p>The program counter of the instrumented call site. It answers <b>where</b> the data
+            landed in the code. On its own, this is ordinary edge coverage — and it <b>saturates</b>.</p>
+        </div>
+        <div class="card cyan">
+          <h4>VAL — the cargo</h4>
+          <p>The actual bytes the kernel handled there: a length, a flags field, an offset, a return
+            code. It answers <b>what</b> flowed. Folding it in gives the map a second axis that
+            <b>doesn't</b> saturate while inputs keep varying.</p>
+        </div>
+      </div>
+
+      <p>Why <code>XOR</code> specifically, and not, say, addition or concatenation? Three reasons a
+        systems programmer cares about: it's a single cheap instruction; it mixes all the bits of both
+        operands into the result; and it keeps a little <em>locality</em> — a small change in the value
+        nudges the lamp, so related values cluster instead of scattering into pure noise. (The real code
+        follows the XOR with a multiply to fully shuffle the bits — more on that below.)</p>
+    </div>
+
+    <figure>
+      <div class="plate-head">
+        <span class="tag">Fig. 02 — interactive</span>
+        <span class="ttl">The combination lock, bit by bit</span>
+      </div>
+      <div class="body">
+        <div class="controls">
+          <span class="readout">PC = <b class="mono" id="f2pc">0x4a1c</b></span>
+          <button class="ctl ghost" id="f2newpc">New street (PC)</button>
+          <button class="ctl ghost" id="f2clear">Forget seen values</button>
+        </div>
+        <div style="margin:.2rem 0 1rem">
+          <div class="panelLabel"><span>Drag the cargo (value)</span><span class="hit mono" id="f2valLabel">0x0000</span></div>
+          <input type="range" id="f2val" min="0" max="65535" value="4919" aria-label="value">
+        </div>
+        <canvas class="fig" id="f2bits" style="height:196px"></canvas>
+        <div style="display:grid;grid-template-columns:1fr auto;gap:1rem;align-items:center;margin-top:1rem">
+          <canvas class="fig" id="f2wall" style="height:120px"></canvas>
+          <div class="readout" style="min-width:8.5rem">
+            bucket → <b class="mono" id="f2bucket">—</b><br>
+            <span id="f2verdict" style="font-weight:600">—</span>
+          </div>
+        </div>
+      </div>
+      <figcaption>The top plate XORs the two bit-rows into a third; wherever the
+        <span style="color:var(--amber)">PC</span> and
+        <span style="color:var(--cyan)">value</span> bits <b>differ</b>, the result bit is lit. That
+        combined number is shuffled (× a golden-ratio constant, then take the high bits) into a
+        <b>bucket</b> — one lamp on the wall. Drag the value: the lit lamp jumps. Land on a bucket
+        you've <span style="color:var(--reward)">never hit before</span> and the fuzzer scores a
+        reward; land on one already seen and it stays quiet. That “first time only” gate is the whole
+        trick to not drowning in noise.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ========== 3. KERNEL SIDE ========== -->
+  <section>
+    <div class="kicker measure"><span class="n">03</span><span class="eyebrow">Where the numbers come from</span><span class="line"></span></div>
+    <div class="measure">
+      <h2 class="serif">The kernel just writes down what it saw</h2>
+      <p>An important design choice: the kernel does <strong>no folding at all</strong>. The compiler
+        (a custom Clang pass) inserts callbacks at function entries and returns —
+        <code>__sanitizer_cov_trace_args</code> and <code>__sanitizer_cov_trace_ret</code> — and those
+        callbacks dump <em>raw</em> records into a shared ring buffer that userspace reads. Each record is
+        just: a small header, the <span style="color:var(--amber)">PC</span>, some metadata, and the
+        <span style="color:var(--cyan)">value(s)</span> observed.</p>
+      <pre class="mono"><code><span class="tok-c">/* one record in the shared ring — kernel/kcov_dataflow.c */</span>
+area[i]     = type_marker | ((nfields) &lt;&lt; 24) | seq;  <span class="tok-c">// 0xE=args 0xF=ret 0xC=cmp</span>
+area[i + 1] = <span class="tok-k">pc</span>;                                <span class="tok-c">// raw program counter, untouched</span>
+area[i + 2] = meta;                              <span class="tok-c">// arg index | size | pointer</span>
+area[i + 3] = <span class="tok-v">value</span>;   <span class="tok-c">// a scalar, OR up to N decomposed struct fields</span></code></pre>
+      <p>One nice detail: when the traced argument is a <em>pointer to a struct</em>, the Clang pass
+        also emits the struct's field offsets, and the kernel walks them with
+        <code>copy_from_kernel_nofault</code> (a fault-safe read) to record several fields per argument.
+        So a buried <code>length</code> member three fields deep inside a request struct becomes its own
+        piece of cargo. Everything is read defensively — a bad pointer yields a
+        <code>0xBADADD85</code> sentinel instead of a crash.</p>
+      <div class="note"><b>Why raw?</b> Keeping the fold out of the kernel means the <i>policy</i> — how
+        aggressively to reward values, how to split the map, whether to run value-blind at all — lives
+        in the userspace harness where it can be changed and A/B-tested without rebooting into a new
+        kernel.</div>
+    </div>
+  </section>
+
+  <!-- ========== 4. USERSPACE FOLD ========== -->
+  <section>
+    <div class="kicker measure"><span class="n">04</span><span class="eyebrow">The fold</span><span class="line"></span></div>
+    <div class="measure">
+      <h2 class="serif">Two neighborhoods on one wall</h2>
+      <p>Userspace reads the raw records and “develops” them onto the coverage bitmap that libFuzzer
+        actually watches — an array of counters called <code>ctr[]</code>. The clever part is that the
+        wall is split into <strong>two neighborhoods</strong>:</p>
+      <p><span class="swatch" style="background:var(--amber)"></span><strong>The PATH region</strong>
+        (left). Here only the <span style="color:var(--amber)">PC</span> matters — pure edge coverage.
+        It fills up fast and then saturates, exactly like the bored lamplighter. That's fine: its job is
+        to credit <em>reaching</em> code at all.</p>
+      <p><span class="swatch" style="background:var(--cyan)"></span><strong>The VALUE region</strong>
+        (right). Here the <code>PC ⊕ VAL</code> fold lands, and a lamp lights <strong>only the first
+        time</strong> a given <span class="mono">(PC, field, value)</span> combination is ever seen —
+        tracked by a 65,536-bit “have I seen this?” bitmap called <code>val_seen</code>.</p>
+      <pre class="mono"><code><span class="tok-c">/* grain/common.h — fb(): develop raw records onto ctr[] */</span>
+<span class="tok-k">uint64_t</span> h = pc * <span class="tok-v">0x517cc1b727220a95</span>;         <span class="tok-c">// spread the PC</span>
+ctr[(h &gt;&gt; 12) % <span class="tok-k">path_n</span>]++;                 <span class="tok-c">// PATH region: value-blind, saturates</span>
+
+<span class="tok-k">for</span> (k = 0; k &lt; nfields; k++) {              <span class="tok-c">// every struct field is its own cargo</span>
+    fv = field[k];
+    <span class="tok-k">if</span> (fv == 0 || fv == <span class="tok-v">0xBADADD85</span>) <span class="tok-k">continue</span>; <span class="tok-c">// skip null + failed-read</span>
+    vh = ((<span class="tok-k">pc</span> ^ <span class="tok-v">fv</span>) + k*<span class="tok-v">0x9E3779B9</span>) * <span class="tok-v">0x9E3779B97F4A7C15</span>;  <span class="tok-c">// ← the fold</span>
+    vb = vh &gt;&gt; 48;                             <span class="tok-c">// 16-bit bucket</span>
+    <span class="tok-k">if</span> (!seen(val_seen, vb)) {                 <span class="tok-c">// FIRST time only</span>
+        mark(val_seen, vb);
+        ctr[<span class="tok-k">path_n</span> + vb % <span class="tok-k">val_n</span>]++;         <span class="tok-n">// reward: a novel (pc,value)!</span>
+    }
+}</code></pre>
+      <p>The <code>+ k * 0x9E3779B9</code> keeps the same value distinct depending on <em>which field</em>
+        it came from, and the big multiply by the 64-bit golden-ratio constant avalanches the bits so
+        near-neighbor pairs don't collide in the top 16 bits we actually use. The
+        <code>val_seen</code> gate is what makes this <em>bounded</em>: a loop that reads the same length
+        a million times mints exactly one lamp, not a million. Without it, the value neighborhood would
+        flood and saturate just like the path one — and you'd be back to a bored lamplighter, only
+        noisier.</p>
+    </div>
+
+    <figure>
+      <div class="plate-head">
+        <span class="tag">Fig. 03 — interactive</span>
+        <span class="ttl">Path bulk saturates; the value region keeps finding</span>
+      </div>
+      <div class="body">
+        <div class="controls">
+          <button class="ctl" id="f3run">Feed 60 records</button>
+          <button class="ctl ghost" id="f3reset">Reset</button>
+          <label class="readout" style="display:flex;align-items:center;gap:.5rem">
+            <input type="checkbox" id="f3bounded" checked> first-seen gate (bounded)
+          </label>
+        </div>
+        <canvas class="fig" id="f3strip" style="height:170px"></canvas>
+        <div class="readout" style="margin-top:.7rem" id="f3stat">
+          PATH lamps lit: <b>0</b> · VALUE lamps lit: <b>0</b></div>
+      </div>
+      <figcaption>The single strip is <code>ctr[]</code>. The
+        <span style="color:var(--amber)">amber</span> left is the PATH region, the
+        <span style="color:var(--cyan)">cyan</span> right is the VALUE region. Feed records and watch the
+        path side fill and cap out while the value side keeps sprinkling in fresh lamps. Now
+        <b>uncheck the first-seen gate</b> (the legacy <code>GRAIN_DATAFLOW=1</code> mode): repeated
+        values now light the same buckets over and over, the region floods, and its usefulness
+        collapses — a vivid picture of why the bound exists.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ========== 5. PROS & CONS ========== -->
+  <section>
+    <div class="kicker measure"><span class="n">05</span><span class="eyebrow">The trade-off</span><span class="line"></span></div>
+    <div class="measure">
+      <h2 class="serif">The second axis isn't free</h2>
+      <p>A new signal always sends a bill. <span style="color:var(--cyan);font-weight:600">PC⊕VAL</span>
+        buys depth — but it costs map space, adds a noise risk, and blurs the tidy “are we done yet?”
+        line that plain edge coverage gives you. An engineer should be able to argue both sides, so here
+        it is, aspect by aspect:</p>
+    </div>
+    <div class="measure tbl-wrap">
+      <table class="cmp">
+        <thead><tr><th>Aspect</th><th class="pccol">PC only — edge</th><th class="dfcol">PC ⊕ VAL — dataflow</th></tr></thead>
+        <tbody>
+          <tr><th>Same PC, new value</th>
+            <td class="win bad">Invisible — one lamp forever</td>
+            <td class="win good">Distinguished — a fresh lamp</td></tr>
+          <tr><th>Escaping a plateau</th>
+            <td class="win bad">Stuck once every edge is seen</td>
+            <td class="win good">Keeps finding while values vary</td></tr>
+          <tr><th>Boundary-value bugs <span class="readout">(0, −1, huge len)</span></th>
+            <td class="win bad">No pull toward them</td>
+            <td class="win good">Each novel value is rewarded</td></tr>
+          <tr><th>“Am I done?” signal</th>
+            <td class="win good">Clean — saturates, easy to read</td>
+            <td class="win neu">Muddier — value axis keeps drifting up</td></tr>
+          <tr><th>Map pressure &amp; collisions</th>
+            <td class="win good">Compact — few features</td>
+            <td class="win bad">Many features; needs a big map + a bound</td></tr>
+          <tr><th>Noise resistance</th>
+            <td class="win good">Immune — edges are finite</td>
+            <td class="win neu">Floods without the first-seen gate</td></tr>
+          <tr><th>Corpus size</th>
+            <td class="win good">Small — few inputs kept</td>
+            <td class="win neu">Larger — more inputs judged “interesting”</td></tr>
+          <tr><th>Runtime overhead</th>
+            <td class="win good">Cheap — one counter bump</td>
+            <td class="win bad">Extra reads, field decode, a hash</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="measure">
+      <p><span class="mono" style="color:var(--cyan)">✓</span> a win &nbsp;·&nbsp;
+         <span class="mono" style="color:var(--reward)">✗</span> a cost &nbsp;·&nbsp;
+         <span class="mono" style="color:var(--faint)">±</span> depends. The pattern is clean:
+         <b>PC-only wins on economy and clarity; PC⊕VAL wins on reach.</b></p>
+      <p>Which is why the design doesn't <em>choose</em> — it runs <strong>both at once</strong>. The path
+        region gives you edge coverage's cheap breadth and its clean saturation signal; the value region
+        adds depth only where inputs keep producing genuinely new values. On a fresh target edge coverage
+        races to breadth fast; the moment it plateaus, the value axis is what keeps the fuzzer moving. And
+        because the value axis can be switched off (<code>KSMBDZZER_ENGINE=pc-*</code>), you can always
+        measure exactly what the second axis earned — a cost you can't justify is a cost you shouldn't
+        pay.</p>
+    </div>
+  </section>
+
+  <!-- ========== 6. TRACE-CMP ========== -->
+  <section>
+    <div class="kicker measure"><span class="n">06</span><span class="eyebrow">Integrating comparisons</span><span class="line"></span></div>
+    <div class="measure">
+      <h2 class="serif">Where should a comparison go?</h2>
+      <p>The compiler can instrument every comparison too — <code>__sanitizer_cov_trace_cmp*</code> hands
+        you, for each <code>if (a == b)</code>, the site (<span style="color:var(--amber);font-weight:600">PC</span>)
+        and <em>both operands</em>. That's gold for beating magic-byte and checksum checks. The question
+        is <em>how to spend it</em> — and two philosophies lead to very different formulas:</p>
+
+      <div class="formulae">
+        <div class="fbox a">
+          <div class="flabel">Scheme A — operand as coverage</div>
+          <div class="formula"><span class="pc">PC</span> <span class="op">⊕</span> <span class="cmp">CMP</span></div>
+          <p>Treat the comparison <em>operand</em> exactly like a dataflow value and fold it into the
+            value map. This is what libFuzzer's <span class="mono">value profile</span> does: reaching a
+            comparison with a never-seen operand mints a new feature.</p>
+          <p class="verdict">✗ operand is input-echo → the map floods</p>
+        </div>
+        <div class="fbox b">
+          <div class="flabel">Scheme B — context + directed solve</div>
+          <div class="formula">(<span class="pc">PC</span> <span class="op">+</span> <span class="cmp">CMP</span>) <span class="op">⊕</span> <span class="val">VAL</span></div>
+          <p>Let the comparison only <em>refine the location</em> (which compare, resolved which way) in
+            the PATH region, keep <span class="mono">⊕ VAL</span> for genuine kernel arguments and
+            returns, and hand the operand <em>pair</em> to the i2s mutator to solve the check outright.</p>
+          <p class="verdict">✓ three concerns cleanly separated</p>
+        </div>
+      </div>
+
+      <p>The trap is that <span class="cmpword">CMP</span> means two different things here. In
+        <strong>Scheme A</strong> it's the operand <em>value</em> — and operands are usually
+        <strong>your own input bytes echoed straight back</strong>. If four input bytes flow into
+        <code>a</code> in <code>if (a == MAGIC)</code>, then every mutation makes <code>a</code>
+        different, so <code>PC ⊕ CMP</code> is “new” on <em>every single run</em>. The map fills with
+        input noise, the first-seen gate saturates almost instantly, and you <em>still</em> can't tell a
+        guess creeping toward <code>MAGIC</code> from one wandering away. Worse, those noisy operand
+        features share the value map with your <em>real</em> dataflow values and drown them out.</p>
+      <p>In <strong>Scheme B</strong>, <span class="cmpword">CMP</span> is only a small <em>context tag</em>
+        — which comparison, and how it resolved — added onto the
+        <span style="color:var(--amber);font-weight:600">PC</span> so the location becomes more specific
+        (context-sensitive coverage). It's bounded: there are finitely many comparison sites, so it
+        saturates cleanly like the rest of the path region. The genuine value fold
+        <span style="color:var(--cyan);font-weight:600">⊕ VAL</span> stays reserved for arguments and
+        returns. And the part that actually <em>beats</em> the check isn't coverage at all — the operand
+        pair goes to <code>mutate_i2s</code>: “the kernel just compared your bytes at offset 12 against
+        <code>0xFE534D42</code> → write <code>0xFE534D42</code> there.” One directed copy instead of
+        2³² blind guesses.</p>
+      <div class="note"><b>What the codebase actually does.</b> kcov-dataflow follows Scheme B: cmp
+        records are <em>excluded</em> from the <code>⊕ VAL</code> value region (the <code>rt != 0xC</code>
+        guard in <code>fb()</code>), reaching a comparison is still credited by the path bulk, and the
+        operand pair drives <code>mutate_i2s</code>. Scheme A's value-profile is a fine tool for a
+        pure-userspace target — but on a kernel where the same map must <em>also</em> carry real
+        argument and return dataflow, letting input-echo operands share it is a net loss.</div>
+    </div>
+
+    <figure>
+      <div class="plate-head">
+        <span class="tag">Fig. 04 — interactive</span>
+        <span class="ttl">Beating a magic-byte check: noise vs. a directed copy</span>
+      </div>
+      <div class="body">
+        <p class="readout" style="margin:.1rem 0 1rem">target &nbsp;<span class="mono" style="color:var(--ink);font-size:1.05em">if (word == 0xCAFE) → BUG()</span></p>
+        <div class="twoGrid">
+          <div>
+            <div class="panelLabel"><span><span class="swatch" style="background:var(--reward)"></span>Scheme A · PC ⊕ CMP</span><span class="hit" id="f4aLock">🔒 CLOSED</span></div>
+            <canvas class="fig" id="f4a" style="height:126px"></canvas>
+            <div class="controls" style="margin:.7rem 0 0">
+              <button class="ctl" id="f4aBtn" style="background:var(--reward)">Random mutation ×8</button>
+            </div>
+            <div class="readout" style="margin-top:.5rem" id="f4aStat">guesses: <b>0</b> · noise features: <b>0</b></div>
+          </div>
+          <div>
+            <div class="panelLabel"><span><span class="swatch" style="background:var(--cyan)"></span>Scheme B · operand → i2s</span><span class="hit" id="f4bLock">🔒 CLOSED</span></div>
+            <canvas class="fig" id="f4b" style="height:126px"></canvas>
+            <div class="controls" style="margin:.7rem 0 0">
+              <button class="ctl cyan" id="f4bBtn">Observe &amp; copy operand</button>
+            </div>
+            <div class="readout" style="margin-top:.5rem" id="f4bStat">steps: <b>0</b> · features: <b>0</b></div>
+          </div>
+        </div>
+      </div>
+      <figcaption>Both fight the same 16-bit check — odds of a random hit: <b>1 in 65,536</b>.
+        <span style="color:var(--reward)">Scheme A</span> lights a fresh coverage lamp on nearly every
+        guess; the curve <i>looks</i> productive, but it's input-echo and the lock stays shut.
+        <span style="color:var(--cyan)">Scheme B</span> reads the constant the kernel compared against and
+        writes it straight into the input — lock open in one step, almost no map churn. Coverage that
+        <b>climbs</b> is not the same as coverage that <b>progresses</b>.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ========== 7. EXTRAS ========== -->
+  <section>
+    <div class="measure">
+      <div class="kicker"><span class="n">07</span><span class="eyebrow">Beyond the fold</span><span class="line"></span></div>
+      <h2 class="serif">The value axis pays off beyond coverage</h2>
+      <p>Once the kernel is handing you real runtime values, the coverage map isn't the only place they
+        help:</p>
+      <p><strong>Return values become dictionary tokens.</strong> A value the kernel <em>produced</em>
+        (a handle, an ID, a computed length in a <code>ret</code> record) is stashed and later spliced
+        back into the fuzzer's input. If the kernel checks <code>if (reply_id == request_id)</code>
+        later, the fuzzer already has the magic number to satisfy it. This “feed the output back into the
+        input” idea is <strong>RedQueen's input-to-state</strong> correspondence, applied to return
+        flow. (The comparison side of this — why cmp operands feed the mutator instead of the map — is
+        Scheme B in the previous section.)</p>
+      <p><strong>There's an off switch, on purpose.</strong> Setting <code>KSMBDZZER_ENGINE=pc-*</code>
+        drops the value region entirely, leaving pure PC coverage — <em>exactly what an edge fuzzer
+        sees</em>. That's not a bug, it's the <strong>control group</strong>: run the same target both
+        ways and you can measure whether the <code>(PC, value)</code> vector actually finds more than
+        <code>PC</code> alone. A claim about a new coverage signal is only worth something if you can turn
+        it off and watch the results get worse.</p>
+    </div>
+  </section>
+
+  <!-- ========== 6. LINEAGE ========== -->
+  <section>
+    <div class="measure">
+      <div class="kicker"><span class="n">08</span><span class="eyebrow">Where the idea comes from</span><span class="line"></span></div>
+      <h2 class="serif">Standing on a decade of coverage research</h2>
+      <p>Folding values into the coverage signal isn't a bolt from the blue — it's the latest step in a
+        long conversation about <em>what a fuzzer should measure</em>. The lineage worth knowing:</p>
+      <div class="refs">
+        <div class="ref"><span class="yr">2013→</span><div><b>AFL &amp; edge coverage.</b> Established the
+          branch/edge bitmap as the feedback signal that made coverage-guided fuzzing explode. Also the
+          source of the saturation ceiling this whole design is fighting.</div></div>
+        <div class="ref"><span class="yr">2016→</span><div><b>kcov &amp; syzkaller (Linux).</b> Brought
+          edge coverage into the kernel; <code>KCOV_TRACE_CMP</code> later exposed comparison operands.
+          kcov-dataflow is a sibling mechanism — a separate <code>/sys/kernel/debug/kcov_dataflow</code>
+          device carrying <i>values</i>, not just PCs.</div></div>
+        <div class="ref"><span class="yr">2017</span><div><b>VUzzer (Sanabria et&nbsp;al., NDSS).</b>
+          Data-flow / taint features to guide mutation — an early argument that <i>what</i> flows, not
+          just <i>where</i>, should steer the fuzzer.</div></div>
+        <div class="ref"><span class="yr">2016</span><div><b>laf-intel &amp; libFuzzer value profile.</b>
+          Split multi-byte comparisons into single bytes, and fold comparison operands into a value
+          table — the concrete instance of “Scheme A” (operand-as-coverage) discussed above.</div></div>
+        <div class="ref"><span class="yr">2018</span><div><b>Angora (Chen &amp; Chen, S&amp;P).</b>
+          Byte-level taint plus gradient descent on comparison operands to solve hard branch
+          conditions — the intellectual cousin of the i2s mutator here.</div></div>
+        <div class="ref"><span class="yr">2019</span><div><b>RedQueen (Aschermann et&nbsp;al., NDSS).</b>
+          Input-to-state correspondence: values seen at runtime get written back into the input,
+          cheaply solving magic-byte and checksum checks. Directly the ancestor of the return-value
+          dictionary and <code>mutate_i2s</code>.</div></div>
+        <div class="ref"><span class="yr">2020</span><div><b>Ijon (Aschermann et&nbsp;al., S&amp;P).</b>
+          The closest kin: it lets you fold <i>program state values</i> into the coverage map to escape
+          plateaus edge coverage can't. kcov-dataflow automates that folding for kernel arguments and
+          returns instead of asking a human to annotate it.</div></div>
+      </div>
+      <p style="color:var(--muted);font-size:.95rem">Read together, the arc is simple: the community kept
+        discovering that the runtime <em>values</em> a program computes are too useful to throw away. The
+        <code>PC ⊕ VAL</code> fold is one compact way to keep them — a second axis on a wall of lamps
+        that used to have only one.</p>
+    </div>
+  </section>
+
+  <footer>
+    <div class="serif" style="font-size:1.3rem;color:var(--ink)">
+      <span style="color:var(--amber)">PC</span>
+      <span style="color:var(--muted)">⊕</span>
+      <span style="color:var(--cyan)">VAL</span></div>
+    <p class="mono" style="margin-top:.6rem">where × what — kcov-dataflow coverage folding, explained</p>
+  </footer>
+</div>
+
+<script>
+(function(){
+  "use strict";
+  var reduced = matchMedia('(prefers-reduced-motion:reduce)').matches;
+
+  function pal(){
+    var s=getComputedStyle(document.documentElement);
+    var g=function(n){return s.getPropertyValue(n).trim();};
+    return {ink:g('--ink'),amber:g('--amber'),amberS:g('--amber-soft'),cyan:g('--cyan'),
+            reward:g('--reward'),muted:g('--muted'),faint:g('--faint'),
+            off:g('--lamp-off'),bg:g('--fig-bg'),rule:g('--rule')};
+  }
+  function fit(cv){
+    var r=cv.getBoundingClientRect();
+    var dpr=Math.min(window.devicePixelRatio||1,2);
+    cv.width=Math.max(1,Math.round(r.width*dpr));
+    cv.height=Math.max(1,Math.round(r.height*dpr));
+    var ctx=cv.getContext('2d');
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    return {ctx:ctx,w:r.width,h:r.height};
+  }
+  function rr(ctx,x,y,w,h,r){
+    r=Math.min(r,w/2,h/2);
+    ctx.beginPath();
+    ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);
+    ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();
+  }
+  var redraws=[];
+  function reg(fn){redraws.push(fn);try{fn();}catch(e){}}
+  var rt=null;
+  function redrawAll(){for(var i=0;i<redraws.length;i++){try{redraws[i]();}catch(e){}}}
+  window.addEventListener('resize',function(){clearTimeout(rt);rt=setTimeout(redrawAll,120);});
+  new MutationObserver(redrawAll).observe(document.documentElement,{attributes:true,attributeFilter:['data-theme','class','style']});
+  try{matchMedia('(prefers-color-scheme:dark)').addEventListener('change',redrawAll);}catch(e){}
+
+  // ---- lamp grid helper ----
+  function drawGrid(ctx,w,h,cols,rows,state,defColor){
+    var p=pal();
+    ctx.clearRect(0,0,w,h);
+    var pad=6, gx=5, gy=5;
+    var cw=(w-pad*2-gx*(cols-1))/cols;
+    var ch=(h-pad*2-gy*(rows-1))/rows;
+    for(var r=0;r<rows;r++){for(var c=0;c<cols;c++){
+      var idx=r*cols+c;
+      var x=pad+c*(cw+gx), y=pad+r*(ch+gy);
+      var st=state[idx];
+      ctx.save();
+      if(st&&st.on){
+        var col=st.color||defColor;
+        ctx.shadowColor=col; ctx.shadowBlur=st.flash?cw*1.1:cw*0.5;
+        ctx.fillStyle=col; ctx.globalAlpha=st.flash?1:0.92;
+      } else {
+        ctx.fillStyle=p.off; ctx.globalAlpha=1;
+      }
+      rr(ctx,x,y,cw,ch,Math.max(2,cw*0.16)); ctx.fill();
+      ctx.restore();
+    }}
+  }
+
+  /* =================== HERO =================== */
+  (function(){
+    var cv=document.getElementById('heroCanvas'); if(!cv)return;
+    var cols=44, rows=6, state=[], t=0, acc=0;
+    function ensure(n){while(state.length<n)state.push({on:false,color:null,flash:0});}
+    function frame(){
+      var f=fit(cv), p=pal(); ensure(cols*rows);
+      // ambient: occasionally light a lamp (a folded record landing)
+      acc++;
+      if(acc%5===0){
+        var i=(Math.floor((Math.sin(t*0.7)*0.5+0.5)*cols*rows*0.9)+ (t*7|0))%(cols*rows);
+        var amber = ((t*13)|0)%3!==0;
+        state[i]={on:true,color:amber?p.amber:p.cyan,flash:1.0};
+      }
+      var st=[];
+      for(var k=0;k<cols*rows;k++){
+        var s=state[k];
+        if(s.flash>0){s.flash-=0.045; if(s.flash<0)s.flash=0;}
+        st[k]={on:s.on&&s.flash>0.02,color:s.color,flash:s.flash>0.6};
+        if(s.flash<=0.02)s.on=false;
+      }
+      drawGrid(f.ctx,f.w,f.h,cols,rows,st,p.amber);
+      t+=0.016;
+      if(!reduced) requestAnimationFrame(frame);
+    }
+    if(reduced){
+      // static: a scattered arrangement
+      reg(function(){var f=fit(cv),p=pal(),st=[];
+        for(var k=0;k<cols*rows;k++){var on=(k*7%11)<3; st[k]={on:on,color:(k%3?p.amber:p.cyan)};}
+        drawGrid(f.ctx,f.w,f.h,cols,rows,st,p.amber);});
+    } else { requestAnimationFrame(frame); }
+  })();
+
+  /* =================== FIG 1 =================== */
+  (function(){
+    var eCv=document.getElementById('f1edge'), dCv=document.getElementById('f1data'),
+        cCv=document.getElementById('f1chart');
+    if(!eCv)return;
+    var cols=14, rows=6, N=cols*rows;
+    var PATH=[]; // fixed path lamps
+    (function(){var seed=7; for(var i=0;i<11;i++){seed=(seed*1103515245+12345)&0x7fffffff; PATH.push(seed%N);}})();
+    var runs=0, edgeSet={}, dataSet={}, hist=[]; // hist: {e,d}
+    function reset(){runs=0;edgeSet={};dataSet={};hist=[];render();upd(0,0);}
+    function send(){
+      runs++;
+      var eNew=0,dNew=0;
+      // edge: path lamps only
+      for(var i=0;i<PATH.length;i++){ if(!edgeSet[PATH[i]]){edgeSet[PATH[i]]=1;eNew++;} }
+      // data: path lamps (amber) + one new value lamp (cyan) per run
+      for(i=0;i<PATH.length;i++){ if(!dataSet['p'+PATH[i]]){dataSet['p'+PATH[i]]=1;dNew++;} }
+      // pick a fresh value lamp not in path
+      var vseed=(runs*2654435761)>>>0, vlamp=vseed%N, guard=0;
+      while((PATH.indexOf(vlamp)>=0||dataSet['v'+vlamp])&&guard<N){vlamp=(vlamp+7)%N;guard++;}
+      dataSet['v'+vlamp]=1; dNew++;
+      hist.push({e:Object.keys(edgeSet).length, d:countData()});
+      upd(eNew,dNew); render();
+    }
+    function countData(){return Object.keys(dataSet).length;}
+    function upd(eN,dN){
+      document.getElementById('f1runs').innerHTML='inputs sent: <b>'+runs+'</b>';
+      document.getElementById('f1eNew').textContent='+'+eN+' new';
+      document.getElementById('f1dNew').textContent='+'+dN+' new';
+      document.getElementById('f1eNew').style.color=eN?'var(--amber)':'var(--faint)';
+      document.getElementById('f1dNew').style.color=dN?'var(--cyan)':'var(--faint)';
+    }
+    function render(){
+      var p=pal();
+      // edge grid
+      var f=fit(eCv), st=[];
+      for(var k=0;k<N;k++)st[k]={on:!!edgeSet[k],color:p.amber};
+      drawGrid(f.ctx,f.w,f.h,cols,rows,st,p.amber);
+      // data grid
+      f=fit(dCv);st=[];
+      for(k=0;k<N;k++){var on=dataSet['p'+k]||dataSet['v'+k];
+        st[k]={on:!!on,color:dataSet['v'+k]?p.cyan:p.amber};}
+      drawGrid(f.ctx,f.w,f.h,cols,rows,st,p.cyan);
+      // chart
+      drawChart();
+    }
+    function drawChart(){
+      var f=fit(cCv), p=pal(), w=f.w, h=f.h, ctx=f.ctx;
+      ctx.clearRect(0,0,w,h);
+      var padL=8,padR=8,padT=14,padB=18;
+      var maxX=Math.max(10,hist.length), maxY=Math.max(12, hist.length?hist[hist.length-1].d:12);
+      function X(i){return padL+(w-padL-padR)*(i/(maxX-1||1));}
+      function Y(v){return h-padB-(h-padT-padB)*(v/maxY);}
+      // baseline
+      ctx.strokeStyle=p.rule;ctx.lineWidth=1;
+      ctx.beginPath();ctx.moveTo(padL,h-padB);ctx.lineTo(w-padR,h-padB);ctx.stroke();
+      if(hist.length){
+        // dataflow line
+        var series=[['d',p.cyan],['e',p.amber]];
+        for(var s=0;s<series.length;s++){
+          ctx.strokeStyle=series[s][1];ctx.lineWidth=2.4;ctx.beginPath();
+          for(var i=0;i<hist.length;i++){var xx=X(i),yy=Y(hist[i][series[s][0]]);
+            if(i===0)ctx.moveTo(xx,yy);else ctx.lineTo(xx,yy);}
+          ctx.stroke();
+          // endpoint dot
+          var lx=X(hist.length-1),ly=Y(hist[hist.length-1][series[s][0]]);
+          ctx.fillStyle=series[s][1];ctx.beginPath();ctx.arc(lx,ly,3.2,0,7);ctx.fill();
+        }
+      }
+      // labels
+      ctx.font='11px ui-monospace,monospace';ctx.fillStyle=p.muted;
+      ctx.textBaseline='top';ctx.fillText('total lamps lit  →',padL,2);
+      ctx.textBaseline='bottom';ctx.textAlign='right';
+      ctx.fillText('inputs sent →',w-padR,h-3);ctx.textAlign='left';
+    }
+    document.getElementById('f1send').onclick=send;
+    document.getElementById('f1reset').onclick=reset;
+    reg(render);
+  })();
+
+  /* =================== FIG 2 =================== */
+  (function(){
+    var bits=document.getElementById('f2bits'), wall=document.getElementById('f2wall');
+    if(!bits)return;
+    var PC=0x4a1c, GRID_C=16, GRID_R=4, GN=GRID_C*GRID_R;
+    var seen={}, curBucket=-1, curNovel=false;
+    var valEl=document.getElementById('f2val');
+    function bucketOf(pc,val){
+      // mimic: ((pc^val) * golden) >> 48 -> but JS 32-bit; emulate a shuffle
+      var x=(pc^val)>>>0;
+      // xorshift-ish avalanche
+      x=Math.imul(x^(x>>>15),0x9E3779B1)>>>0;
+      x^=x>>>13; x=Math.imul(x,0x85EBCA77)>>>0; x^=x>>>16;
+      return x%GN;
+    }
+    function fmt(n){var s=n.toString(16).toUpperCase();while(s.length<4)s='0'+s;return '0x'+s;}
+    function renderBits(){
+      var f=fit(bits),p=p2pal(),ctx=f.ctx,w=f.w,h=f.h;
+      ctx.clearRect(0,0,w,h);
+      var val=parseInt(valEl.value,10)|0;
+      var rows=[['PC',PC,p.amber],['VALUE',val,p.cyan],['PC ⊕ VALUE',(PC^val)&0xffff,p.reward]];
+      var labelW=Math.min(96,w*0.24);
+      var gx=3, cells=16;
+      var cw=(w-labelW-gx*(cells-1)-8)/cells;
+      var rh=30, gapY=(h-8-rows.length*rh)/(rows.length-1);
+      ctx.textBaseline='middle';
+      for(var r=0;r<rows.length;r++){
+        var y=4+r*(rh+gapY);
+        ctx.font='600 12px ui-monospace,monospace';ctx.fillStyle=p.muted;ctx.textAlign='left';
+        ctx.fillText(rows[r][0],2,y+rh/2);
+        ctx.font='11px ui-monospace,monospace';ctx.fillStyle=p.faint;ctx.textAlign='right';
+        ctx.fillText(fmt(rows[r][1]&0xffff),labelW-6,y+rh*0.5);
+        for(var b=0;b<cells;b++){
+          var bit=(rows[r][1]>>(15-b))&1;
+          var x=labelW+8+b*(cw+gx);
+          ctx.save();
+          if(bit){ctx.fillStyle=rows[r][2];ctx.globalAlpha=r===2?1:0.9;
+            if(r===2){ctx.shadowColor=rows[r][2];ctx.shadowBlur=cw*0.5;}}
+          else{ctx.fillStyle=p.off;}
+          rr(ctx,x,y,cw,rh,4);ctx.fill();
+          ctx.restore();
+        }
+      }
+    }
+    function renderWall(){
+      var f=fit(wall),p=p2pal();
+      var st=[];
+      for(var k=0;k<GN;k++){
+        var on=!!seen[k];
+        var isCur=(k===curBucket);
+        st[k]={on:on||isCur, color:isCur?(curNovel?p.reward:p.cyan):p.cyan, flash:isCur};
+      }
+      drawGrid(f.ctx,f.w,f.h,GRID_C,GRID_R,st,p.cyan);
+    }
+    function p2pal(){var p=pal();return p;}
+    function update(){
+      var val=parseInt(valEl.value,10)|0;
+      document.getElementById('f2valLabel').textContent=fmt(val);
+      var b=bucketOf(PC,val);
+      curNovel=!seen[b];
+      curBucket=b;
+      document.getElementById('f2bucket').textContent='#'+b;
+      var vd=document.getElementById('f2verdict');
+      if(curNovel){vd.textContent='NEW — reward!';vd.style.color='var(--reward)';}
+      else{vd.textContent='already seen';vd.style.color='var(--muted)';}
+      renderBits();renderWall();
+    }
+    function commit(){var b=bucketOf(PC,parseInt(valEl.value,10)|0);seen[b]=1;}
+    valEl.addEventListener('input',update);
+    valEl.addEventListener('change',function(){commit();update();});
+    document.getElementById('f2pc').textContent=fmt(PC);
+    document.getElementById('f2newpc').onclick=function(){
+      PC=(Math.floor((performance.now()*997)%65535))^0x1234; PC&=0xffff;
+      document.getElementById('f2pc').textContent=fmt(PC); update();
+    };
+    document.getElementById('f2clear').onclick=function(){seen={};update();};
+    reg(function(){renderBits();renderWall();});
+    update();
+  })();
+
+  /* =================== FIG 3 =================== */
+  (function(){
+    var strip=document.getElementById('f3strip'); if(!strip)return;
+    var PATHN=48, VALN=48, TOTAL=PATHN+VALN;
+    var path=new Array(PATHN).fill(0), val=new Array(VALN).fill(0);
+    var seen={}, anim=null;
+    var boundedEl=document.getElementById('f3bounded');
+    function reset(){for(var i=0;i<PATHN;i++)path[i]=0;for(i=0;i<VALN;i++)val[i]=0;seen={};render();stat();}
+    function feedOne(step){
+      // path: a handful of PCs, hit repeatedly -> saturate
+      var pc=(step*40503)%PATHN; path[pc]=Math.min(6,path[pc]+1);
+      // value: pc^value bucket; value repeats sometimes
+      var vpick=(step%7<3)? (step%5) : step; // repeats when step%7<3
+      var vb=((pc*131)^ (vpick*2654435761))>>>0; vb%=VALN;
+      var bounded=boundedEl.checked;
+      if(bounded){ if(!seen[vb]){seen[vb]=1; val[vb]=1;} }
+      else { val[vb]=Math.min(6,(val[vb]||0)+1); }
+    }
+    function run(){
+      var i=0, base=(Math.floor(performance.now())%1000);
+      function tick(){
+        for(var j=0;j<4;j++){feedOne(base+i);i++;}
+        render();stat();
+        if(i<60 && !reduced){anim=requestAnimationFrame(tick);}
+        else{if(reduced){for(;i<60;i++)feedOne(base+i);}render();stat();}
+      }
+      if(anim)cancelAnimationFrame(anim);
+      tick();
+    }
+    function render(){
+      var f=fit(strip),p=pal(),ctx=f.ctx,w=f.w,h=f.h;
+      ctx.clearRect(0,0,w,h);
+      var pad=8, midGap=18;
+      var usable=w-pad*2-midGap;
+      var wPath=usable*PATHN/TOTAL, wVal=usable*VALN/TOTAL;
+      drawRegion(ctx,pad,wPath,h,PATHN,path,p.amber,p,'PATH region  ·  PC only');
+      drawRegion(ctx,pad+wPath+midGap,wVal,h,VALN,val,p.cyan,p,'VALUE region  ·  PC ⊕ VAL');
+      // divider
+      ctx.strokeStyle=p.rule;ctx.setLineDash([4,4]);
+      ctx.beginPath();ctx.moveTo(pad+wPath+midGap/2,10);ctx.lineTo(pad+wPath+midGap/2,h-10);ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    function drawRegion(ctx,x0,ww,h,n,arr,color,p,label){
+      var cols=Math.ceil(n/4), rows=4;
+      var topPad=22, gx=3, gy=3;
+      var cw=(ww-gx*(cols-1))/cols;
+      var ch=(h-topPad-8-gy*(rows-1))/rows;
+      ctx.font='600 11px ui-monospace,monospace';ctx.fillStyle=p.muted;
+      ctx.textAlign='left';ctx.textBaseline='top';ctx.fillText(label,x0,4);
+      for(var i=0;i<n;i++){
+        var c=Math.floor(i/rows), r=i%rows;
+        var x=x0+c*(cw+gx), y=topPad+r*(ch+gy);
+        var lvl=arr[i]||0;
+        ctx.save();
+        if(lvl>0){
+          ctx.fillStyle=color;
+          ctx.globalAlpha=0.35+Math.min(0.65,lvl*0.14);
+          if(lvl>=5){ctx.shadowColor=color;ctx.shadowBlur=cw*0.4;}
+        } else {ctx.fillStyle=p.off;}
+        rr(ctx,x,y,cw,ch,Math.max(2,cw*0.16));ctx.fill();
+        ctx.restore();
+      }
+    }
+    function stat(){
+      var pc=0,vc=0,i;
+      for(i=0;i<PATHN;i++)if(path[i])pc++;
+      for(i=0;i<VALN;i++)if(val[i])vc++;
+      document.getElementById('f3stat').innerHTML=
+        'PATH lamps lit: <b>'+pc+' / '+PATHN+'</b> &nbsp;·&nbsp; VALUE lamps lit: <b>'+vc+' / '+VALN+'</b>';
+    }
+    document.getElementById('f3run').onclick=run;
+    document.getElementById('f3reset').onclick=reset;
+    boundedEl.onchange=reset;
+    reg(function(){render();stat();});
+  })();
+
+  /* =================== FIG 4 =================== */
+  (function(){
+    var aCv=document.getElementById('f4a'), bCv=document.getElementById('f4b');
+    if(!aCv)return;
+    var TARGET=0xCAFE, PC=0x51e2, GC=16, GR=3, GN=GC*GR;
+    var aGuesses=0, aFeat=0, aSeen={}, aState=[], aOpen=false, aRng=0x1234;
+    var bSteps=0, bFeat=0, bOpen=false, bState=[];
+    function lcg(){aRng=(Math.imul(aRng,1103515245)+12345)&0x7fffffff;return aRng;}
+    function bucket(pc,v){var x=(pc^v)>>>0;x=Math.imul(x^(x>>>15),0x9E3779B1)>>>0;x^=x>>>13;return x%GN;}
+    function renderA(){var f=fit(aCv),p=pal(),st=[];
+      for(var k=0;k<GN;k++)st[k]={on:!!aState[k],color:p.reward};
+      drawGrid(f.ctx,f.w,f.h,GC,GR,st,p.reward);}
+    function renderB(){var f=fit(bCv),p=pal(),st=[];
+      for(var k=0;k<GN;k++)st[k]={on:!!bState[k],color:p.cyan,flash:bOpen&&k===0};
+      drawGrid(f.ctx,f.w,f.h,GC,GR,st,p.cyan);}
+    document.getElementById('f4aBtn').onclick=function(){
+      if(aOpen)return;
+      for(var i=0;i<8;i++){
+        aGuesses++;
+        var g=lcg()&0xffff, vb=bucket(PC,g);
+        if(!aSeen[vb]){aSeen[vb]=1;aFeat++;aState[vb]=1;}
+        if(g===TARGET){aOpen=true;break;}
+      }
+      document.getElementById('f4aStat').innerHTML='guesses: <b>'+aGuesses+'</b> · noise features: <b>'+aFeat+'</b>';
+      var lk=document.getElementById('f4aLock');
+      lk.textContent=aOpen?'🔓 OPEN':'🔒 CLOSED';lk.style.color=aOpen?'var(--cyan)':'var(--muted)';
+      renderA();
+    };
+    document.getElementById('f4bBtn').onclick=function(){
+      if(bOpen)return;
+      bSteps++; bOpen=true; bState[0]=1; bFeat=1;    // read the compared constant, copy it in → match
+      document.getElementById('f4bStat').innerHTML='steps: <b>'+bSteps+'</b> · features: <b>'+bFeat+'</b>';
+      var lk=document.getElementById('f4bLock');
+      lk.textContent='🔓 OPEN';lk.style.color='var(--cyan)';
+      renderB();
+    };
+    reg(function(){renderA();renderB();});
+  })();
+
+})();
+</script>

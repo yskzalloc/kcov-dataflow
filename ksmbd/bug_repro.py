@@ -500,8 +500,42 @@ def test_write_speed():
     xact(s, hdr + struct.pack("<HH", 24, 0) + fid)
     s.close()
 
+def replay_finding(path):
+    """Replay a single dataflow-oracle finding JSON standalone: authenticate to
+    its share via libksmbdzzer.so (same NTLMv2 path the fuzzer uses) and resend
+    the recorded CREATE PDU. Exit 0 if ksmbd accepts it (bug reproduces)."""
+    import ctypes, json
+    from pathlib import Path
+    d = json.loads(Path(path).read_text())
+    SCRIPT_DIR = Path(__file__).resolve().parent
+    lib = ctypes.CDLL(str(SCRIPT_DIR / 'libksmbdzzer.so'))
+    lib.ksmbdzzer_init.argtypes = [ctypes.c_ulong]
+    lib.ksmbdzzer_probe_init_share.argtypes = [ctypes.c_char_p]
+    lib.ksmbdzzer_probe_send.argtypes = [ctypes.c_uint16, ctypes.c_char_p,
+                                         ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+    lib.ksmbdzzer_probe_send.restype = ctypes.c_int
+    lib.ksmbdzzer_init(1)  # sets target 127.0.0.1 (return ignored; probe is independent)
+    share = d.get('share', 'privtest').encode()
+    if lib.ksmbdzzer_probe_init_share(share) != 0:
+        print(f"[repro] auth to [{share.decode()}] failed — cannot replay"); return 2
+    body = bytes.fromhex(d['create_pdu_hex'])
+    resp = ctypes.create_string_buffer(8192)
+    r = lib.ksmbdzzer_probe_send(0x0005, body, len(body), resp, 8192)
+    status = int.from_bytes(resp.raw[8:12], 'little') if r >= 12 else 0xFFFFFFFF
+    print(f"[repro] {d['kind']} ({d.get('spec','')})  sent={d['sent']}")
+    accepted = status == 0
+    print(f"[repro] replayed CREATE -> NTSTATUS=0x{status:08x} -- "
+          f"{'ACCEPTED: bug REPRODUCES' if accepted else 'rejected: NOT reproduced'}")
+    return 0 if accepted else 1
+
+
 if __name__ == '__main__':
-    print("=== ksmbdzzer Bug Reproducer ===\n")
+    import sys
+    json_args = [a for a in sys.argv[1:] if a.endswith('.json')]
+    if json_args:
+        sys.exit(replay_finding(json_args[0]))
+    print("=== ksmbdzzer Bug Reproducer ===")
+    print("(pass a findings/*.json to replay a dataflow-oracle finding)\n")
     test_replay_protection()
     print()
     test_session_binding()

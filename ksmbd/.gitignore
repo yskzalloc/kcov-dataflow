@@ -1,1 +1,7 @@
 __pycache__
+*.so
+*.o
+
+# compiled grain harnesses (persistent compile cache, host-mount)
+grain/.grains/
+.fuzzdb/
