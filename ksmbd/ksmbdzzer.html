@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>ksmbdzzer Architecture</title>
+<style>
+body { font-family: -apple-system, sans-serif; margin: 2rem; background: #1a1a2e; color: #e0e0e0; }
+h1 { color: #76ff03; }
+h2 { color: #40c4ff; margin-top: 2rem; }
+canvas { border: 1px solid #333; border-radius: 8px; display: block; margin: 1rem 0; }
+.info { background: #16213e; padding: 1rem; border-radius: 6px; margin: 1rem 0; font-size: 0.9rem; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+th, td { border: 1px solid #333; padding: 0.5rem; text-align: left; font-size: 0.85rem; }
+th { background: #16213e; color: #76ff03; }
+.finding { background: #1b3a1b; border-left: 4px solid #76ff03; padding: 1rem; margin: 1rem 0; }
+</style>
+</head>
+<body>
+<h1>ksmbdzzer — KSMBD Write-Side LPE Fuzzer</h1>
+<p>trace-args/ret (kcov_dataflow) + libFuzzer + privilege bypass detection</p>
+
+<h2>Architecture</h2>
+<canvas id="arch" width="900" height="500"></canvas>
+<script>
+const c = document.getElementById('arch').getContext('2d');
+
+// Background
+c.fillStyle = '#0f0f1a';
+c.fillRect(0, 0, 900, 500);
+
+// Phase boxes
+function box(x, y, w, h, color, label, sublabel) {
+    c.fillStyle = color + '20';
+    c.strokeStyle = color;
+    c.lineWidth = 2;
+    c.beginPath(); c.roundRect(x, y, w, h, 8); c.fill(); c.stroke();
+    c.fillStyle = color;
+    c.font = 'bold 13px monospace';
+    c.fillText(label, x + 10, y + 20);
+    if (sublabel) { c.font = '11px sans-serif'; c.fillStyle = '#aaa'; c.fillText(sublabel, x + 10, y + 38); }
+}
+
+function arrow(x1, y1, x2, y2, color) {
+    c.strokeStyle = color || '#666';
+    c.lineWidth = 2;
+    c.beginPath(); c.moveTo(x1, y1); c.lineTo(x2, y2); c.stroke();
+    // arrowhead
+    const a = Math.atan2(y2-y1, x2-x1);
+    c.beginPath(); c.moveTo(x2, y2);
+    c.lineTo(x2 - 10*Math.cos(a-0.4), y2 - 10*Math.sin(a-0.4));
+    c.lineTo(x2 - 10*Math.cos(a+0.4), y2 - 10*Math.sin(a+0.4));
+    c.closePath(); c.fill();
+}
+
+// Python orchestrator
+box(20, 20, 250, 120, '#ffab00', 'Phase 1-5: Python', '11 VFS ops, 5000 iters/round');
+c.font = '10px monospace'; c.fillStyle = '#ccc';
+c.fillText('• kcov_df_remote_enable/disable', 30, 80);
+c.fillText('• ret=0 → 2× rank (bypass signal)', 30, 95);
+c.fillText('• builds value_pool + corpus', 30, 110);
+
+// Snipers
+box(320, 20, 280, 120, '#76ff03', 'Phase 6: libFuzzer Snipers (C)', '15 harnesses, raw TCP');
+c.font = '10px monospace'; c.fillStyle = '#ccc';
+c.fillText('• __libfuzzer_extra_counters', 330, 80);
+c.fillText('• ret=0 → ctr += 3 (weight signal)', 330, 95);
+c.fillText('• persistent corpus across rounds', 330, 110);
+
+// kcov_dataflow kernel
+box(650, 20, 230, 120, '#ff5252', 'Kernel: kcov_dataflow', 'per-task ring buffer');
+c.font = '10px monospace'; c.fillStyle = '#ccc';
+c.fillText('• trace-args: fn(arg1, arg2...)', 660, 80);
+c.fillText('• trace-ret: fn() → retval', 660, 95);
+c.fillText('• KSMBD worker thread capture', 660, 110);
+
+// Arrows
+arrow(270, 80, 320, 80, '#ffab00');  // Python → Snipers
+arrow(600, 80, 650, 80, '#76ff03');  // Snipers → Kernel
+arrow(780, 140, 780, 180, '#ff5252'); // Kernel → KSMBD
+
+// KSMBD
+box(650, 180, 230, 100, '#e040fb', 'KSMBD (fs/smb/server/)', 'smb2_write, smb2_lock, smb2_set_info');
+c.font = '10px monospace'; c.fillStyle = '#ccc';
+c.fillText('• ksmbd_vfs_write()', 660, 230);
+c.fillText('• smb_check_perm_dacl()', 660, 245);
+c.fillText('• KASAN detects OOB/UAF', 660, 260);
+
+// Feedback loop
+arrow(650, 240, 450, 240, '#40c4ff');
+c.fillStyle = '#40c4ff'; c.font = '10px monospace';
+c.fillText('trace-args/ret records', 490, 235);
+
+// Live dict
+box(320, 180, 280, 60, '#40c4ff', 'Live Dictionary', 'value_pool → sniper dict per-round');
+
+// Priv bypass
+box(20, 180, 250, 80, '#ff9100', 'Privilege Bypass Detection', 'sniper_priv_bypass on [privtest]');
+c.font = '10px monospace'; c.fillStyle = '#ccc';
+c.fillText('• READ-only → LOCK/DELETE_ON_CLOSE', 30, 225);
+c.fillText('• ret=0 → 10× weight (BYPASS!)', 30, 240);
+
+// Sharp
+box(20, 300, 250, 80, '#7c4dff', 'Phase 7: Sharp Analysis', 'binary search + anomaly + trust');
+c.font = '10px monospace'; c.fillStyle = '#ccc';
+c.fillText('• boundary: exact ret 0→error', 30, 340);
+c.fillText('• anomaly: ret=0 for arg > 2× max', 30, 355);
+
+// Result
+box(320, 300, 280, 80, '#00e676', 'Output', '');
+c.font = '10px monospace'; c.fillStyle = '#ccc';
+c.fillText('• /tmp/ksmbdzzer_crashes/ (reproducers)', 330, 335);
+c.fillText('• /tmp/ksmbdzzer_report.csv (histogram)', 330, 350);
+c.fillText('• find.md (confirmed findings)', 330, 365);
+
+// Key insight box
+box(20, 420, 860, 60, '#ffab00', 'KEY: trace-args/ret → libFuzzer feedback', '');
+c.font = '12px monospace'; c.fillStyle = '#fff';
+c.fillText('smb2_write(offset=0xFFF0) → ret=0  ⇒  ctr[hash(PC,0xFFF0)] += 3  ⇒  libFuzzer explores more near 0xFFF0', 30, 460);
+</script>
+
+<h2>Findings</h2>
+<div class="finding">
+<strong>Finding 1:</strong> Exclusive lock without WRITE access (MS-SMB2 3.3.5.14)<br>
+<strong>Finding 2:</strong> DELETE_ON_CLOSE without DELETE access (MS-SMB2 3.3.5.9) — unauthorized file deletion
+</div>
+
+<h2>Usage</h2>
+<div class="info">
+<code>python3 ksmbdzzer.py fuzz -t 5h -procs 2 -target write -sniper-time 60</code><br><br>
+<b>-t 5h</b>: total runtime (graceful shutdown)<br>
+<b>-sniper-time 60</b>: seconds per sniper per round (higher = deeper corpus, increase as budget allows)<br>
+<b>-target write</b>: raw_write + dacl + compound + mt_race + read_after_write
+</div>
+
+<h2>Snipers</h2>
+<table>
+<tr><th>Sniper</th><th>Coverage</th><th>Target</th><th>Bypass Signal</th></tr>
+<tr><td>priv_bypass</td><td>21 cov</td><td>[privtest] with NTLMv2</td><td>ret=0 on denied op → 10× weight</td></tr>
+<tr><td>mt_race</td><td>29 cov</td><td>WRITE+CLOSE (shared fid)</td><td>ret=0 during race = UAF</td></tr>
+<tr><td>raw_write</td><td>18 cov</td><td>streams + negative offsets</td><td>ret=0 = write accepted</td></tr>
+<tr><td>dh_trust</td><td>30 ft</td><td>DH2C forged reconnect</td><td>ret=0 = trust bypass</td></tr>
+<tr><td>compound</td><td>20 cov</td><td>WRITE+TRUNCATE+CLOSE</td><td>AllocationSize overflow</td></tr>
+</table>
+</body>
+</html>

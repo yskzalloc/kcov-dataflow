@@ -95,6 +95,7 @@ cmake -S llvm -B build -G Ninja \
   -DCMAKE_CXX_COMPILER=clang++ \
   -DLLVM_ENABLE_LLD=ON \
   -DLLVM_ENABLE_PROJECTS="clang;lld" \
+  -DLLVM_ENABLE_RUNTIMES="compiler-rt" \
   -DLLVM_TARGETS_TO_BUILD="X86;AArch64"
 ninja -C build
 cd ..
