@@ -98,6 +98,20 @@ static inline const char *pfz_dts(void)
 static pthread_mutex_t g_smbc_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_smb_fd = -1;
 static int g_smb_fd2 = -1;
+static SMBCCTX *g_smbctx = NULL;   /* so pool init can raise the op timeout during connect */
+/* Switchable auth policy (KSMBDZZER_EVERYTIME_AUTH, set by `gfuzz --everytime-auth`):
+ *   0 (default) = LAZY pool: only pool-based grains authenticate the pool (session reuse),
+ *                 so the non-pool majority does NOT flood ksmbd.mountd with per-grain NTLMv2.
+ *   1           = EVERY-TIME: the original behaviour — every grain does a fresh pool NTLMv2
+ *                 handshake up front (heavier mountd load; kept for A/B and stress testing). */
+static int g_everytime_auth = -1;
+static int everytime_auth(void) {
+    if (g_everytime_auth < 0) {
+        const char *e = getenv("KSMBDZZER_EVERYTIME_AUTH");
+        g_everytime_auth = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return g_everytime_auth;
+}
 static int g_df_fd = -1;
 static uint64_t *g_df_buf = NULL;
 static int g_raw_sock = -1;
@@ -117,6 +131,8 @@ static char g_target_ip[16] = "127.0.0.1"; /* server address this worker dials *
  * with value buckets); reported at exit as KERNEL_PCS=N, parsed by gen.py. */
 static int g_eng_blind = -1;               /* -1 = unresolved; 1 = pc-only coverage */
 static int g_eng_i2s   = 1;                /* 1 = i2s-directed mutation, 0 = pure havoc */
+static int g_eng_vec   = 0;                /* 1 = dataflow-vec: whole-arg vector fold + value-class normalize */
+static int g_eng_rel   = 0;                /* 1 = dataflow-rel: dataflow-vec + within-record pairwise cmp3 */
 #define PFZ_PC_BITS (1u << 17)
 static uint8_t g_pc_bitmap[PFZ_PC_BITS / 8];
 static void pfz_pc_mark(uint64_t pc) {
@@ -131,6 +147,31 @@ static void pfz_engine_init(void) {
      * i2s is ON for dataflow + pc-i2s, OFF only for pc-havoc (the pure-havoc control). */
     g_eng_blind = (e && (!strcmp(e, "pc-i2s") || !strcmp(e, "pc-havoc"))) ? 1 : 0;
     g_eng_i2s   = (e && !strcmp(e, "pc-havoc")) ? 0 : 1;
+    /* dataflow-vec = value-fold (blind=0) + i2s on, but the fold uses the WHOLE arg
+     * vector, each field value-class-normalized (see pfz_valclass). Baseline dataflow
+     * keeps its arg0-raw fold so the two arms are a clean A/B. dataflow-rel adds the
+     * within-record pairwise cmp3 (offset<len? boundary bits) ON TOP of dataflow-vec,
+     * folded into the SAME feature (no extra features) so its A/B vs dataflow-vec
+     * isolates the marginal payoff of relational structure over magnitude buckets. */
+    g_eng_rel   = (e && !strcmp(e, "dataflow-rel")) ? 1 : 0;
+    g_eng_vec   = (e && (!strcmp(e, "dataflow-vec") || g_eng_rel)) ? 1 : 0;
+}
+
+/* pfz_valclass — normalize a traced value before folding it as coverage.
+ * Raw arg/return values pollute pc^val two ways: (1) kernel POINTERS are effectively
+ * random per allocation → every address mints a bogus "new coverage" feature (map noise,
+ * corpus blowup, non-reproducible); (2) adjacent scalars (len=1000 vs 1001) each mint a
+ * distinct feature though they drive identical behavior. Collapse pointers to a small
+ * class token (keeping only NULL-ness + a few alignment bits — the part that gates
+ * branches) and quantize scalars to a log2 magnitude bucket so only ORDER-OF-MAGNITUDE
+ * and boundary crossings survive. Deterministic + bounded, so it de-noises the signal
+ * regardless of VM determinism. */
+static inline uint64_t pfz_valclass(uint64_t v) {
+    if (v == 0) return 0;                                 /* NULL / zero */
+    if (v >= 0xffff000000000000ULL)                       /* kernel pointer (matches the */
+        return 0x1000ULL | (v & 0x38ULL);                 /*   ret_dict/i2s ptr threshold) */
+    if (v >  0x00007fffffffffffULL) return 0x2000ULL;     /* other high / non-canonical */
+    return (uint64_t)(63u - __builtin_clzll(v));          /* scalar → 1..63 magnitude bucket */
 }
 
 /* ─── Reverse-flow RedQueen dictionary + i2s proof counters (fleet-wide) ────────
@@ -147,6 +188,14 @@ static uint32_t g_retdict_n;
 static uint8_t  g_retdict_seen[8192];
 static unsigned long g_ret_hits;
 static unsigned long g_cmp_hits;
+/* Record-type census (0xC/0xE/0xF seen in df_buf), tallied as pfz_get_features()
+ * walks each exec's records. This is the DECISIVE i2s diagnostic: it separates
+ * "kernel never delivered a 0xC comparison record" (g_cmp_recs==0 → the trace-cmp
+ * → dataflow path is dead: static key / remote context / not instrumented) from
+ * "records arrive but the operand never appears literally in the input, so the
+ * RedQueen splice can't fire" (g_cmp_recs>0 but g_cmp_hits==0 → userspace match).
+ * Counted independent of the splice so the two failure modes are distinguishable. */
+static unsigned long g_cmp_recs, g_ent_recs, g_ret_recs;
 static inline void ret_dict_add(uint64_t v) {
     if (v <= 1 || v >= 0xffff000000000000ULL) return;      /* skip trivial + kernel ptrs */
     uint32_t idx = (uint32_t)((v * 0x9E3779B97F4A7C15ULL) >> 48);
@@ -155,14 +204,77 @@ static inline void ret_dict_add(uint64_t v) {
     g_retdict[g_retdict_n % PFZ_RETDICT_N] = v;
     if (g_retdict_n < 0xffffffffu) g_retdict_n++;
 }
+
+/* Persistent trace_cmp OPERAND ring — the cmp-side twin of g_retdict, and the fix
+ * for the DF_CMP_RECS>>0 yet CMP_I2S_HITS≈0 puzzle. pfz_mutate_i2s() used to read
+ * cmp operands LIVE from g_df_buf, but the libFuzzer custom mutator runs when df_buf
+ * reflects whatever input libFuzzer last executed — frequently one carrying no 0xC
+ * record — so the whole 32k-record/grain the kernel delivers was invisible at splice
+ * time and only stray in-place matches (≤2 fleet-wide) ever landed. Harvesting every
+ * 0xC operand into this ring INSIDE pfz_get_features (where the records are provably
+ * present) decouples the operand supply from df_buf's mutate-time state, exactly as
+ * ret_dict_add already does for 0xF return tokens. */
+#define PFZ_CMPDICT_N 512
+static uint64_t g_cmpdict[PFZ_CMPDICT_N];
+static uint32_t g_cmpdict_n;
+static uint8_t  g_cmpdict_seen[8192];
+static inline void cmp_dict_add(uint64_t v) {
+    if (v <= 1 || v >= 0xffff000000000000ULL) return;      /* skip trivial + kernel ptrs */
+    uint32_t idx = (uint32_t)((v * 0x9E3779B97F4A7C15ULL) >> 48);
+    if (g_cmpdict_seen[idx >> 3] & (uint8_t)(1u << (idx & 7))) return;
+    g_cmpdict_seen[idx >> 3] |= (uint8_t)(1u << (idx & 7));
+    g_cmpdict[g_cmpdict_n % PFZ_CMPDICT_N] = v;
+    if (g_cmpdict_n < 0xffffffffu) g_cmpdict_n++;
+}
+
+/* One-shot cmp-operand sampler (task-2 diagnostic): classify an operand the way
+ * cmp_dict_add's filter does, so a CMP_SAMPLE dump shows whether real ksmbd cmp
+ * operands are usable (OK) or all get filtered (PTR/TRIV → ring starves). */
+#define PFZ_CMPSAMP 16
+static unsigned g_cmpsamp_n;
+static inline const char *pfz_valtag(uint64_t v) {
+    if (v >= 0xffff000000000000ULL) return "PTR";
+    if (v <= 1) return "TRIV";
+    return "OK";
+}
 static void pfz_report_metrics(void) {
     unsigned c = 0;
     for (unsigned i = 0; i < sizeof(g_pc_bitmap); i++)
         c += (unsigned)__builtin_popcount(g_pc_bitmap[i]);
     /* fleet-wide, parsed by gen.py / engine_compare_campagin.sh table */
-    pfz_err("KERNEL_PCS=%u RET_TOKEN_HITS=%lu CMP_I2S_HITS=%lu RET_DICT=%u\n",
+    /* CMP_DICT/RET_DICT = live size of the persistent operand rings. These are the
+     * decisive i2s diagnostic split from CMP_I2S_HITS: CMP_DICT==0 with DF_CMP_RECS>0
+     * ⇒ every delivered cmp operand was filtered out (trivial/kernel-pointer) → the
+     * ring is starved (structural, not a splice bug); CMP_DICT>0 with CMP_I2S_HITS==0
+     * ⇒ operands are ringed but injection/gate never fires (a mutator bug). */
+    pfz_err("KERNEL_PCS=%u RET_TOKEN_HITS=%lu CMP_I2S_HITS=%lu RET_DICT=%u CMP_DICT=%u "
+            "DF_CMP_RECS=%lu DF_ENT_RECS=%lu DF_RET_RECS=%lu\n",
             c, g_ret_hits, g_cmp_hits,
-            g_retdict_n < PFZ_RETDICT_N ? g_retdict_n : PFZ_RETDICT_N);
+            g_retdict_n < PFZ_RETDICT_N ? g_retdict_n : PFZ_RETDICT_N,
+            g_cmpdict_n < PFZ_CMPDICT_N ? g_cmpdict_n : PFZ_CMPDICT_N,
+            g_cmp_recs, g_ent_recs, g_ret_recs);
+    fflush(stderr);   /* survive the saturation SIGKILL (pipe = block-buffered) */
+
+    /* Fleet-UNION support: KERNEL_PCS above is this grain's own popcount, which gen.py
+     * SUMS across the fleet — a throughput-biased over-count that lets the cheapest-per-
+     * exec engine win. Dump the raw PC bitmap so gen.py can OR every grain's bitmap into
+     * a deduplicated fleet union (identical 2^17-bit layout + hash as common.h pc_bitmap,
+     * so lib and raw grains OR coherently). Only when the popcount GREW since the last
+     * dump — a saturated/misaligned grain stops discovering PCs, so its dumps stop too,
+     * bounding churn to O(distinct-PC increases) instead of one 16 KiB write per emit. */
+    const char *bmp = getenv("GRAIN_PCBMP");
+    if (bmp) {
+        static unsigned last_dumped;
+        if (c > last_dumped) {
+            int fd = open(bmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (fd >= 0) {
+                ssize_t w = write(fd, g_pc_bitmap, sizeof(g_pc_bitmap));
+                (void)w;
+                close(fd);
+            }
+            last_dumped = c;
+        }
+    }
 }
 
 /* ─── Auth callback ─────────────────────────────────────────────────────── */
@@ -188,6 +300,15 @@ static void auth_fn(const char *srv, const char *shr,
  */
 int pfz_init(unsigned long worker_octet)
 {
+    /* LINE-BUFFER stderr. gen.py runs the grain with stderr = a PIPE, so libc
+     * switches stderr to FULL (block) buffering; our periodic KERNEL_PCS/CMP_I2S_HITS
+     * emits then sit in the 4 KB buffer, and when gen.py SIGKILLs the grain on
+     * saturation the buffered lines are LOST — so the campaign only ever saw the
+     * early (near-zero) emit and the whole i2s/RedQueen signal looked dead even
+     * though it was firing. Line-buffering flushes each emit immediately, so the
+     * metric survives the kill. (A clean-exit standalone run flushed via atexit and
+     * DID show CMP_I2S_HITS>0 — this is why only the piped/killed path lost it.) */
+    setvbuf(stderr, NULL, _IOLBF, 0);
     g_worker_octet = (worker_octet >= 1 && worker_octet <= 254)
                      ? (int)worker_octet : 1;
     snprintf(g_target_ip, sizeof(g_target_ip), "127.0.0.%d", g_worker_octet);
@@ -237,20 +358,58 @@ int pfz_init(unsigned long worker_octet)
      * block indefinitely — an grain stuck in an uninterruptible read can't even
      * be reaped by the harness SIGKILL. This is the smbc analogue of the raw-socket
      * SO_RCVTIMEO and closes the last "grain blocks forever on a bad server" hole. */
+    /* INIT-AWARE timeout: a GENEROUS 5s for the initial connect+auth+create (which
+     * legitimately takes >1s under N-way load — a flat 1s here made MORE grains fail
+     * init and 0-exec), then drop to 1s for the fuzzing ops below so a slow op fails
+     * fast and the grain cycles ~5x more (enough execs for the RedQueen to ramp). */
     smbc_setTimeout(smbctx, 5000);
     smbc_set_context(smbctx);
+    g_smbctx = smbctx;
     snprintf(url, sizeof(url), "smb://%s/share/fuzz_target", g_target_ip);
-    g_smb_fd = smbc_open(url, O_RDWR | O_CREAT, 0666);
-    if (g_smb_fd < 0) return -1;
+    /* Retry the initial connect+auth+create. A SINGLE transient failure under N-way
+     * concurrency — auth/tree-connect/create racing a busy ksmbd, or the 5s op-timeout
+     * firing on an overloaded server — otherwise _exit(1)s the grain with "0 executions",
+     * the leading cause of the fleet's 0-exec storm (which in turn overloads ksmbd and
+     * slows the survivors). Raw grains already retry via smb_setup(); lib grains did not.
+     * On failure, purge libsmbclient's cached (dead) server entry so the next open really
+     * reconnects instead of reusing the broken handle. */
+    g_smb_fd = -1;
+    for (int _t = 0; _t < 3 && g_smb_fd < 0; _t++) {
+        g_smb_fd = smbc_open(url, O_RDWR | O_CREAT, 0666);
+        if (g_smb_fd < 0) {
+            smbc_getFunctionPurgeCachedServers(smbctx)(smbctx);
+            usleep(80000 * (_t + 1));            /* 80ms, 160ms, 240ms … backoff */
+        }
+    }
+    if (g_smb_fd < 0) {
+        /* CONNECTION-LAYER death diagnostic for the LIB (libsmbclient) fleet — the
+         * counterpart to common.h smb_setup's GRAIN_SETUP_FAIL. smbc_open bundles
+         * connect+negotiate+auth+tree-connect+create, so errno is the best localizer:
+         * ECONNREFUSED/ECONNRESET/ETIMEDOUT ⇒ transport/accept (conn reset under load),
+         * EACCES/EPERM ⇒ auth/mountd, ENOENT ⇒ share/path. Names the 40% 0-exec deaths. */
+        pfz_err("GRAIN_SETUP_FAIL step=SMBC_OPEN errno=%d(%s) ip=%s url=%s\n",
+                errno, errno ? strerror(errno) : "none", g_target_ip, url);
+        return -1;
+    }
     snprintf(url, sizeof(url), "smb://%s/share/fuzz_race", g_target_ip);
     g_smb_fd2 = smbc_open(url, O_RDWR | O_CREAT, 0666);
+    /* THROUGHPUT: init done → drop the per-op cap to 500ms so a stalled fuzzing op
+     * (ksmbd overloaded under the wave) fails ~2x faster and the grain cycles more
+     * execs — the network-bound lib grains were stuck at 2-7 execs/window, starving
+     * the RedQueen. On loopback a live op returns sub-ms, so 500ms only ever bites a
+     * genuinely-overloaded server, where aborting-and-retrying beats blocking. Init
+     * keeps 5s (above) so first connect+auth+create still succeeds under load. */
+    smbc_setTimeout(smbctx, 500);
 
     /* 3. Raw TCP (for PDU injection) — same IP so it routes to our buffer */
     struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(445) };
     addr.sin_addr.s_addr = inet_addr(g_target_ip);
     g_raw_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (g_raw_sock >= 0) {
-        struct timeval tv = {.tv_sec = 2};
+        /* THROUGHPUT: 1s→500ms fuzzing-op recv cap — fail a stalled raw op ~2x faster
+         * so the grain cycles more (loopback live latency is sub-ms; 500ms only bites
+         * an overloaded ksmbd). Matches the smbc 500ms cap above. */
+        struct timeval tv = {.tv_sec = 0, .tv_usec = 500000};
         setsockopt(g_raw_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         connect(g_raw_sock, (struct sockaddr *)&addr, sizeof(addr));
     }
@@ -462,6 +621,35 @@ int pfz_get_features(uint32_t *out, int max)
         uint64_t rlen = 3 + nfields;
         if (pos + rlen > 1 + n) break;
 
+        /* Per-type census (before the kernel-PC filter) — see g_cmp_recs decl. */
+        if      (rtype == 0xC) {
+            g_cmp_recs++;
+            /* Harvest this record's operands into the persistent cmp ring so
+             * pfz_mutate_i2s() can inject them even when df_buf no longer holds
+             * this exec's records at custom-mutator time. Layout mirrors the
+             * mutator: pos+2 = KCOV_CMP ctype, pos+3/pos+4 = operands a1/a2. */
+            if (nfields >= 2) {
+                uint64_t ct = g_df_buf[pos + 2];
+                int cw = 1 << ((ct >> 1) & 3);          /* 1/2/4/8B */
+                uint64_t a1 = g_df_buf[pos + 3], a2 = g_df_buf[pos + 4];
+                if (cw >= 2 && a1 != a2) { cmp_dict_add(a1); cmp_dict_add(a2); }
+                /* One-shot operand sample (first PFZ_CMPSAMP records this process):
+                 * dumps raw operands + a class tag so we can EYEBALL whether real
+                 * ksmbd cmp operands survive cmp_dict_add's trivial/kernel-pointer
+                 * filter — i.e. distinguish "ring starved by filtering" from a
+                 * splice bug. PTR = kernel pointer (filtered), TRIV = <=1 (filtered),
+                 * OK = usable magic value. */
+                if (g_cmpsamp_n < PFZ_CMPSAMP) {
+                    g_cmpsamp_n++;
+                    pfz_err("CMP_SAMPLE w=%d a1=0x%llx[%s] a2=0x%llx[%s]\n", cw,
+                            (unsigned long long)a1, pfz_valtag(a1),
+                            (unsigned long long)a2, pfz_valtag(a2));
+                }
+            }
+        }
+        else if (rtype == 0xE) g_ent_recs++;
+        else if (rtype == 0xF) g_ret_recs++;
+
         if (pc >= 0xffffffff80000000UL) {
             pfz_pc_mark(pc);                    /* KERNEL_PCS metric (distinct PCs reached) */
             if (rtype == 0xF) ret_dict_add(g_df_buf[pos + 3]);   /* reverse-flow harvest */
@@ -473,12 +661,47 @@ int pfz_get_features(uint32_t *out, int max)
                 * - cmp (0xC) always: operands are input-derived, folding them as
                 *   coverage would explode the map — the pair feeds mutate_i2s (i2s). */
                 h ^= pc; h *= 0x100000001b3UL;
-            } else if (rtype == 0xE) { h ^= val; h *= 0x100000001b3UL; }
-            else { h ^= pc; h *= 0x100000001b3UL; h ^= val; h *= 0x100000001b3UL; }
+            } else if (g_eng_vec && rtype == 0xE) {
+                /* dataflow-vec: fold the WHOLE arg vector, callsite-local, each field
+                 * value-class-normalized. One feature per record (same map footprint as
+                 * baseline), but reflecting pc + all nfields args instead of arg0 raw —
+                 * so multi-arg functions contribute, and pointer args stop minting noise. */
+                h ^= pc; h *= 0x100000001b3UL;
+                for (int f = 0; f < nfields; f++) {
+                    uint64_t c = pfz_valclass(g_df_buf[pos + 3 + f]);
+                    h ^= (c ^ (uint64_t)f); h *= 0x100000001b3UL;
+                }
+                if (g_eng_rel) {
+                    /* dataflow-rel: within-record pairwise cmp3 (<,==,>) folded into the
+                     * SAME feature. Buckets alone collapse the OOB gate (offset vs length
+                     * at the same magnitude) to one feature; the ordering bits split it. */
+                    for (int a = 0; a < nfields; a++)
+                        for (int b = a + 1; b < nfields; b++) {
+                            uint64_t x = g_df_buf[pos + 3 + a], y = g_df_buf[pos + 3 + b];
+                            uint64_t r = (x < y) ? 0 : (x == y) ? 1 : 2;
+                            h ^= (r + (uint64_t)(a * 7 + b) * 0x9E37ULL); h *= 0x100000001b3UL;
+                        }
+                }
+            } else if (rtype == 0xE) { h ^= val; h *= 0x100000001b3UL; }   /* baseline: arg0 raw */
+            else { /* 0xF return: pc^val (value-class-normalized in vec arm) */
+                uint64_t rv = g_eng_vec ? pfz_valclass(val) : val;
+                h ^= pc; h *= 0x100000001b3UL; h ^= rv; h *= 0x100000001b3UL;
+            }
             out[count++] = (uint32_t)(h & 0xFFFFFFFF);
         }
         pos += rlen;
     }
+    /* Periodic metric emission: pfz_report_metrics() runs only at atexit, which the
+     * saturation SIGKILL teardown BYPASSES → KERNEL_PCS/RET_TOKEN_HITS/CMP_I2S_HITS were
+     * always 0 in the engine-comparison table. Re-emit the (monotonic) counters on the
+     * first exec and every 64 thereafter, so gen.py's stderr reader captures the
+     * high-water mark no matter how the grain dies (the table takes the max). */
+    static unsigned long _emit_ctr;
+    /* Every 8 execs (was 64): network-bound grains do only tens of execs before the
+     * saturation SIGKILL (which bypasses atexit), so a coarse cadence emitted only the
+     * near-zero exec-1 snapshot and hid the accumulated RET/CMP hit counts. */
+    if (++_emit_ctr == 1 || (_emit_ctr & 7u) == 0)
+        pfz_report_metrics();
     return count;
 }
 
@@ -543,7 +766,27 @@ size_t pfz_mutate_i2s(uint8_t *data, size_t size, size_t maxsize, unsigned seed)
     uint64_t n = g_df_buf[0], pos;
     int hits = 0;
 
-    /* pass 0 — trace_cmp RedQueen: overwrite one observed operand with the other */
+    /* Grow a too-small input up to a small window so the i2s splices below have room to
+     * land. Live LIB-grain inputs are frequently 0-2 bytes (the grain only uses a few
+     * bytes to parameterize a libsmbclient op), so the `size >= w` guards in the injection
+     * and in-place passes skipped EVERY splice and CMP_I2S_HITS stayed 0 fleet-wide despite
+     * a full operand ring (CMP_DICT=512) — the PFZ_SELFTEST passed only because it drives a
+     * 64-byte buffer. Grow (zero-filled, bounded by maxsize) so injection always has room;
+     * libFuzzer keeps the enlarged input only if it improves coverage. */
+    if (size < 16 && maxsize > size) {
+        size_t grow = maxsize < 16 ? maxsize : 16;
+        if (grow > size) { memset(data + size, 0, grow - size); size = grow; }
+    }
+
+    /* pass 0 — trace_cmp RedQueen. IN-PLACE: replace an operand ALREADY present in the
+     * input with the other side (works for raw grains whose `data` IS the wire PDU).
+     * When the operand is NOT in `data` — the whole LIB-grain fleet, where `data` only
+     * parameterizes a libsmbclient op and the operands live in the PDU it builds — the
+     * in-place replace can never fire, so the 40k+ cmp records the kernel delivers were
+     * ENTIRELY wasted (DF_CMP_RECS>0 yet CMP_I2S_HITS=0). So COLLECT the unplaced operands
+     * and INJECT a bounded few below (input-to-state coloring): the magic value enters the
+     * fuzzed bytes and can reach the comparison on the next iteration. */
+    uint64_t cmpv[96]; int ncmpv = 0;
     for (pos = 1; pos + 3 <= 1 + n && pos < DF_BUF_WORDS; ) {
         uint32_t rt = (g_df_buf[pos] >> 28) & 0xF, nf = (g_df_buf[pos] >> 24) & 0xF;
         if (!nf) nf = 1;
@@ -552,6 +795,7 @@ size_t pfz_mutate_i2s(uint8_t *data, size_t size, size_t maxsize, unsigned seed)
             uint64_t ctype = g_df_buf[pos+2], a1 = g_df_buf[pos+3], a2 = g_df_buf[pos+4];
             int w = 1 << ((ctype >> 1) & 3);              /* KCOV_CMP_SIZE: 1/2/4/8B */
             if (w >= 2 && a1 != a2) {
+                int placed = 0;
                 for (int dir = 0; dir < 2; dir++) {
                     uint64_t find = dir ? a2 : a1, put = dir ? a1 : a2;
                     if (find == 0) continue;
@@ -561,13 +805,40 @@ size_t pfz_mutate_i2s(uint8_t *data, size_t size, size_t maxsize, unsigned seed)
                     for (size_t o = 0; o + (size_t)w <= size; o++) {
                         if (memcmp(data+o, needle, w)) continue;
                         for (int i=0;i<w;i++) data[o+i] = repl[i];
-                        hits++; g_cmp_hits++;
+                        hits++; g_cmp_hits++; placed = 1;
                         break;
                     }
+                }
+                if (!placed) {   /* operand absent from input → remember for injection */
+                    if (a1 && ncmpv < 96) cmpv[ncmpv++] = a1;
+                    if (a2 && ncmpv < 96) cmpv[ncmpv++] = a2;
                 }
             }
         }
         pos += 3 + nf;
+    }
+    /* Inject up to 6 unplaced operands (bounded so a structured input is nudged, not
+     * shredded). This is what makes trace_cmp productive for the lib-grain fleet: the
+     * observed comparison values are coloured into the fuzzed bytes so they reach the
+     * PDU fields the grain drives. Each injection is a genuine trace_cmp-operand splice. */
+    uint32_t cdn = g_cmpdict_n < PFZ_CMPDICT_N ? g_cmpdict_n : PFZ_CMPDICT_N;
+    if ((ncmpv || cdn) && size >= 2) {
+        for (int t = 0; t < 6; t++) {
+            /* Alternate between this-exec operands (freshest, when df_buf carried a
+             * 0xC record) and the persistent ring (reliable — accumulates every
+             * operand pfz_get_features ever saw, so injection fires regardless of
+             * df_buf's mutate-time state, which is what unblocks the lib fleet). */
+            uint64_t v;
+            if (ncmpv && (t & 1)) v = cmpv[(seed + (unsigned)t*7u) % (unsigned)ncmpv];
+            else if (cdn)         v = g_cmpdict[(seed + (unsigned)t*13u) % cdn];
+            else if (ncmpv)       v = cmpv[(seed + (unsigned)t*7u) % (unsigned)ncmpv];
+            else                  break;
+            int w = (v >> 32) ? 8 : (v >> 16) ? 4 : 2;
+            if ((size_t)w > size) w = 2;
+            size_t o = (size_t)((seed + (unsigned)t*29u) % (unsigned)(size - (size_t)w + 1));
+            for (int i = 0; i < w; i++) data[o+i] = (uint8_t)((v >> (i*8)) & 0xFF);
+            hits++; g_cmp_hits++;
+        }
     }
 
     /* pass 1 — collect THIS exec's return values (supplement the persistent dict) */
@@ -615,6 +886,78 @@ size_t pfz_mutate_i2s(uint8_t *data, size_t size, size_t maxsize, unsigned seed)
     }
     return hits ? size : 0;      /* 0 ⇒ caller falls back to LLVMFuzzerMutate (havoc) */
 }
+
+#ifdef PFZ_SELFTEST
+/* Host-side micro-test of the i2s engine — NO VM, NO ksmbd. Builds a synthetic
+ * df_buf with known 0xC/0xE/0xF records and drives pfz_mutate_i2s directly, so the
+ * RedQueen/injection logic can be iterated in milliseconds. Build:
+ *   cc -DPFZ_SELFTEST -O2 -I/usr/include/samba-4.0 -I. libksmbdzzer.c -o /tmp/st \
+ *      -lsmbclient -lpthread -lrdmacm -libverbs -lcrypto
+ */
+static void _st_put_cmp(uint64_t *b, size_t *pp, int szlog, uint64_t a1, uint64_t a2) {
+    size_t p = *pp;
+    b[p+0] = 0xC0000000ULL | ((uint64_t)2 << 24) | (uint64_t)(p & 0xFFFFFF);
+    b[p+1] = 0xffffffff81000000ULL + p;      /* fake kernel ip */
+    b[p+2] = (uint64_t)(szlog << 1);          /* KCOV_CMP_SIZE(szlog): 0/1/2/3 = 1/2/4/8B */
+    b[p+3] = a1; b[p+4] = a2;
+    *pp = p + 5;
+}
+int main(void) {
+    g_df_buf = (uint64_t *)calloc(1u << 16, 8);
+    size_t p = 1;
+    /* A mix of comparison widths; operands deliberately ABSENT from the all-'A' input,
+     * so ONLY the injection path (not in-place replace) can produce a hit. */
+    _st_put_cmp(g_df_buf, &p, 3, 0xAABBCCDD11223344ULL, 0x1122334455667788ULL); /* 8B */
+    _st_put_cmp(g_df_buf, &p, 2, 0x0000000000000021ULL, 0x00000000DEADBEEFULL); /* 4B, StructureSize-like */
+    _st_put_cmp(g_df_buf, &p, 1, 0x0000000000000041ULL, 0x0000000000007000ULL); /* 2B */
+    _st_put_cmp(g_df_buf, &p, 0, 0x0000000000000005ULL, 0x00000000000000FFULL); /* 1B (w<2, skipped) */
+    g_df_buf[0] = p - 1;
+
+    const char *eng = getenv("KSMBDZZER_ENGINE"); if (!eng) eng = "dataflow";
+    g_eng_blind = -1; g_eng_i2s = -1; pfz_engine_init();
+
+    uint8_t data[64];
+    unsigned long hits0 = g_cmp_hits;
+    for (unsigned s = 0; s < 300; s++) {   /* many seeds → 1/3 pass the seed%3 gate */
+        memset(data, 'A', sizeof data);
+        pfz_mutate_i2s(data, sizeof data, 512, s);
+    }
+    fprintf(stderr, "SELFTEST engine=%s: ", eng);
+    pfz_report_metrics();
+    fprintf(stderr, "SELFTEST phase1 (live df_buf) delta g_cmp_hits=%lu (expect >0 for dataflow/pc-i2s, 0 for pc-havoc)\n",
+            g_cmp_hits - hits0);
+
+    /* Phase 2 — the persistent-ring path (task-3 fix). Reproduce the LIVE failure:
+     * harvest the operands via pfz_get_features (as an exec would), then WIPE df_buf
+     * so the mutator's live scan finds NOTHING — exactly the custom-mutator timing
+     * that made CMP_I2S_HITS≈0 despite 32k delivered records. Injection must still
+     * fire, sourced purely from g_cmpdict. */
+    uint32_t feats[4096];
+    pfz_get_features(feats, 4096);          /* populates g_cmpdict from the records above */
+    g_df_buf[0] = 0;                         /* df_buf now empty at "mutate time" */
+    unsigned long hits1 = g_cmp_hits;
+    for (unsigned s = 0; s < 300; s++) {
+        memset(data, 'A', sizeof data);
+        pfz_mutate_i2s(data, sizeof data, 512, s);
+    }
+    fprintf(stderr, "SELFTEST phase2 (empty df_buf, ring=%u) delta g_cmp_hits=%lu "
+            "(expect >0 for dataflow/pc-i2s — proves ring decouples from df_buf timing)\n",
+            g_cmpdict_n, g_cmp_hits - hits1);
+
+    /* Phase 3 — TINY input (the live LIB-grain case). Before the grow-fix a size<2 input
+     * skipped every splice (size>=w guards false) → the live CMP_I2S_HITS=0 despite the
+     * ring being full; now the mutator must grow the input and inject from g_cmpdict. */
+    unsigned long hits2 = g_cmp_hits;
+    for (unsigned s = 0; s < 300; s++) {
+        uint8_t tiny[512]; tiny[0] = 'A';
+        pfz_mutate_i2s(tiny, 1, sizeof tiny, s);
+    }
+    fprintf(stderr, "SELFTEST phase3 (tiny size=1 input, ring=%u) delta g_cmp_hits=%lu "
+            "(expect >0 AFTER the grow-fix; was 0 — the live CMP_I2S_HITS=0 cause)\n",
+            g_cmpdict_n, g_cmp_hits - hits2);
+    return 0;
+}
+#endif
 
 
 /* ─── Full dataflow record export (I2S mutator + contract oracle) ──────────── */
@@ -796,6 +1139,35 @@ int pfz_reconnect(void)
     return pfz_init((unsigned long)g_worker_octet);
 }
 
+/**
+ * pfz_reopen_smb_fd - Re-establish ONLY the libsmbclient scratch fd (g_smb_fd).
+ *
+ * The counterpart to pfz_pool_init() for the raw g_pool[]: the shared-process
+ * selftest runs all grains in one process, so a grain that disrupts the
+ * libsmbclient session leaves g_smb_fd closed or stale, and every LATER lib
+ * grain (rmxattr / setxattr / …) then bails with ret<0 and 0 coverage. Closing
+ * and reopening just this one handle heals that WITHOUT a full pfz_reconnect()
+ * (which would tear down and re-mmap the private kcov handle). In a real gfuzz
+ * run each grain is its own process, so this contamination can't occur — this
+ * exists purely to give the selftest an accurate per-grain verdict.
+ * Returns 0 if a usable fd exists afterward, -1 otherwise.
+ */
+int pfz_reopen_smb_fd(void)
+{
+    if (!g_smbctx) return -1;
+    if (g_smb_fd >= 0) { smbc_close(g_smb_fd); g_smb_fd = -1; }
+    char url[256];
+    snprintf(url, sizeof(url), "smb://%s/share/fuzz_target", g_target_ip);
+    for (int _t = 0; _t < 3 && g_smb_fd < 0; _t++) {
+        g_smb_fd = smbc_open(url, O_RDWR | O_CREAT, 0666);
+        if (g_smb_fd < 0) {
+            smbc_getFunctionPurgeCachedServers(g_smbctx)(g_smbctx);
+            usleep(80000 * (_t + 1));   /* 80/160/240ms backoff, same as pfz_init */
+        }
+    }
+    return g_smb_fd >= 0 ? 0 : -1;
+}
+
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Multi-Connection Pool + Attack Patterns
@@ -847,6 +1219,7 @@ static int pool_xact(struct pool_conn *c, const void *pdu, int len, void *resp, 
 
 /* Full SPNEGO+NTLMv2 authenticated connect (defined below) — the pool reuses it. */
 static int pool_connect_auth(struct pool_conn *c, const char *share);
+static int pool_lazy(int n);   /* lazy pool init — see definition (#3) */
 
 /*
  * Open one authenticated pool connection (session + tree to [share]).
@@ -868,26 +1241,33 @@ static void pool_create_file(struct pool_conn *c, const char *name)
 {
     uint8_t pdu[256], resp[256];
     int nlen = strlen(name) * 2;
-    pool_smb2_hdr(pdu, 0x0005, c);
-    uint8_t *b = pdu + 64;
-    *(uint16_t *)b = 57;
-    *(uint32_t *)(b + 24) = 0x12019F; /* DesiredAccess */
-    *(uint32_t *)(b + 28) = 0x80;
-    *(uint32_t *)(b + 32) = 0x07; /* ShareAccess */
-    *(uint32_t *)(b + 36) = 0x05; /* CREATE_DISPOSITION */
-    *(uint32_t *)(b + 40) = 0x40;
-    *(uint16_t *)(b + 44) = 120; *(uint16_t *)(b + 46) = nlen;
-    /* Simple ASCII→UTF-16 */
-    for (int i = 0; i < (int)strlen(name); i++) {
-        pdu[120 + i*2] = name[i]; pdu[120 + i*2 + 1] = 0;
+    /* Retry a transient CREATE miss. A single failure (status!=0 while ksmbd is busy
+     * under N-way concurrency) left the pool at fids=0, which silently BAILS every
+     * pool-based grain (copychunk, lease, compound, sequence, …). Rebuild the header
+     * each attempt for a fresh MessageId. */
+    for (int _t = 0; _t < 2 && !c->has_fid; _t++) {
+        pool_smb2_hdr(pdu, 0x0005, c);
+        uint8_t *b = pdu + 64;
+        *(uint16_t *)b = 57;
+        *(uint32_t *)(b + 24) = 0x12019F; /* DesiredAccess */
+        *(uint32_t *)(b + 28) = 0x80;
+        *(uint32_t *)(b + 32) = 0x07; /* ShareAccess */
+        *(uint32_t *)(b + 36) = 0x05; /* CREATE_DISPOSITION */
+        *(uint32_t *)(b + 40) = 0x40;
+        *(uint16_t *)(b + 44) = 120; *(uint16_t *)(b + 46) = nlen;
+        /* Simple ASCII→UTF-16 */
+        for (int i = 0; i < (int)strlen(name); i++) {
+            pdu[120 + i*2] = name[i]; pdu[120 + i*2 + 1] = 0;
+        }
+        int r = pool_xact(c, pdu, 120 + nlen, resp, sizeof(resp));
+        /* Only accept a real CREATE success (NTSTATUS==0 + full response). The old
+         * `r>=144`-only check set has_fid on error/short responses → grains ran with a
+         * garbage fid or (worse) silently believed they had one. FileId is at body+64
+         * = abs 128 in the SMB2 CREATE response. */
+        uint32_t status = (r >= 12) ? *(uint32_t *)(resp + 8) : 0xFFFFFFFFu;
+        if (r >= 144 && status == 0) { memcpy(c->fid, resp + 128, 16); c->has_fid = 1; break; }
+        usleep(40000 * (_t + 1));       /* 40ms, 80ms, 120ms backoff */
     }
-    int r = pool_xact(c, pdu, 120 + nlen, resp, sizeof(resp));
-    /* Only accept a real CREATE success (NTSTATUS==0 + full response). The old
-     * `r>=144`-only check set has_fid on error/short responses → grains ran with a
-     * garbage fid or (worse) silently believed they had one. FileId is at body+64
-     * = abs 128 in the SMB2 CREATE response. */
-    uint32_t status = (r >= 12) ? *(uint32_t *)(resp + 8) : 0xFFFFFFFFu;
-    if (r >= 144 && status == 0) { memcpy(c->fid, resp + 128, 16); c->has_fid = 1; }
 }
 
 /* Working-preamble helper for raw-PDU grains: guarantee an open fid on the pool
@@ -922,7 +1302,7 @@ static int pool_ensure_fid(struct pool_conn *c, const char *name)
  * ksmbd's smb2_ioctl dispatch + the per-FSCTL handler with fuzzed input. */
 static int pool_ioctl(uint32_t ctl, const void *input, int inlen, int need_fid)
 {
-    if (g_pool_n < 1) return -1;
+    if (!pool_lazy(1)) return -1;
     if (need_fid && !pool_ensure_fid(&g_pool[0], "ioctl_v")) return -1;
     uint8_t pdu[1024], resp[1024];
     if (inlen > 400) inlen = 400;
@@ -947,7 +1327,7 @@ static int pool_ioctl(uint32_t ctl, const void *input, int inlen, int need_fid)
 static int pool_create_with_ctx(const char *name, const char *tag, int taglen,
                                 const void *data, int datalen)
 {
-    if (g_pool_n < 1) return -1;
+    if (!pool_lazy(1)) return -1;
     struct pool_conn *c = &g_pool[0];
     uint8_t pdu[1024], resp[512];
     if (datalen > 400) datalen = 400;
@@ -1136,7 +1516,7 @@ static int pool_connect_auth(struct pool_conn *c, const char *share)
     struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(445) };
     addr.sin_addr.s_addr = inet_addr(g_target_ip);
     c->sock = socket(AF_INET, SOCK_STREAM, 0);
-    struct timeval tv = {.tv_sec = 2};
+    struct timeval tv = {.tv_sec = 1};   /* 2s→1s: fail a slow op fast so the grain cycles */
     setsockopt(c->sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     if (connect(c->sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) return -1;
     c->mid = 0; c->has_fid = 0; c->sid = 0; c->tid = 0;
@@ -1453,7 +1833,7 @@ static void *_pool_race_thread(void *arg) {
  */
 int pfz_pool_oplock_race(const char *filename)
 {
-    if (g_pool_n < 2) return -1;
+    if (!pool_lazy(2)) return -1;
     uint8_t pdu[256], resp[256];
     int nlen = strlen(filename) * 2;
 
@@ -1605,12 +1985,23 @@ static int g_pool_smb_fds[MAX_POOL];
 int pfz_pool_init_authed(int n)
 {
     if (n > MAX_POOL) n = MAX_POOL;
+    /* GENEROUS timeout for the pool connect+auth+create (each is a full SMB session, like
+     * pfz_init's). This runs AFTER pfz_init dropped the ctx timeout to 1s, so under load the
+     * 2nd connect used to fail → g_pool_n=1 → exec #1 then did a ~1.8s pool RE-INIT that
+     * trips gen.py's early 0-exec kill (the flaky "0 executions" that MASKED the real
+     * CMP_I2S_HITS). Retry each connection so we reliably reach n in INIT, then restore the
+     * fast fuzzing-op timeout. */
+    if (g_smbctx) smbc_setTimeout(g_smbctx, 5000);
     g_pool_n = 0;
     for (int i = 0; i < n; i++) {
         char url[64];
         snprintf(url, sizeof(url), "smb://%s/share/pool_file_%d", g_target_ip, i);
-        g_pool_smb_fds[i] = smbc_open(url, O_RDWR | O_CREAT, 0666);
-        if (g_pool_smb_fds[i] < 0) break;
+        g_pool_smb_fds[i] = -1;
+        for (int _t = 0; _t < 2 && g_pool_smb_fds[i] < 0; _t++) {
+            g_pool_smb_fds[i] = smbc_open(url, O_RDWR | O_CREAT, 0666);
+            if (g_pool_smb_fds[i] < 0) usleep(60000 * (_t + 1));   /* 60/120/180ms backoff */
+        }
+        if (g_pool_smb_fds[i] < 0) break;    /* genuine failure after retries → stop */
         /* Also open raw socket for this connection's races */
         if (pool_connect_one(&g_pool[i]) == 0) {
             char fname[32];
@@ -1619,7 +2010,22 @@ int pfz_pool_init_authed(int n)
         }
         g_pool_n++;
     }
+    if (g_smbctx) smbc_setTimeout(g_smbctx, 1000);   /* restore fast fuzzing-op timeout */
     return g_pool_n;
+}
+
+/* LAZY pool init (#3): a pool-based grain calls this at the start of its fn; the pool auth
+ * (2 NTLMv2 handshakes) happens ONCE, and ONLY for grains that actually use the pool — so
+ * the non-pool majority never pays it, cutting the ksmbd.mountd auth storm. Returns 1 if the
+ * pool has >= n connections. */
+static int pool_lazy(int n) {
+    /* Init AT MOST ONCE per required size. pfz_pool_init_authed() resets g_pool_n=0 and
+     * rebuilds, so calling it every exec (when the pool can't reach n) would thrash the
+     * auth + tear down a working n=1 pool each time. _tried_n remembers the largest size we
+     * have attempted so a stuck pool grain bails cleanly instead of re-authing per exec. */
+    static int _tried_n = 0;
+    if (g_pool_n < n && _tried_n < n) { _tried_n = n; pfz_pool_init_authed(n); }
+    return g_pool_n >= n;
 }
 
 /* #4 prerequisite assertion: how many pool connections actually have an OPEN fid.
@@ -1682,7 +2088,7 @@ int pfz_pool_race_authed(int a_idx, int b_idx, const void *data, int len)
  */
 int pfz_durable_reconnect(const char *filename)
 {
-    if (g_pool_n < 1) return -1;
+    if (!pool_lazy(1)) return -1;
     struct pool_conn *c = &g_pool[0];
     uint8_t pdu[512], resp[512];
     int nlen = strlen(filename) * 2;
@@ -1760,7 +2166,7 @@ int pfz_durable_reconnect(const char *filename)
  */
 int pfz_session_binding_race(void)
 {
-    if (g_pool_n < 2) return -1;
+    if (!pool_lazy(2)) return -1;
     if (g_df_buf) g_df_buf[0] = 0;
 
     /* Conn 1: SESSION_SETUP with SMB2_SESSION_FLAG_BINDING + Conn 0's sid */
@@ -1832,7 +2238,7 @@ int pfz_query_dir(uint8_t info_class, uint32_t output_buf_len,
  */
 int pfz_ndr_fuzz(const void *rpc_data, int rpc_len)
 {
-    if (g_pool_n < 1) return -1;
+    if (!pool_lazy(1)) return -1;
     struct pool_conn *c = &g_pool[0];
     uint8_t pdu[1024], resp[4096];
 
@@ -1896,7 +2302,7 @@ int pfz_ndr_fuzz(const void *rpc_data, int rpc_len)
  */
 int pfz_lease_race(const char *filename, const void *lease_key, uint32_t lease_state)
 {
-    if (g_pool_n < 2) return -1;
+    if (!pool_lazy(2)) return -1;
     uint8_t pdu[512], resp[512];
     int nlen = strlen(filename) * 2;
 
@@ -2055,7 +2461,7 @@ int pfz_set_reparse(uint32_t reparse_tag, const void *data, int len)
  */
 int pfz_krb5_fuzz(const void *ap_req_data, int len)
 {
-    if (g_pool_n < 1) return -1;
+    if (!pool_lazy(1)) return -1;
     uint8_t pdu[1024], resp[512];
     /* Build SPNEGO with Kerberos mechtype + malformed token */
     uint8_t krb5_oid[] = {0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02};
@@ -2122,7 +2528,7 @@ int pfz_negotiate_contexts(const void *ctx_data, int ctx_len)
     addr.sin_addr.s_addr = inet_addr(g_target_ip);
     sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return -1;
-    struct timeval tv = {.tv_sec = 2};
+    struct timeval tv = {.tv_sec = 1};   /* 2s→1s: fail a slow op fast so the grain cycles */
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(sock); return -1; }
 
@@ -2160,7 +2566,7 @@ int pfz_negotiate_contexts(const void *ctx_data, int ctx_len)
 /* #4: Unknown pipe names — CREATE on IPC$ with garbage/unknown pipe names. */
 int pfz_unknown_pipe(const void *pipe_name, int name_len)
 {
-    if (g_pool_n < 1) return -1;
+    if (!pool_lazy(1)) return -1;
     uint8_t pdu[512], resp[512];
     /* TREE_CONNECT to IPC$ first */
     const uint8_t ipc[] = {'\\',0,'\\',0,'1',0,'2',0,'7',0,'.',0,'0',0,'.',0,'0',0,'.',0,'1',0,'\\',0,'I',0,'P',0,'C',0,'$',0};
@@ -2197,7 +2603,7 @@ int pfz_unknown_pipe(const void *pipe_name, int name_len)
 /* #7: Unicode/path edge cases — CREATE with extreme filenames. */
 int pfz_unicode_path(const void *filename_utf16, int name_len)
 {
-    if (g_pool_n < 1) return -1;
+    if (!pool_lazy(1)) return -1;
     uint8_t pdu[4096], resp[512];
     int nlen = name_len > 3000 ? 3000 : name_len;
     pool_smb2_hdr(pdu, 0x0005, &g_pool[0]);
@@ -2856,7 +3262,7 @@ static int grain_flush(const uint8_t *d, size_t n) {         /* SMB2 FLUSH 0x07 
 }
 
 static int grain_echo(const uint8_t *d, size_t n) {          /* SMB2 ECHO 0x0D */
-    if (g_pool_n < 1) return -1;
+    if (!pool_lazy(1)) return -1;
     uint8_t pdu[80], resp[80];
     pool_smb2_hdr(pdu, 0x000D, &g_pool[0]);
     uint8_t *b = pdu + 64;
@@ -2866,7 +3272,7 @@ static int grain_echo(const uint8_t *d, size_t n) {          /* SMB2 ECHO 0x0D *
 }
 
 static int grain_cancel(const uint8_t *d, size_t n) {        /* SMB2 CANCEL 0x0C */
-    if (g_pool_n < 1) return -1;
+    if (!pool_lazy(1)) return -1;
     uint8_t pdu[80], resp[80];
     pool_smb2_hdr(pdu, 0x000C, &g_pool[0]);
     /* Cancel a (possibly non-existent) async op by MID → async-teardown path. */
@@ -2937,7 +3343,7 @@ static int grain_notify(const uint8_t *d, size_t n) {        /* SMB2 CHANGE_NOTI
 }
 
 static int grain_tdis(const uint8_t *d, size_t n) {          /* SMB2 TREE_DISCONNECT 0x04 */
-    if (g_pool_n < 1) return -1;
+    if (!pool_lazy(1)) return -1;
     uint8_t pdu[80], resp[80];
     pool_smb2_hdr(pdu, 0x0004, &g_pool[0]);
     *(uint32_t *)(pdu + 36) = (uint32_t)grain_u(d, n, 0, 4);/* fuzz TreeId */
@@ -3077,18 +3483,40 @@ static int grain_hardlink(const uint8_t *d, size_t n) {
  * the authed socket. ksmbd only expects SMB1 NEGOTIATE for downgrade; any other
  * SMB1 command exercises the legacy/version-mismatch handling — a classic
  * "old protocol meets new server" security surface. */
+/* Send a raw SMB1 PDU on a THROWAWAY connection (fresh socket), after an SMB2 NEGOTIATE so
+ * ksmbd sees a legacy SMB1 command over a negotiated-SMB2 conn — the version-conflict surface —
+ * WITHOUT disrupting the shared authed pool. The old smb1 grains sent \xffSMB over the SMB2
+ * pool socket, which made ksmbd CLOSE that connection, leaving a dead pool socket (has_fid=1)
+ * → the grain's pool_xact failed (-1 = BAIL) AND every pool grain after it bailed too. */
+static int smb1_throwaway(uint8_t cmd, const uint8_t *d, int n) {
+    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(445) };
+    addr.sin_addr.s_addr = inet_addr(g_target_ip);
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return -1;
+    struct timeval tv = {.tv_sec = 1};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(sock); return -1; }
+    uint8_t neg[128]; memset(neg, 0, sizeof(neg));       /* SMB2 NEGOTIATE → negotiated conn */
+    memcpy(neg, "\xfeSMB", 4); *(uint16_t *)(neg + 4) = 64;
+    { uint8_t *nb = neg + 64; *(uint16_t *)nb = 36; *(uint16_t *)(nb + 2) = 1; *(uint16_t *)(nb + 36) = 0x0311; }
+    uint32_t nl = htonl(64 + 38); (void)!write(sock, &nl, 4); (void)!write(sock, neg, 64 + 38);
+    uint8_t tmp[512]; (void)!read(sock, tmp, sizeof(tmp));
+    uint8_t pdu[256]; memset(pdu, 0, sizeof(pdu));       /* the fuzzed SMB1 command (legacy) */
+    memcpy(pdu, "\xffSMB", 4);
+    pdu[4] = cmd;
+    pdu[13] = 0x18; pdu[14] = 0x01; pdu[15] = 0x20;      /* Flags/Flags2 */
+    int blen = n > 200 ? 200 : n;
+    if (blen > 0) memcpy(pdu + 33, d, blen);
+    pdu[32] = (uint8_t)(n > 1 ? d[1] : 0);              /* WordCount */
+    int plen = 33 + (blen > 3 ? blen : 3);
+    if (g_df_buf) g_df_buf[0] = 0;
+    uint32_t pb = htonl(plen); (void)!write(sock, &pb, 4); (void)!write(sock, pdu, plen);
+    uint8_t resp[256]; (void)!read(sock, resp, sizeof(resp));
+    close(sock);
+    return g_df_buf ? (int)g_df_buf[0] : 0;
+}
 static int grain_smb1(const uint8_t *d, size_t n) {
-    if (g_pool_n < 1) return -1;
-    uint8_t pdu[256], resp[256];
-    memset(pdu, 0, sizeof(pdu));
-    memcpy(pdu, "\xffSMB", 4);                        /* SMB1 magic */
-    pdu[4] = (uint8_t)grain_u(d, n, 0, 1);           /* Command (SMBopen/write/trans...) */
-    /* Flags/Flags2 + fuzzed WordCount/ByteCount body */
-    pdu[13] = 0x18; pdu[14] = 0x01; pdu[15] = 0x20;
-    int blen = (int)(n > 200 ? 200 : n);
-    if (blen > 0) memcpy(pdu + 32, d, blen);
-    pdu[32] = (uint8_t)grain_u(d, n, 1, 1);          /* WordCount */
-    return pool_xact(&g_pool[0], pdu, 32 + (blen > 3 ? blen : 3), resp, sizeof(resp));
+    return smb1_throwaway((uint8_t)grain_u(d, n, 0, 1), d, (int)n);   /* fuzzed SMB1 command */
 }
 
 /* ─── CREATE-context grains (§4): fuzz each context parser via pool_create_with_ctx ─── */
@@ -3147,7 +3575,7 @@ static int grain_fsctl_netif(const uint8_t *d, size_t n) {   /* FSCTL_QUERY_NETW
 
 /* TREE_CONNECT (0x03) with a fuzzed UNC/share path → ksmbd share lookup + path parse. */
 static int grain_tcon(const uint8_t *d, size_t n) {
-    if (g_pool_n < 1) return -1;
+    if (!pool_lazy(1)) return -1;
     uint8_t pdu[256], resp[256];
     pool_smb2_hdr(pdu, 0x0003, &g_pool[0]);
     uint8_t *b = pdu + 64;
@@ -3236,7 +3664,7 @@ static int grain_append(const uint8_t *d, size_t n) {
 /* SMB3 TRANSFORM_HEADER (0xFD'SMB'): fuzz Signature/Nonce/OrigSize/Flags + payload →
  * ksmbd's smb3 decrypt/transform path (needs `smb3 encryption = enabled`). */
 static int grain_encrypt(const uint8_t *d, size_t n) {
-    if (g_pool_n < 1) return -1;
+    if (!pool_lazy(1)) return -1;
     uint8_t pdu[256], resp[256];
     memset(pdu, 0, sizeof(pdu));
     memcpy(pdu, "\xfdSMB", 4);                             /* transform magic */
@@ -3289,7 +3717,7 @@ static int grain_oplock_ack(const uint8_t *d, size_t n) {
 /* Dedicated SESSION_SETUP auth-fuzz: fuzz Flags/SecurityMode/Capabilities + the whole
  * security (SPNEGO/NTLMSSP) blob → ksmbd's auth/ASN.1 decode surface. */
 static int grain_session_setup(const uint8_t *d, size_t n) {
-    if (g_pool_n < 1) return -1;
+    if (!pool_lazy(1)) return -1;
     uint8_t pdu[512], resp[256];
     pool_smb2_hdr(pdu, 0x0001, &g_pool[0]);
     uint8_t *b = pdu + 64;
@@ -3308,16 +3736,10 @@ static int grain_session_setup(const uint8_t *d, size_t n) {
 /* SMB1 per-opcode legacy grains: send a specific SMB1 command over the SMB2 session
  * (version-conflict). ksmbd only expects SMB1 NEGOTIATE — these hit legacy handling. */
 static int smb1_cmd(uint8_t cmd, const uint8_t *d, int n) {
-    if (g_pool_n < 1) return -1;
-    uint8_t pdu[256], resp[256];
-    memset(pdu, 0, sizeof(pdu));
-    memcpy(pdu, "\xffSMB", 4);
-    pdu[4] = cmd;
-    pdu[9] = 0x18; pdu[10] = 0x01; pdu[11] = 0x20;         /* Flags/Flags2 */
-    int blen = n > 200 ? 200 : n;
-    pdu[32] = (uint8_t)(n > 0 ? d[0] : 0);                 /* WordCount */
-    if (blen > 0) memcpy(pdu + 33, d, blen);              /* params + ByteCount + data */
-    return pool_xact(&g_pool[0], pdu, 33 + (blen > 0 ? blen : 0), resp, sizeof(resp));
+    /* Throwaway conn (not the pool): the per-opcode SMB1 grains (tconx/ntcreate/trans/
+     * open/write) send \xffSMB over an SMB2-negotiated conn — the version-conflict surface —
+     * without tearing down the shared authed pool (which caused the pool-grain BAIL cascade). */
+    return smb1_throwaway(cmd, d, n);
 }
 static int grain_smb1_tconx(const uint8_t *d, size_t n)    { return smb1_cmd(0x75, d, (int)n); } /* SMBtconX */
 static int grain_smb1_ntcreate(const uint8_t *d, size_t n) { return smb1_cmd(0xA2, d, (int)n); } /* SMBntcreateX */
@@ -3560,7 +3982,7 @@ static int grain_dacl_deep(const uint8_t *d, size_t n) {
  * computes the expected signature (HMAC-SHA256 / AES-CMAC engine) and compares.
  * Needs `server signing` enabled in the config (set to `auto`). */
 static int grain_sign(const uint8_t *d, size_t n) {
-    if (g_pool_n < 1) return -1;
+    if (!pool_lazy(1)) return -1;
     uint8_t pdu[128], resp[256];
     pool_smb2_hdr(pdu, 0x000E, &g_pool[0]);      /* QUERY_DIRECTORY */
     *(uint32_t *)(pdu + 16) |= 0x00000008u;      /* SMB2_FLAGS_SIGNED */
@@ -3594,7 +4016,7 @@ static int grain_rpc_opnum(const uint8_t *d, size_t n) {
  * (decompression bombs, offset/length overflow). ksmbd added compression-transform
  * helpers; unsupported → protocol-detect reject (still exercises the dispatch). */
 static int grain_compress_transform(const uint8_t *d, size_t n) {
-    if (g_pool_n < 1) return -1;
+    if (!pool_lazy(1)) return -1;
     uint8_t pdu[256], resp[256];
     memset(pdu, 0, sizeof(pdu));
     *(uint32_t *)pdu       = 0x424d53fc;                   /* 0xFC'SMB' compression id */
@@ -3638,6 +4060,1930 @@ static int grain_set_quota(const uint8_t *d, size_t n) {
     memcpy(b + 16, g_pool[0].fid, 16);
     for (int i = 0; i < dlen && i < (int)n; i++) b[32 + i] = d[i]; /* fuzzed quota info */
     return pool_xact(&g_pool[0], pdu, 64 + 32 + dlen, resp, sizeof(resp));
+}
+
+/* ─── Batch 10 (2026-07-22): parser-DEPTH grains ─────────────────────────────
+ * These turn existing single-element grains into the CHAIN/ARRAY walk their KSMBD
+ * parser actually implements — the loop body that today's fleet leaves at iteration
+ * count 1. See GRAIN.md §9. */
+
+/* set_ea_chain — multi-entry FILE_FULL_EA list with fuzzed NextEntryOffset, to
+ * exercise smb2_set_ea()'s do/while chain-walk (smb2pdu.c). The set_full_ea/create_ea
+ * grains hardcode NextEntryOffset=0 (single entry), so the walk + its per-entry bounds
+ * (overlap / short next / EaValueLength vs buf_len) were never reached. Entries are laid
+ * out contiguously (well-formed) but each entry's NextEntryOffset is set to the natural
+ * link OR fuzzed to overlap/underflow so the kernel's chain-walk hits its bounds. */
+static int grain_set_ea_chain(const uint8_t *d, size_t n) {
+    uint8_t ea[400]; memset(ea, 0, sizeof(ea));
+    int nent = 2 + (int)(n ? d[0] % 3 : 0);          /* 2-4 chained entries */
+    int off = 0, p = 1, cnt = 0;
+    int eoff[8], elen[8];
+    for (int i = 0; i < nent && off + 16 < 360; i++) {
+        int namelen = 3 + (int)(grain_u(d, n, p, 1) % 6);
+        int vallen  = 2 + (int)(grain_u(d, n, p + 1, 1) % 8);
+        uint8_t *e = ea + off;
+        e[4] = (uint8_t)grain_u(d, n, p + 2, 1);     /* Flags */
+        e[5] = (uint8_t)namelen;                     /* EaNameLength */
+        *(uint16_t *)(e + 6) = (uint16_t)vallen;     /* EaValueLength */
+        for (int j = 0; j < namelen; j++) e[8 + j] = 'A' + ((p + j) % 26);
+        e[8 + namelen] = 0;
+        for (int j = 0; j < vallen; j++)
+            e[8 + namelen + 1 + j] = (uint8_t)grain_u(d, n, p + 3 + j, 1);
+        int len = (8 + namelen + 1 + vallen + 3) & ~3;   /* 4-align */
+        eoff[cnt] = off; elen[cnt] = len; cnt++;
+        off += len; p += 8;
+    }
+    for (int i = 0; i < cnt; i++) {                  /* set (and sometimes corrupt) the links */
+        uint32_t next = (i == cnt - 1) ? 0 : (uint32_t)elen[i];
+        if (off > 0 && (grain_u(d, n, 200 + i, 1) & 1))
+            next = (uint32_t)(grain_u(d, n, 210 + i * 2, 2) % (unsigned)(off + 8));
+        *(uint32_t *)(ea + eoff[i]) = next;          /* NextEntryOffset (fuzzed) */
+    }
+    return pool_setinfo(15, ea, off > 0 ? off : 16); /* FILE_FULL_EA_INFORMATION */
+}
+
+/* negotiate_ctx_multi — NEGOTIATE with NegotiateContextCount > 1 and N fuzzed contexts,
+ * to exercise deassemble_neg_contexts()'s `while (i++ < neg_ctxt_cnt)` array walk AND the
+ * 2nd..Nth sub-decoders (decode_preauth_ctxt SaltLength/HashAlgorithmCount,
+ * decode_compress_ctxt CompressionAlgorithmCount, decode_encrypt_ctxt CipherCount).
+ * pfz_negotiate_contexts hardcodes count=1 so only the FIRST context/decoder was reached.
+ * Throwaway socket (a bad NEGOTIATE kills the connection) — does NOT touch the pool. */
+static int grain_negotiate_ctx_multi(const uint8_t *d, size_t n) {
+    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(445) };
+    addr.sin_addr.s_addr = inet_addr(g_target_ip);
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return -1;
+    struct timeval tv = {.tv_sec = 1};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(sock); return -1; }
+
+    uint8_t pdu[1024]; memset(pdu, 0, sizeof(pdu));
+    memcpy(pdu, "\xfeSMB", 4);
+    *(uint16_t *)(pdu + 4) = 64; *(uint16_t *)(pdu + 12) = 0;   /* NEGOTIATE */
+    uint8_t *b = pdu + 64;
+    *(uint16_t *)b = 36;                              /* StructureSize */
+    *(uint16_t *)(b + 2) = 1;                         /* DialectCount */
+    *(uint16_t *)(b + 4) = 1;                         /* SecurityMode */
+    *(uint32_t *)(b + 8) = 0x7F;                      /* Capabilities */
+    memset(b + 12, 0xAA, 16);                         /* ClientGuid */
+    *(uint16_t *)(b + 36) = 0x0311;                   /* Dialect SMB 3.1.1 */
+    int ctx_off = (64 + 36 + 2 + 7) & ~7;             /* 8-aligned, after 1 dialect */
+    *(uint32_t *)(b + 28) = ctx_off;                  /* NegotiateContextOffset */
+    int nctx = 2 + (int)(grain_u(d, n, 0, 1) % 5);    /* 2-6 contexts (THE point) */
+    *(uint16_t *)(b + 32) = (uint16_t)nctx;           /* NegotiateContextCount */
+    static const uint16_t CT[] = { 1, 2, 3, 5, 6, 8 }; /* preauth/enc/compress/netname/signing/posix */
+    int off = ctx_off, p = 1;
+    for (int i = 0; i < nctx && off + 8 < 960; i++) {
+        int dlen = (int)(grain_u(d, n, p + 1, 1) % 40);        /* fuzzed DataLength */
+        *(uint16_t *)(pdu + off) = CT[grain_u(d, n, p, 1) % 6];/* ContextType */
+        *(uint16_t *)(pdu + off + 2) = (uint16_t)dlen;         /* DataLength (fuzzed) */
+        for (int j = 0; j < dlen && off + 8 + j < 1000; j++)
+            pdu[off + 8 + j] = (uint8_t)grain_u(d, n, p + 2 + j, 1); /* counts/salts/algs */
+        off += (8 + dlen + 7) & ~7;                            /* 8-align */
+        p += 6;
+    }
+    if (g_df_buf) g_df_buf[0] = 0;
+    uint32_t nb = htonl(off);
+    write(sock, &nb, 4); (void)!write(sock, pdu, off);
+    uint8_t resp[512]; (void)!read(sock, resp, sizeof(resp));
+    close(sock);
+    return g_df_buf ? (int)g_df_buf[0] : 0;
+}
+
+/* compound_chain — a STRUCTURED 2-4 command SMB2 compound linked by NextCommand, fuzzing
+ * the link offsets + mid-chain SessionId/TreeId (SMB2_FLAGS_RELATED_OPERATIONS), to stress
+ * __handle_ksmbd_work()'s `do { } while (is_chained)` loop + credit/tcon accounting.
+ * pfz_compound just sprays raw bytes (never forms a valid NextCommand), so the chaining
+ * loop almost never fired. Throwaway socket + a minimal NEGOTIATE first. */
+static int grain_compound_chain(const uint8_t *d, size_t n) {
+    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(445) };
+    addr.sin_addr.s_addr = inet_addr(g_target_ip);
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return -1;
+    struct timeval tv = {.tv_sec = 1};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(sock); return -1; }
+    uint8_t neg[128]; memset(neg, 0, sizeof(neg));   /* minimal NEGOTIATE (give the conn a dialect) */
+    memcpy(neg, "\xfeSMB", 4); *(uint16_t *)(neg + 4) = 64;
+    { uint8_t *nb2 = neg + 64; *(uint16_t *)nb2 = 36; *(uint16_t *)(nb2 + 2) = 1;
+      *(uint16_t *)(nb2 + 36) = 0x0311; }
+    uint32_t nl = htonl(64 + 38);
+    (void)!write(sock, &nl, 4); (void)!write(sock, neg, 64 + 38);
+    uint8_t tmp[512]; (void)!read(sock, tmp, sizeof(tmp));
+
+    uint8_t pdu[1024]; memset(pdu, 0, sizeof(pdu));
+    int ncmd = 2 + (int)(grain_u(d, n, 0, 1) % 3);   /* 2-4 sub-commands */
+    static const uint16_t CMD[] = { 0x000D, 0x0007, 0x000E, 0x0003 }; /* ECHO/FLUSH/QDIR/TCON */
+    int off = 0, p = 1;
+    for (int i = 0; i < ncmd && off + 72 < 960; i++) {
+        uint8_t *h = pdu + off;
+        memcpy(h, "\xfeSMB", 4);
+        *(uint16_t *)(h + 4) = 64;                    /* header StructureSize */
+        *(uint16_t *)(h + 12) = CMD[grain_u(d, n, p, 1) % 4]; /* Command */
+        *(uint16_t *)(h + 14) = 31;                   /* CreditRequest */
+        *(uint64_t *)(h + 24) = (uint64_t)i;          /* MessageId */
+        if (i > 0) {                                  /* related-request confusion */
+            *(uint32_t *)(h + 16) = 0x04;             /* SMB2_FLAGS_RELATED_OPERATIONS */
+            *(uint32_t *)(h + 36) = (uint32_t)grain_u(d, n, p + 1, 4);  /* TreeId */
+            *(uint64_t *)(h + 40) = grain_u(d, n, p + 5, 8);           /* SessionId */
+        }
+        *(uint16_t *)(h + 64) = 4;                    /* minimal ECHO body StructureSize */
+        int cmdlen = (64 + 4 + 7) & ~7;               /* 8-align */
+        uint32_t next = (i == ncmd - 1) ? 0 : (uint32_t)cmdlen;
+        if (grain_u(d, n, p + 13, 1) & 1)             /* fuzz the link (overlap/short/unaligned) */
+            next = (uint32_t)(grain_u(d, n, p + 14, 2) % 200);
+        *(uint32_t *)(h + 20) = next;                 /* NextCommand */
+        off += cmdlen; p += 16;
+    }
+    if (g_df_buf) g_df_buf[0] = 0;
+    uint32_t nb = htonl(off);
+    (void)!write(sock, &nb, 4); (void)!write(sock, pdu, off);
+    uint8_t resp[512]; (void)!read(sock, resp, sizeof(resp));
+    close(sock);
+    return g_df_buf ? (int)g_df_buf[0] : 0;
+}
+
+/* ndr_xattr — NDR encode+decode round-trip: SET a fuzzed self-relative security descriptor
+ * (ksmbd stores it as the security.NTACL xattr via ndr_encode_v4_ntacl, size driven by our
+ * bytes) then QUERY it back so smb2_query_info SECURITY runs ndr_decode_v4_ntacl on the
+ * stored blob (its bounds: sd_size = length - offset, kzalloc, ndr_read_bytes). Attacker
+ * control is indirect (ksmbd re-encodes) but the decode path + its size math execute. */
+static int grain_ndr_xattr(const uint8_t *d, size_t n) {
+    if (g_pool_n < 1 || !pool_ensure_fid(&g_pool[0], "ndr_v")) return -1;
+    uint8_t pdu[512], resp[2048];
+    /* 1) write the SD (varies the stored NDR blob length) */
+    uint8_t sd[300]; memset(sd, 0, sizeof(sd));
+    int sdlen = 20 + (int)(grain_u(d, n, 0, 1) % 200);
+    sd[0] = 1;                                        /* Revision */
+    *(uint16_t *)(sd + 2) = 0x8004;                   /* DACL_PRESENT | SELF_RELATIVE */
+    *(uint32_t *)(sd + 16) = 20;                      /* OffsetDacl */
+    for (int i = 20; i < sdlen && i < (int)n; i++) sd[i] = d[i];
+    pool_smb2_hdr(pdu, 0x0011, &g_pool[0]);
+    { uint8_t *b = pdu + 64; memset(b, 0, 32);
+      *(uint16_t *)b = 33; b[2] = 0x03;               /* InfoType = SECURITY */
+      *(uint32_t *)(b + 4) = (uint32_t)sdlen;
+      *(uint16_t *)(b + 8) = 64 + 32;
+      *(uint32_t *)(b + 12) = 0x04;                   /* DACL_SECURITY_INFORMATION */
+      memcpy(b + 16, g_pool[0].fid, 16);
+      memcpy(b + 32, sd, sdlen); }
+    pool_xact(&g_pool[0], pdu, 64 + 32 + sdlen, resp, sizeof(resp));
+    /* 2) read it back → ndr_decode_v4_ntacl on the stored blob */
+    pool_smb2_hdr(pdu, 0x0010, &g_pool[0]);
+    { uint8_t *b = pdu + 64; memset(b, 0, 41);
+      *(uint16_t *)b = 41; b[2] = 0x03;               /* InfoType = SECURITY */
+      *(uint32_t *)(b + 4) = 2048;                    /* OutputBufferLength */
+      *(uint32_t *)(b + 16) = 0x07;                   /* OWNER|GROUP|DACL */
+      memcpy(b + 24, g_pool[0].fid, 16); }
+    return pool_xact(&g_pool[0], pdu, 64 + 41, resp, sizeof(resp));
+}
+
+/* dir_pattern — QUERY_DIRECTORY on a real directory handle with a wildcard-DENSE search
+ * pattern, to stress misc.c match_pattern() (the hand-rolled '*'/'?' backtracker at
+ * smb2pdu.c:4845 / smb_common.c:473). pfz_query_dir lists a SUBPATH via libsmbclient and
+ * never sends an SMB2 search pattern, so match_pattern was effectively unfuzzed. */
+static int grain_dir_pattern(const uint8_t *d, size_t n) {
+    if (g_pool_n < 1) return -1;
+    uint8_t pdu[512], resp[4096];
+    /* open the share ROOT as a directory (empty name + FILE_DIRECTORY_FILE) */
+    pool_smb2_hdr(pdu, 0x0005, &g_pool[0]);
+    { uint8_t *b = pdu + 64; memset(b, 0, 56);
+      *(uint16_t *)b = 57;
+      *(uint32_t *)(b + 24) = 0x100081;               /* LIST_DIRECTORY|READ_ATTR|SYNCHRONIZE */
+      *(uint32_t *)(b + 28) = 0x10;                   /* FILE_ATTRIBUTE_DIRECTORY */
+      *(uint32_t *)(b + 32) = 0x07;                   /* ShareAccess ALL */
+      *(uint32_t *)(b + 36) = 0x01;                   /* Disposition = FILE_OPEN */
+      *(uint32_t *)(b + 40) = 0x01;                   /* Options = FILE_DIRECTORY_FILE */
+      *(uint16_t *)(b + 44) = 120;                    /* NameOffset */
+      *(uint16_t *)(b + 46) = 0; }                    /* NameLength = 0 (root) */
+    int r = pool_xact(&g_pool[0], pdu, 120, resp, sizeof(resp));
+    if (r < 144 || *(uint32_t *)(resp + 8) != 0) return -1;
+    uint8_t dfid[16]; memcpy(dfid, resp + 128, 16);
+    /* wildcard-dense UTF-16LE search pattern */
+    uint8_t pat[128]; int pl = 0;
+    int m = 4 + (int)(grain_u(d, n, 0, 1) % 40);
+    for (int i = 0; i < m && pl + 2 < 120; i++) {
+        uint8_t sel = (uint8_t)(grain_u(d, n, 1 + i, 1) % 8), c;
+        if      (sel < 3) c = '*';
+        else if (sel < 5) c = '?';
+        else if (sel < 6) c = (uint8_t)grain_u(d, n, 48 + i, 1);
+        else              c = 'A' + (i % 26);
+        pat[pl++] = c; pat[pl++] = 0;
+    }
+    pool_smb2_hdr(pdu, 0x000E, &g_pool[0]);
+    { uint8_t *b = pdu + 64; memset(b, 0, 32);
+      *(uint16_t *)b = 33;
+      b[2] = (uint8_t)(1 + (grain_u(d, n, 2, 1) % 3)); /* FileInformationClass (DIR/FULL/BOTH) */
+      b[3] = (uint8_t)(grain_u(d, n, 3, 1) & 0x0f);    /* Flags (RESTART/SINGLE/INDEX) */
+      memcpy(b + 8, dfid, 16);                         /* FileId */
+      *(uint16_t *)(b + 24) = 64 + 32;                 /* FileNameOffset (from SMB2 hdr) */
+      *(uint16_t *)(b + 26) = (uint16_t)pl;            /* FileNameLength */
+      *(uint32_t *)(b + 28) = 4096; }                  /* OutputBufferLength */
+    memcpy(pdu + 96, pat, pl);
+    return pool_xact(&g_pool[0], pdu, 96 + pl, resp, sizeof(resp));
+}
+
+/* transport_frame — fuzz the RFC1001/NetBIOS session header (the 4-byte length prefix ksmbd
+ * reads BEFORE any SMB parsing): message-type byte + a 24-bit length that (mis)matches the
+ * bytes actually sent, stressing the connection read-assembly / length-validation path
+ * (ksmbd_tcp_readv → init_smb2_server → ksmbd_smb2_check_message). Throwaway socket. */
+static int grain_transport_frame(const uint8_t *d, size_t n) {
+    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(445) };
+    addr.sin_addr.s_addr = inet_addr(g_target_ip);
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return -1;
+    struct timeval tv = {.tv_sec = 1};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(sock); return -1; }
+    uint8_t hdr4[4];
+    hdr4[0] = (uint8_t)grain_u(d, n, 0, 1);          /* NetBIOS message type (0x00 msg, 0x81/0x85…) */
+    uint32_t claim = (uint32_t)grain_u(d, n, 1, 3);  /* 24-bit length — deliberately may != payload */
+    hdr4[1] = (claim >> 16) & 0xff; hdr4[2] = (claim >> 8) & 0xff; hdr4[3] = claim & 0xff;
+    uint8_t body[256]; memset(body, 0, sizeof(body));
+    memcpy(body, "\xfeSMB", 4);
+    int blen = (int)(n > 200 ? 200 : n);
+    for (int i = 4; i < blen; i++) body[i] = d[i];   /* fuzz after the magic */
+    if (blen < 8) blen = 8;
+    if (g_df_buf) g_df_buf[0] = 0;
+    (void)!write(sock, hdr4, 4);
+    (void)!write(sock, body, blen);
+    uint8_t resp[256]; (void)!read(sock, resp, sizeof(resp));
+    close(sock);
+    return g_df_buf ? (int)g_df_buf[0] : 0;
+}
+
+/* ─── Batch 11 (2026-07-22): more parser-DEPTH grains (chain/array walks) ─────── */
+
+/* lock_array — SMB2 LOCK with LockCount 2-8 and an independently-fuzzed lock-element
+ * array, to exercise smb2_lock()'s `for (i=0;i<lock_count;i++)` walk over lock_ele[i]
+ * (smb2pdu.c:8249; also the find.md #1 missing-check surface). grain_lock pins LockCount=1. */
+static int grain_lock_array(const uint8_t *d, size_t n) {
+    if (g_pool_n < 1 || !pool_ensure_fid(&g_pool[0], "lockarr_v")) return -1;
+    uint8_t pdu[512], resp[256];
+    pool_smb2_hdr(pdu, 0x000A, &g_pool[0]);
+    uint8_t *b = pdu + 64;
+    int nlock = 2 + (int)(grain_u(d, n, 0, 1) % 7);        /* 2-8 elements (spec cap 64) */
+    *(uint16_t *)b = 48;                                   /* StructureSize (must be 48) */
+    *(uint16_t *)(b + 2) = (uint16_t)nlock;                /* LockCount (THE point) */
+    *(uint32_t *)(b + 4) = (uint32_t)grain_u(d, n, 1, 4);  /* LockSequenceNumber */
+    memcpy(b + 8, g_pool[0].fid, 16);
+    int p = 5;
+    for (int i = 0; i < nlock; i++) {                      /* smb2_lock_element[i] @ b+24 */
+        uint8_t *e = b + 24 + i * 24;
+        *(uint64_t *)(e + 0)  = grain_u(d, n, p, 8);       /* Offset (overlap/huge/inverted) */
+        *(uint64_t *)(e + 8)  = grain_u(d, n, p + 8, 8);   /* Length */
+        *(uint32_t *)(e + 16) = (uint32_t)grain_u(d, n, p + 16, 4); /* Flags SHARED/EXCL/UNLOCK/FAIL */
+        *(uint32_t *)(e + 20) = 0;                         /* Reserved */
+        p += 12;
+    }
+    return pool_xact(&g_pool[0], pdu, 64 + 24 + nlock * 24, resp, sizeof(resp));
+}
+
+/* create_ctx_chain — a CREATE carrying 2-4 create contexts linked by fuzzed Next offsets,
+ * to exercise smb2_open()'s create-context array walk (smb2_find_context_vals follows Next).
+ * pool_create_with_ctx sends ONE context with Next=0. Contexts are laid out contiguously
+ * (well-formed) but each Next is set to the natural link OR fuzzed to overlap/underflow. */
+static int grain_create_ctx_chain(const uint8_t *d, size_t n) {
+    if (!pool_lazy(1)) return -1;
+    struct pool_conn *c = &g_pool[0];
+    uint8_t pdu[1024], resp[512];
+    const char *name = "cc_chain";
+    int nlen = strlen(name) * 2;
+    pool_smb2_hdr(pdu, 0x0005, c);
+    uint8_t *b = pdu + 64; memset(b, 0, 56);
+    *(uint16_t *)b = 57;
+    *(uint32_t *)(b + 24) = 0x12019F;                /* DesiredAccess */
+    *(uint32_t *)(b + 28) = 0x80;                    /* FileAttributes */
+    *(uint32_t *)(b + 32) = 0x07;                    /* ShareAccess */
+    *(uint32_t *)(b + 36) = 0x05;                    /* Disposition = OVERWRITE_IF */
+    *(uint32_t *)(b + 40) = 0x40;                    /* Options */
+    *(uint16_t *)(b + 44) = 120;                     /* NameOffset */
+    *(uint16_t *)(b + 46) = nlen;                    /* NameLength */
+    for (int i = 0; i < (int)strlen(name); i++) { pdu[120 + i*2] = name[i]; pdu[120 + i*2 + 1] = 0; }
+    int ctx = (120 + nlen + 7) & ~7;                 /* 8-aligned context array start */
+    static const char TAGS[6][4] = { {'E','x','t','A'}, {'M','x','A','c'}, {'Q','F','i','d'},
+                                     {'A','l','S','i'}, {'S','e','c','D'}, {'R','q','L','s'} };
+    int nctx = 2 + (int)(grain_u(d, n, 0, 1) % 3);   /* 2-4 contexts */
+    int off = ctx, p = 1, cnt = 0, coff[8], clen[8];
+    for (int i = 0; i < nctx && off + 64 < 980; i++) {
+        uint8_t *cc = pdu + off;
+        int dataoff = 16 + 8;                        /* 16 hdr + 8 (4-byte tag, 8-aligned) */
+        int datalen = (int)(grain_u(d, n, p, 1) % 32);
+        memset(cc, 0, dataoff);
+        *(uint16_t *)(cc + 4)  = 16;                 /* NameOffset (rel) */
+        *(uint16_t *)(cc + 6)  = 4;                  /* NameLength */
+        *(uint16_t *)(cc + 10) = dataoff;            /* DataOffset (rel) */
+        *(uint32_t *)(cc + 12) = (uint32_t)datalen;  /* DataLength (fuzzed) */
+        memcpy(cc + 16, TAGS[grain_u(d, n, p + 1, 1) % 6], 4);
+        for (int j = 0; j < datalen && off + dataoff + j < 1000; j++)
+            cc[dataoff + j] = (uint8_t)grain_u(d, n, p + 2 + j, 1);
+        int len = (dataoff + datalen + 7) & ~7;      /* 8-align to next context */
+        coff[cnt] = off; clen[cnt] = len; cnt++;
+        off += len; p += 6;
+    }
+    for (int i = 0; i < cnt; i++) {                  /* natural or fuzzed Next link */
+        uint32_t next = (i == cnt - 1) ? 0 : (uint32_t)clen[i];
+        if (grain_u(d, n, 100 + i, 1) & 1)
+            next = (uint32_t)(grain_u(d, n, 110 + i * 2, 2) % (unsigned)((off - ctx) + 8));
+        *(uint32_t *)(pdu + coff[i]) = next;         /* Next (fuzzed) */
+    }
+    *(uint32_t *)(b + 48) = ctx;                     /* CreateContextsOffset (from hdr) */
+    *(uint32_t *)(b + 52) = (uint32_t)(off - ctx);   /* CreateContextsLength */
+    int r = pool_xact(c, pdu, off, resp, sizeof(resp));
+    if (r >= 144 && *(uint32_t *)(resp + 8) == 0) { memcpy(c->fid, resp + 128, 16); c->has_fid = 1; }
+    return r;
+}
+
+/* copychunk_multi — FSCTL_SRV_COPYCHUNK with ChunkCount 2-8 and INDEPENDENTLY-fuzzed
+ * per-chunk Source/TargetOffset + Length, to exercise fsctl_copychunk()'s chunk-array walk
+ * (smb2pdu.c:8607: per-chunk Length==0 / copy-range bounds). pfz_copychunk computes chunks
+ * as a linear progression (and uses a wrong ctl code); this fetches a real ResumeKey and
+ * fuzzes each chunk independently (overlap / backward / huge). */
+static int grain_copychunk_multi(const uint8_t *d, size_t n) {
+    if (g_pool_n < 1 || !pool_ensure_fid(&g_pool[0], "ccm_v")) return -1;
+    uint8_t pdu[512], resp[512];
+    pool_create_file(&g_pool[0], "ccm_dst");
+    uint8_t dst_fid[16]; memcpy(dst_fid, g_pool[0].fid, 16);
+    pool_create_file(&g_pool[0], "pool_0");          /* re-open source */
+    uint8_t rkey[24]; memset(rkey, 0, sizeof(rkey)); /* real 24-byte ResumeKey */
+    {
+        pool_smb2_hdr(pdu, 0x000B, &g_pool[0]);
+        uint8_t *rb = pdu + 64; memset(rb, 0, 64);
+        *(uint16_t *)rb = 57;
+        *(uint32_t *)(rb + 4) = 0x00140078;          /* FSCTL_SRV_REQUEST_RESUME_KEY */
+        memcpy(rb + 8, g_pool[0].fid, 16);
+        *(uint32_t *)(rb + 24) = 120;
+        *(uint32_t *)(rb + 44) = 4096;
+        *(uint32_t *)(rb + 48) = 1;                  /* IS_FSCTL */
+        int rk = pool_xact(&g_pool[0], pdu, 120, resp, sizeof(resp));
+        if (rk >= 12 && *(uint32_t *)(resp + 8) == 0) {
+            uint32_t oo = *(uint32_t *)(resp + 64 + 32), oc = *(uint32_t *)(resp + 64 + 36);
+            if (oc >= 24 && oo + 24 <= (uint32_t)rk) memcpy(rkey, resp + oo, 24);
+        }
+    }
+    pool_smb2_hdr(pdu, 0x000B, &g_pool[0]);
+    uint8_t *b = pdu + 64; memset(b, 0, 64);
+    *(uint16_t *)b = 57;
+    *(uint32_t *)(b + 4) = 0x001440F2;               /* FSCTL_SRV_COPYCHUNK (correct code) */
+    memcpy(b + 8, dst_fid, 16);
+    uint8_t input[512]; memset(input, 0, sizeof(input));
+    memcpy(input, rkey, 24);                          /* SourceKey */
+    int nch = 2 + (int)(grain_u(d, n, 0, 1) % 7);     /* 2-8 chunks */
+    *(uint32_t *)(input + 24) = (uint32_t)nch;        /* ChunkCount (fuzzed) */
+    int p = 1;
+    for (int i = 0; i < nch; i++) {                   /* srv_copychunk[i] @ input+32 */
+        int o = 32 + i * 24;
+        *(uint64_t *)(input + o)      = grain_u(d, n, p, 8);       /* SourceOffset */
+        *(uint64_t *)(input + o + 8)  = grain_u(d, n, p + 8, 8);   /* TargetOffset */
+        *(uint32_t *)(input + o + 16) = (uint32_t)grain_u(d, n, p + 16, 4); /* Length */
+        p += 12;
+    }
+    int ilen = 32 + nch * 24;
+    *(uint32_t *)(b + 24) = 120;                      /* InputOffset */
+    *(uint32_t *)(b + 28) = (uint32_t)ilen;           /* InputCount */
+    *(uint32_t *)(b + 44) = 4096;                     /* MaxOutputResponse */
+    *(uint32_t *)(b + 48) = 1;                        /* IS_FSCTL */
+    memcpy(pdu + 120, input, ilen);
+    return pool_xact(&g_pool[0], pdu, 120 + ilen, resp, sizeof(resp));
+}
+
+/* quota_chain — QUERY_INFO QUOTA with a CHAINED FILE_GET_QUOTA_INFORMATION SID list
+ * (NextEntryOffset walk), the multi-entry list the get_quota grain (flat blob) misses.
+ * ksmbd's quota-query walks the SID list; the fuzzed NextEntryOffset/SidLength stress its
+ * bounds. */
+static int grain_quota_chain(const uint8_t *d, size_t n) {
+    if (g_pool_n < 1 || !pool_ensure_fid(&g_pool[0], "qchain_v")) return -1;
+    uint8_t pdu[512], resp[4096];
+    pool_smb2_hdr(pdu, 0x0010, &g_pool[0]);
+    uint8_t *b = pdu + 64; memset(b, 0, 40);
+    *(uint16_t *)b = 41;                              /* StructureSize */
+    b[2] = 0x04;                                      /* InfoType = QUOTA */
+    *(uint32_t *)(b + 4) = 4096;                      /* OutputBufferLength */
+    *(uint16_t *)(b + 8) = 64 + 40;                   /* InputBufferOffset */
+    uint8_t *q = b + 40;                              /* SMB2_QUERY_QUOTA_INFO (24 fixed) */
+    q[0] = (uint8_t)grain_u(d, n, 0, 1);             /* ReturnSingle */
+    q[1] = (uint8_t)grain_u(d, n, 1, 1);             /* RestartScan */
+    uint8_t *sl = q + 24;                             /* FILE_GET_QUOTA_INFORMATION list */
+    int nent = 2 + (int)(grain_u(d, n, 2, 1) % 4);   /* 2-5 SID entries */
+    int off = 0, p = 3, cnt = 0, eoff[8], elen[8];
+    for (int i = 0; i < nent && off + 16 < 300; i++) {
+        int sub = 1 + (int)(grain_u(d, n, p, 1) % 4);
+        int sidlen = 8 + 4 * sub;                     /* SID: 8 hdr + 1-4 subauthorities */
+        uint8_t *e = sl + off;
+        *(uint32_t *)(e + 4) = (uint32_t)sidlen;      /* SidLength */
+        uint8_t *sid = e + 8;
+        sid[0] = 1; sid[1] = (uint8_t)sub; sid[7] = 5;/* Revision / SubAuthCount / NT authority */
+        for (int j = 0; j < sub * 4 && j < 16; j++)
+            sid[8 + j] = (uint8_t)grain_u(d, n, p + 1 + j, 1);
+        int len = (8 + sidlen + 3) & ~3;
+        eoff[cnt] = off; elen[cnt] = len; cnt++;
+        off += len; p += 6;
+    }
+    for (int i = 0; i < cnt; i++) {
+        uint32_t next = (i == cnt - 1) ? 0 : (uint32_t)elen[i];
+        if (off > 0 && (grain_u(d, n, 200 + i, 1) & 1))
+            next = (uint32_t)(grain_u(d, n, 210 + i * 2, 2) % (unsigned)(off + 8));
+        *(uint32_t *)(sl + eoff[i]) = next;           /* NextEntryOffset (fuzzed) */
+    }
+    *(uint32_t *)(q + 4)  = (uint32_t)off;            /* SidListLength = chain total */
+    int qlen = 24 + off;
+    *(uint32_t *)(b + 12) = (uint32_t)qlen;           /* InputBufferLength */
+    memcpy(b + 24, g_pool[0].fid, 16);
+    return pool_xact(&g_pool[0], pdu, 64 + 40 + qlen, resp, sizeof(resp));
+}
+
+/* rdma_channel_desc — SMB2 READ with Channel = RDMA_V1[_INVALIDATE] and a fuzzed
+ * smbdirect_buffer_descriptor_v1 array (offset/token/length), to exercise the channel-info
+ * parse/validation in smb2_read (Channel/ReadChannelInfoOffset/Length). NOTE: over the
+ * fuzzer's loopback TCP, ksmbd rejects RDMA channels before the full descriptor consume, so
+ * this mainly hits the channel-validation path — deep descriptor use needs the RDMA transport
+ * (the `rdma` grain). Still worth the field-level fuzz. */
+static int grain_rdma_channel_desc(const uint8_t *d, size_t n) {
+    if (g_pool_n < 1 || !pool_ensure_fid(&g_pool[0], "rdmach_v")) return -1;
+    uint8_t pdu[256], resp[256];
+    pool_smb2_hdr(pdu, 0x0008, &g_pool[0]);          /* READ */
+    uint8_t *b = pdu + 64; memset(b, 0, 48);
+    *(uint16_t *)b = 49;                              /* StructureSize */
+    *(uint32_t *)(b + 4) = (uint32_t)grain_u(d, n, 0, 4);  /* Length */
+    *(uint64_t *)(b + 8) = grain_u(d, n, 4, 8);            /* Offset */
+    memcpy(b + 16, g_pool[0].fid, 16);               /* FileId */
+    *(uint32_t *)(b + 36) = 1 + (uint32_t)(grain_u(d, n, 12, 1) & 1); /* Channel = RDMA_V1 / V1_INVALIDATE */
+    int ndesc = 1 + (int)(grain_u(d, n, 13, 1) % 4); /* 1-4 buffer descriptors */
+    *(uint16_t *)(b + 44) = 64 + 48;                 /* ReadChannelInfoOffset (from SMB2 hdr) */
+    *(uint16_t *)(b + 46) = (uint16_t)(ndesc * 16);  /* ReadChannelInfoLength */
+    uint8_t *ci = b + 48;
+    int p = 14;
+    for (int i = 0; i < ndesc && 48 + i * 16 < 180; i++) {
+        uint8_t *desc = ci + i * 16;                 /* buffer_descriptor_v1: offset/token/length */
+        *(uint64_t *)(desc + 0)  = grain_u(d, n, p, 8);
+        *(uint32_t *)(desc + 8)  = (uint32_t)grain_u(d, n, p + 8, 4);
+        *(uint32_t *)(desc + 12) = (uint32_t)grain_u(d, n, p + 12, 4);
+        p += 16;
+    }
+    return pool_xact(&g_pool[0], pdu, 64 + 48 + ndesc * 16, resp, sizeof(resp));
+}
+
+/* ─── Batch 12 (2026-07-22): interaction + protocol-parse depth grains ────────── */
+
+/* compound_related_fid — a RELATED compound CREATE → WRITE → CLOSE where WRITE/CLOSE inherit
+ * the fid from the CREATE (FileId=0xFF.., SMB2_FLAGS_RELATED_OPERATIONS). Unlike compound_chain
+ * (ECHO sub-cmds, only the chain LINKING), this exercises the cross-op fid-inheritance / state
+ * resolution in __handle_ksmbd_work + smb2_get_ksmbd_tcon. On the authed pool conn (CREATE
+ * needs a session); a malformed chain may leave the pool needing re-auth (auto-recovered). */
+static int grain_compound_related_fid(const uint8_t *d, size_t n) {
+    if (!pool_lazy(1)) return -1;
+    struct pool_conn *c = &g_pool[0];
+    uint8_t pdu[1024], resp[1024];
+    int off = 0;
+    /* CMD1 CREATE — establishes the fid the related ops inherit */
+    { pool_smb2_hdr(pdu + off, 0x0005, c);
+      uint8_t *b = pdu + off + 64; memset(b, 0, 56);
+      const char *name = "cr_rel"; int nlen = (int)strlen(name) * 2;
+      *(uint16_t *)b = 57;
+      *(uint32_t *)(b + 24) = 0x12019F;               /* DesiredAccess */
+      *(uint32_t *)(b + 28) = 0x80;
+      *(uint32_t *)(b + 32) = 0x07;
+      *(uint32_t *)(b + 36) = 0x05;                   /* OVERWRITE_IF */
+      *(uint32_t *)(b + 40) = 0x40;
+      *(uint16_t *)(b + 44) = 120;                    /* NameOffset (from THIS hdr) */
+      *(uint16_t *)(b + 46) = (uint16_t)nlen;
+      for (int i = 0; i < (int)strlen(name); i++) { (pdu+off)[120+i*2]=name[i]; (pdu+off)[120+i*2+1]=0; }
+      int clen = (120 + nlen + 7) & ~7;
+      *(uint32_t *)((pdu + off) + 20) = (uint32_t)clen; /* NextCommand */
+      off += clen; }
+    /* CMD2 WRITE on the inherited fid (RELATED), fuzzed offset/length/data */
+    { pool_smb2_hdr(pdu + off, 0x0009, c);
+      *(uint32_t *)((pdu + off) + 16) = 0x04;         /* SMB2_FLAGS_RELATED_OPERATIONS */
+      uint8_t *b = pdu + off + 64; memset(b, 0, 48);
+      int wl = (int)(grain_u(d, n, 0, 1) % 64);
+      *(uint16_t *)b = 49;                            /* StructureSize */
+      *(uint16_t *)(b + 2) = 64 + 48;                 /* DataOffset (from THIS hdr) */
+      *(uint32_t *)(b + 4) = (uint32_t)wl;            /* Length */
+      *(uint64_t *)(b + 8) = grain_u(d, n, 1, 8);     /* Offset (fuzzed) */
+      memset(b + 16, 0xFF, 16);                       /* FileId = inherit */
+      for (int i = 0; i < wl && i < (int)n; i++) b[48 + i] = d[i];
+      int clen = (64 + 48 + wl + 7) & ~7;
+      *(uint32_t *)((pdu + off) + 20) = (uint32_t)clen; /* NextCommand */
+      off += clen; }
+    /* CMD3 CLOSE the inherited fid (RELATED, last) */
+    { pool_smb2_hdr(pdu + off, 0x0006, c);
+      *(uint32_t *)((pdu + off) + 16) = 0x04;         /* RELATED */
+      uint8_t *b = pdu + off + 64; memset(b, 0, 24);
+      *(uint16_t *)b = 24;
+      *(uint16_t *)(b + 2) = (uint16_t)grain_u(d, n, 9, 2); /* Flags (fuzzed) */
+      memset(b + 8, 0xFF, 16);                        /* FileId = inherit */
+      *(uint32_t *)((pdu + off) + 20) = 0;            /* NextCommand = 0 (last) */
+      off += 64 + 24; }
+    return pool_xact(c, pdu, off, resp, sizeof(resp));
+}
+
+/* reparse_symlink — FSCTL_SET_REPARSE_POINT with a symlink REPARSE_DATA_BUFFER whose
+ * SubstituteNameOffset/Length + PrintNameOffset/Length are fuzzed → the reparse/symlink
+ * parse bounds (parse_reparse_symlink). The reparse grain sends a flat tag buffer. */
+static int grain_reparse_symlink(const uint8_t *d, size_t n) {
+    uint8_t rp[256]; memset(rp, 0, sizeof(rp));
+    *(uint32_t *)(rp + 0) = 0xA000000C;               /* ReparseTag = IO_REPARSE_TAG_SYMLINK */
+    uint8_t *s = rp + 8;                              /* symlink data (after tag+len+reserved) */
+    int pathlen = 8 + (int)(grain_u(d, n, 0, 1) % 40) * 2; /* even (UTF-16LE) */
+    *(uint16_t *)(s + 0) = (uint16_t)grain_u(d, n, 1, 2);  /* SubstituteNameOffset (fuzzed) */
+    *(uint16_t *)(s + 2) = (uint16_t)grain_u(d, n, 3, 2);  /* SubstituteNameLength (fuzzed) */
+    *(uint16_t *)(s + 4) = (uint16_t)grain_u(d, n, 5, 2);  /* PrintNameOffset (fuzzed) */
+    *(uint16_t *)(s + 6) = (uint16_t)grain_u(d, n, 7, 2);  /* PrintNameLength (fuzzed) */
+    *(uint32_t *)(s + 8) = (uint32_t)grain_u(d, n, 9, 4);  /* Flags */
+    uint8_t *pb = s + 12;
+    for (int i = 0; i < pathlen && 12 + i < 240; i++) pb[i] = (i < (int)n) ? d[i] : 'A';
+    int dlen = 12 + pathlen;
+    *(uint16_t *)(rp + 4) = (uint16_t)dlen;           /* ReparseDataLength */
+    return pool_ioctl(0x000900A4, rp, 8 + dlen, 1);   /* FSCTL_SET_REPARSE_POINT */
+}
+
+/* dfs_referral_ex — FSCTL_DFS_GET_REFERRALS_EX with a fuzzed EX request (MaxReferralLevel /
+ * RequestFlags / RequestDataLength / RequestFileNameLength + name), the structured input the
+ * flat fsctl_dfs_ex grain misses. Goes to the DFS referral handler (no fid). */
+static int grain_dfs_referral_ex(const uint8_t *d, size_t n) {
+    uint8_t req[256]; memset(req, 0, sizeof(req));
+    *(uint16_t *)(req + 0) = (uint16_t)grain_u(d, n, 0, 2); /* MaxReferralLevel (fuzzed) */
+    *(uint16_t *)(req + 2) = (uint16_t)grain_u(d, n, 2, 2); /* RequestFlags (SITE_NAME?) */
+    int namelen = 2 + (int)(grain_u(d, n, 4, 1) % 40) * 2;  /* even UTF-16LE */
+    *(uint16_t *)(req + 8) = (uint16_t)grain_u(d, n, 5, 2); /* RequestFileNameLength (fuzzed) */
+    for (int i = 0; i < namelen && 10 + i < 240; i++) req[10 + i] = (i < (int)n) ? d[i] : '\\';
+    int rdlen = 2 + namelen;
+    *(uint32_t *)(req + 4) = (uint32_t)rdlen;          /* RequestDataLength */
+    return pool_ioctl(0x000601B0, req, 8 + rdlen, 0);  /* FSCTL_DFS_GET_REFERRALS_EX */
+}
+
+/* negotiate_dialects — NEGOTIATE with DialectCount 2-31 and a fuzzed dialect array (mixed
+ * real + fuzzed 16-bit dialects), to exercise smb2_handle_negotiate's dialect-selection loop.
+ * negotiate_ctx_multi pins DialectCount=1. Throwaway socket (does not touch the pool). */
+static int grain_negotiate_dialects(const uint8_t *d, size_t n) {
+    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(445) };
+    addr.sin_addr.s_addr = inet_addr(g_target_ip);
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return -1;
+    struct timeval tv = {.tv_sec = 1};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(sock); return -1; }
+    uint8_t pdu[512]; memset(pdu, 0, sizeof(pdu));
+    memcpy(pdu, "\xfeSMB", 4);
+    *(uint16_t *)(pdu + 4) = 64; *(uint16_t *)(pdu + 12) = 0;   /* NEGOTIATE */
+    uint8_t *b = pdu + 64;
+    *(uint16_t *)b = 36;                              /* StructureSize */
+    int nd = 2 + (int)(grain_u(d, n, 0, 1) % 30);     /* 2-31 dialects (THE point) */
+    *(uint16_t *)(b + 2) = (uint16_t)nd;              /* DialectCount (fuzzed) */
+    *(uint16_t *)(b + 4) = 1;                         /* SecurityMode */
+    *(uint32_t *)(b + 8) = 0x7F;                      /* Capabilities */
+    memset(b + 12, 0xAA, 16);                         /* ClientGuid */
+    static const uint16_t DL[] = { 0x0202, 0x0210, 0x0300, 0x0302, 0x0311, 0x02FF };
+    for (int i = 0; i < nd && 36 + i * 2 + 2 <= 440; i++)
+        *(uint16_t *)(b + 36 + i * 2) = (grain_u(d, n, 1 + i, 1) & 1)
+            ? (uint16_t)grain_u(d, n, 60 + i * 2, 2)      /* fuzzed dialect */
+            : DL[i % 6];                                  /* real dialect */
+    int total = 64 + 36 + nd * 2;
+    if (g_df_buf) g_df_buf[0] = 0;
+    uint32_t nb = htonl(total);
+    (void)!write(sock, &nb, 4); (void)!write(sock, pdu, total);
+    uint8_t resp[512]; (void)!read(sock, resp, sizeof(resp));
+    close(sock);
+    return g_df_buf ? (int)g_df_buf[0] : 0;
+}
+
+/* spnego_asn1 — SESSION_SETUP carrying a SPNEGO/DER-shaped security blob with fuzzed TLV
+ * lengths (GSS-API tag + SPNEGO OID + NegTokenInit SEQUENCE), to stress the ASN.1/GSS-API
+ * parser (the negTokenInit / ntlmssp decode path). The session_setup grain sprays flat bytes;
+ * this keeps just enough DER structure that the parser descends into the fuzzed lengths. */
+static int grain_spnego_asn1(const uint8_t *d, size_t n) {
+    if (!pool_lazy(1)) return -1;
+    uint8_t pdu[512], resp[256];
+    pool_smb2_hdr(pdu, 0x0001, &g_pool[0]);           /* SESSION_SETUP */
+    uint8_t *b = pdu + 64; memset(b, 0, 24);
+    *(uint16_t *)b = 25;
+    b[2] = 0;                                          /* Flags */
+    b[3] = 1;                                          /* SecurityMode */
+    uint8_t sec[256]; int sl = 0;
+    sec[sl++] = 0x60;                                  /* [APPLICATION 0] GSS-API */
+    sec[sl++] = (uint8_t)grain_u(d, n, 0, 1);         /* length (fuzzed → over/underflow) */
+    sec[sl++] = 0x06; sec[sl++] = 0x06;               /* OID, len 6 */
+    memcpy(sec + sl, "\x2b\x06\x01\x05\x05\x02", 6); sl += 6; /* SPNEGO OID 1.3.6.1.5.5.2 */
+    sec[sl++] = 0xA0;                                  /* [0] NegTokenInit */
+    sec[sl++] = (uint8_t)grain_u(d, n, 1, 1);         /* length (fuzzed) */
+    sec[sl++] = 0x30;                                  /* SEQUENCE */
+    sec[sl++] = (uint8_t)grain_u(d, n, 2, 1);         /* length (fuzzed) */
+    int extra = (int)(grain_u(d, n, 3, 1) % 40);      /* fuzzed nested TLV bytes */
+    for (int i = 0; i < extra && sl < 240; i++) sec[sl++] = (uint8_t)grain_u(d, n, 4 + i, 1);
+    *(uint16_t *)(b + 12) = 88;                        /* SecurityBufferOffset */
+    *(uint16_t *)(b + 14) = (uint16_t)sl;              /* SecurityBufferLength */
+    memcpy(b + 24, sec, sl);
+    return pool_xact(&g_pool[0], pdu, 64 + 24 + sl, resp, sizeof(resp));
+}
+
+/* ─── Batch 13 (2026-07-22): 32-grain backlog (A chain/array · B state/concurrency ·
+ * C crypto/transform · D path/name · E fsctl/info breadth). The B-group state/race grains
+ * are SINGLE-THREADED directed sequences — they reach the teardown/lifetime code paths but
+ * do not truly interleave; grains that raw-write the pool socket restore it with
+ * pool_reconnect() so the pool isn't left desynced. ─────────────────────────────────── */
+
+/* A1 */ static int grain_create_dh2q_internals(const uint8_t *d, size_t n) {
+    uint8_t dh[32]; memset(dh, 0, sizeof(dh));
+    *(uint32_t *)(dh + 0) = (uint32_t)grain_u(d, n, 0, 4);   /* Timeout */
+    *(uint32_t *)(dh + 4) = (uint32_t)grain_u(d, n, 4, 4);   /* Flags (PERSISTENT?) */
+    for (int i = 0; i < 16; i++) dh[16 + i] = (uint8_t)grain_u(d, n, 8 + i, 1); /* CreateGuid */
+    int r = pool_create_with_ctx("cc_dh2q", "DH2Q", 4, dh, 32);
+    uint8_t dc[36]; memset(dc, 0, sizeof(dc));
+    memcpy(dc, g_pool[0].fid, 16); memcpy(dc + 16, dh + 16, 16); /* DH2C reconnect (match guid) */
+    *(uint32_t *)(dc + 32) = (uint32_t)grain_u(d, n, 24, 4);
+    pool_create_with_ctx("cc_dh2q", "DH2C", 4, dc, 36);
+    return r;
+}
+/* A2 */ static int grain_notify_output_walk(const uint8_t *d, size_t n) {
+    if (g_pool_n < 1) return -1;
+    uint8_t pdu[256], resp[256];
+    pool_smb2_hdr(pdu, 0x0005, &g_pool[0]);
+    { uint8_t *b = pdu + 64; memset(b, 0, 56); *(uint16_t *)b = 57;
+      *(uint32_t *)(b+24) = 0x100081; *(uint32_t *)(b+28) = 0x10; *(uint32_t *)(b+32) = 0x07;
+      *(uint32_t *)(b+36) = 0x01; *(uint32_t *)(b+40) = 0x01; *(uint16_t *)(b+44) = 120; }
+    int r = pool_xact(&g_pool[0], pdu, 120, resp, sizeof(resp));
+    if (r < 144 || *(uint32_t *)(resp+8) != 0) return -1;
+    uint8_t dfid[16]; memcpy(dfid, resp + 128, 16);
+    pool_smb2_hdr(pdu, 0x000F, &g_pool[0]);
+    uint8_t *b = pdu + 64; memset(b, 0, 32); *(uint16_t *)b = 32;
+    *(uint16_t *)(b + 2) = (uint16_t)grain_u(d, n, 0, 2);   /* Flags (WATCH_TREE) */
+    *(uint32_t *)(b + 4) = (uint32_t)grain_u(d, n, 2, 4);   /* OutputBufferLength (boundary) */
+    memcpy(b + 8, dfid, 16);
+    *(uint32_t *)(b + 24) = (uint32_t)grain_u(d, n, 6, 4);  /* CompletionFilter (fuzzed) */
+    return pool_xact(&g_pool[0], pdu, 64 + 32, resp, sizeof(resp));
+}
+/* A3 */ static int grain_query_dir_resume(const uint8_t *d, size_t n) {
+    if (g_pool_n < 1) return -1;
+    uint8_t pdu[512], resp[4096];
+    pool_smb2_hdr(pdu, 0x0005, &g_pool[0]);
+    { uint8_t *b = pdu + 64; memset(b, 0, 56); *(uint16_t *)b = 57;
+      *(uint32_t *)(b+24) = 0x100081; *(uint32_t *)(b+28) = 0x10; *(uint32_t *)(b+32) = 0x07;
+      *(uint32_t *)(b+36) = 0x01; *(uint32_t *)(b+40) = 0x01; *(uint16_t *)(b+44) = 120; }
+    int r = pool_xact(&g_pool[0], pdu, 120, resp, sizeof(resp));
+    if (r < 144 || *(uint32_t *)(resp+8) != 0) return -1;
+    uint8_t dfid[16]; memcpy(dfid, resp + 128, 16);
+    uint8_t name[64]; int nl = 0; int m = (int)(grain_u(d, n, 4, 1) % 20);
+    for (int i = 0; i < m && nl + 2 < 60; i++) { name[nl++] = (i<(int)n)?d[i]:'A'; name[nl++] = 0; }
+    pool_smb2_hdr(pdu, 0x000E, &g_pool[0]);
+    uint8_t *b = pdu + 64; memset(b, 0, 32); *(uint16_t *)b = 33;
+    b[2] = (uint8_t)(1 + (grain_u(d, n, 0, 1) % 3));       /* FileInformationClass */
+    b[3] = 0x04;                                           /* Flags = SMB2_INDEX_SPECIFIED */
+    *(uint32_t *)(b + 4) = (uint32_t)grain_u(d, n, 1, 4);  /* FileIndex (resume idx, fuzzed) */
+    memcpy(b + 8, dfid, 16);
+    *(uint16_t *)(b + 24) = 64 + 32; *(uint16_t *)(b + 26) = (uint16_t)nl; *(uint32_t *)(b + 28) = 4096;
+    memcpy(pdu + 96, name, nl);
+    return pool_xact(&g_pool[0], pdu, 96 + nl, resp, sizeof(resp));
+}
+/* A4 */ static int grain_set_ea_private(const uint8_t *d, size_t n) {
+    static const char *PRIV[] = { "security.NTACL", "DOSATTRIB", "security.SMB", "$DATA", "user.DOSATTRIB" };
+    const char *nm = PRIV[grain_u(d, n, 0, 1) % 5];
+    int namelen = (int)strlen(nm), vallen = 2 + (int)(grain_u(d, n, 1, 1) % 16);
+    uint8_t ea[128]; memset(ea, 0, sizeof(ea));
+    ea[4] = (uint8_t)grain_u(d, n, 2, 1); ea[5] = (uint8_t)namelen;
+    *(uint16_t *)(ea + 6) = (uint16_t)vallen;
+    memcpy(ea + 8, nm, namelen); ea[8 + namelen] = 0;
+    for (int i = 0; i < vallen; i++) ea[8 + namelen + 1 + i] = (uint8_t)grain_u(d, n, 3 + i, 1);
+    return pool_setinfo(15, ea, 8 + namelen + 1 + vallen);
+}
+/* A5 */ static int grain_ioctl_inout_overlap(const uint8_t *d, size_t n) {
+    if (!pool_lazy(1) || !pool_ensure_fid(&g_pool[0], "iov_v")) return -1;
+    uint8_t pdu[512], resp[512];
+    pool_smb2_hdr(pdu, 0x000B, &g_pool[0]);
+    uint8_t *b = pdu + 64; memset(b, 0, 56); *(uint16_t *)b = 57;
+    *(uint32_t *)(b + 4)  = (uint32_t)grain_u(d, n, 0, 4);   /* CtlCode */
+    memcpy(b + 8, g_pool[0].fid, 16);
+    *(uint32_t *)(b + 24) = (uint32_t)grain_u(d, n, 4, 4);   /* InputOffset (overlap/exceed) */
+    *(uint32_t *)(b + 28) = (uint32_t)grain_u(d, n, 8, 4);   /* InputCount */
+    *(uint32_t *)(b + 36) = (uint32_t)grain_u(d, n, 12, 4);  /* OutputOffset */
+    *(uint32_t *)(b + 40) = (uint32_t)grain_u(d, n, 16, 4);  /* OutputCount */
+    *(uint32_t *)(b + 44) = (uint32_t)grain_u(d, n, 20, 4);  /* MaxOutputResponse */
+    *(uint32_t *)(b + 48) = 1;                               /* IS_FSCTL */
+    int extra = (int)(n > 24 ? (n - 24 > 64 ? 64 : n - 24) : 0);
+    for (int i = 0; i < extra; i++) b[56 + i] = d[24 + i];
+    return pool_xact(&g_pool[0], pdu, 64 + 56 + extra, resp, sizeof(resp));
+}
+/* A6 */ static int grain_sd_owner_group(const uint8_t *d, size_t n) {
+    if (g_pool_n < 1 || !pool_ensure_fid(&g_pool[0], "sdog_v")) return -1;
+    uint8_t sd[200]; memset(sd, 0, sizeof(sd));
+    sd[0] = 1; *(uint16_t *)(sd + 2) = 0x8000;              /* SELF_RELATIVE */
+    *(uint32_t *)(sd + 4) = (uint32_t)grain_u(d, n, 0, 4);  /* OffsetOwner (fuzzed) */
+    *(uint32_t *)(sd + 8) = (uint32_t)grain_u(d, n, 4, 4);  /* OffsetGroup (fuzzed) */
+    uint8_t *o = sd + 20; o[0] = 1; o[1] = 1 + (uint8_t)(grain_u(d, n, 8, 1) & 3); o[7] = 5;
+    for (int i = 0; i < 16; i++) o[8 + i] = (uint8_t)grain_u(d, n, 9 + i, 1);
+    int sdlen = 60;
+    uint8_t pdu[512], resp[128];
+    pool_smb2_hdr(pdu, 0x0011, &g_pool[0]);
+    uint8_t *b = pdu + 64; memset(b, 0, 32); *(uint16_t *)b = 33; b[2] = 0x03;
+    *(uint32_t *)(b + 4) = sdlen; *(uint16_t *)(b + 8) = 64 + 32;
+    *(uint32_t *)(b + 12) = 0x03;                           /* OWNER|GROUP info */
+    memcpy(b + 16, g_pool[0].fid, 16); memcpy(b + 32, sd, sdlen);
+    return pool_xact(&g_pool[0], pdu, 64 + 32 + sdlen, resp, sizeof(resp));
+}
+/* A7 */ static int grain_sd_sacl(const uint8_t *d, size_t n) {
+    if (g_pool_n < 1 || !pool_ensure_fid(&g_pool[0], "sacl_v")) return -1;
+    uint8_t sd[300]; memset(sd, 0, sizeof(sd));
+    sd[0] = 1; *(uint16_t *)(sd + 2) = 0x8010;              /* SACL_PRESENT | SELF_RELATIVE */
+    *(uint32_t *)(sd + 12) = 20;                            /* OffsetSacl */
+    uint8_t *acl = sd + 20; acl[0] = 2;
+    int nace = 1 + (int)(grain_u(d, n, 0, 1) % 3); *(uint16_t *)(acl + 4) = (uint16_t)nace;
+    int off = 8;
+    for (int i = 0; i < nace && off < 260; i++) {
+        uint8_t *ace = acl + off; ace[0] = 0x02;            /* SYSTEM_AUDIT_ACE */
+        ace[1] = (uint8_t)grain_u(d, n, 1 + i, 1);          /* AceFlags (SUCCESS/FAIL) */
+        *(uint32_t *)(ace + 4) = (uint32_t)grain_u(d, n, 4 + i * 4, 4);
+        uint8_t *sid = ace + 8; sid[0] = 1; sid[1] = 1; sid[7] = 5;
+        *(uint32_t *)(sid + 8) = (uint32_t)grain_u(d, n, 20 + i * 4, 4);
+        int acelen = 20; *(uint16_t *)(ace + 2) = (uint16_t)acelen; off += acelen;
+    }
+    *(uint16_t *)(acl + 2) = (uint16_t)off; int sdlen = 20 + off;
+    uint8_t pdu[512], resp[128];
+    pool_smb2_hdr(pdu, 0x0011, &g_pool[0]);
+    uint8_t *b = pdu + 64; memset(b, 0, 32); *(uint16_t *)b = 33; b[2] = 0x03;
+    *(uint32_t *)(b + 4) = sdlen; *(uint16_t *)(b + 8) = 64 + 32;
+    *(uint32_t *)(b + 12) = 0x08;                           /* SACL_SECURITY_INFORMATION */
+    memcpy(b + 16, g_pool[0].fid, 16); memcpy(b + 32, sd, sdlen);
+    return pool_xact(&g_pool[0], pdu, 64 + 32 + sdlen, resp, sizeof(resp));
+}
+/* B8 */ static int grain_durable_reconnect_race(const uint8_t *d, size_t n) {
+    uint8_t guid[16]; for (int i = 0; i < 16; i++) guid[i] = (uint8_t)grain_u(d, n, i, 1);
+    uint8_t dh[32]; memset(dh, 0, sizeof(dh));
+    *(uint32_t *)(dh + 4) = 0x02; memcpy(dh + 16, guid, 16); /* PERSISTENT + guid */
+    pool_create_with_ctx("cc_dur", "DH2Q", 4, dh, 32);
+    uint8_t pfid[16]; memcpy(pfid, g_pool[0].fid, 16);
+    uint8_t dc[36]; memset(dc, 0, sizeof(dc)); memcpy(dc, pfid, 16);
+    for (int i = 0; i < 16; i++)
+        dc[16 + i] = (grain_u(d, n, 16, 1) & 1) ? (uint8_t)grain_u(d, n, 20 + i, 1) : guid[i];
+    *(uint32_t *)(dc + 32) = (uint32_t)grain_u(d, n, 40, 4);
+    return pool_create_with_ctx("cc_dur", "DH2C", 4, dc, 36);
+}
+/* B9 */ static int grain_lease_break_ack_mismatch(const uint8_t *d, size_t n) {
+    uint8_t lc[52]; memset(lc, 0, sizeof(lc));
+    for (int i = 0; i < 16; i++) lc[i] = (uint8_t)grain_u(d, n, i, 1);   /* LeaseKey */
+    *(uint32_t *)(lc + 16) = 0x07;                          /* LeaseState RWH */
+    pool_create_with_ctx("cc_lease", "RqLs", 4, lc, 52);
+    uint8_t pdu[128], resp[128];
+    pool_smb2_hdr(pdu, 0x0012, &g_pool[0]);
+    uint8_t *b = pdu + 64; memset(b, 0, 36); *(uint16_t *)b = 36;
+    for (int i = 0; i < 16; i++)                            /* mismatched LeaseKey */
+        b[8 + i] = (grain_u(d, n, 20, 1) & 1) ? (uint8_t)grain_u(d, n, 24 + i, 1) : lc[i];
+    *(uint32_t *)(b + 24) = (uint32_t)grain_u(d, n, 40, 4); /* LeaseState (fuzzed) */
+    return pool_xact(&g_pool[0], pdu, 64 + 36, resp, sizeof(resp));
+}
+/* B10 */ static int grain_oplock_break_race(const uint8_t *d, size_t n) {
+    if (!pool_lazy(2)) return -1;
+    if (!pool_ensure_fid(&g_pool[0], "opl_shared")) return -1;
+    pool_create_file(&g_pool[1], "opl_shared");             /* 2nd opener → break to conn0 */
+    uint8_t pdu[128], resp[128];
+    pool_smb2_hdr(pdu, 0x0012, &g_pool[0]);
+    uint8_t *b = pdu + 64; memset(b, 0, 24); *(uint16_t *)b = 24;
+    b[2] = (uint8_t)grain_u(d, n, 0, 1);                    /* OplockLevel (fuzzed) */
+    memcpy(b + 8, g_pool[0].fid, 16);
+    int r = pool_xact(&g_pool[0], pdu, 64 + 24, resp, sizeof(resp));
+    pool_smb2_hdr(pdu, 0x0006, &g_pool[0]);                 /* race: close on conn0 */
+    uint8_t *cb = pdu + 64; memset(cb, 0, 24); *(uint16_t *)cb = 24; memcpy(cb + 8, g_pool[0].fid, 16);
+    pool_xact(&g_pool[0], pdu, 64 + 24, resp, sizeof(resp));
+    g_pool[0].has_fid = 0;
+    return r;
+}
+/* B11 */ static int grain_logoff_inflight(const uint8_t *d, size_t n) {
+    if (g_pool_n < 1 || !pool_ensure_fid(&g_pool[0], "logoff_v")) return -1;
+    uint8_t pdu[256], resp[256];
+    pool_smb2_hdr(pdu, 0x000A, &g_pool[0]);                 /* blocking LOCK (no FAIL_IMMEDIATELY) */
+    uint8_t *b = pdu + 64; memset(b, 0, 48); *(uint16_t *)b = 48; *(uint16_t *)(b + 2) = 1;
+    memcpy(b + 8, g_pool[0].fid, 16);
+    *(uint64_t *)(b + 24) = grain_u(d, n, 0, 8); *(uint64_t *)(b + 32) = grain_u(d, n, 8, 8);
+    *(uint32_t *)(b + 40) = 0x01;                           /* SHARED (blocking) */
+    uint32_t nb = htonl(64 + 48); (void)!write(g_pool[0].sock, &nb, 4); (void)!write(g_pool[0].sock, pdu, 64 + 48);
+    pool_smb2_hdr(pdu, 0x0002, &g_pool[0]);                 /* LOGOFF while lock inflight */
+    uint8_t *lb = pdu + 64; memset(lb, 0, 4); *(uint16_t *)lb = 4;
+    int r = pool_xact(&g_pool[0], pdu, 64 + 4, resp, sizeof(resp));
+    pool_reconnect(&g_pool[0]);                             /* session torn down → restore */
+    return r;
+}
+/* B12 */ static int grain_tdis_open_fid(const uint8_t *d, size_t n) {
+    (void)d; (void)n;
+    if (g_pool_n < 1 || !pool_ensure_fid(&g_pool[0], "tdis_open_v")) return -1;
+    uint8_t pdu[128], resp[128];
+    pool_smb2_hdr(pdu, 0x0004, &g_pool[0]);                 /* TREE_DISCONNECT (fid still open) */
+    uint8_t *b = pdu + 64; memset(b, 0, 4); *(uint16_t *)b = 4;
+    int r = pool_xact(&g_pool[0], pdu, 64 + 4, resp, sizeof(resp));
+    pool_reconnect(&g_pool[0]);                             /* tree gone → restore */
+    return r;
+}
+/* B13 */ static int grain_close_durable_scavenger(const uint8_t *d, size_t n) {
+    uint8_t dh[32]; memset(dh, 0, sizeof(dh));
+    *(uint32_t *)(dh + 0) = (uint32_t)grain_u(d, n, 0, 4);  /* Timeout (short → scavenger races) */
+    *(uint32_t *)(dh + 4) = 0x02;                           /* PERSISTENT */
+    for (int i = 0; i < 16; i++) dh[16 + i] = (uint8_t)grain_u(d, n, 4 + i, 1);
+    int r = pool_create_with_ctx("cc_dscav", "DH2Q", 4, dh, 32);
+    if (r < 144) return r;
+    uint8_t pdu[128], resp[128];
+    pool_smb2_hdr(pdu, 0x0006, &g_pool[0]);
+    uint8_t *b = pdu + 64; memset(b, 0, 24); *(uint16_t *)b = 24;
+    *(uint16_t *)(b + 2) = (uint16_t)grain_u(d, n, 20, 2);  /* Flags */
+    memcpy(b + 8, g_pool[0].fid, 16);
+    int r2 = pool_xact(&g_pool[0], pdu, 64 + 24, resp, sizeof(resp));
+    g_pool[0].has_fid = 0;
+    return r2;
+}
+/* B14 */ static int grain_cancel_async_target(const uint8_t *d, size_t n) {
+    if (g_pool_n < 1 || !pool_ensure_fid(&g_pool[0], "cancel_v")) return -1;
+    uint8_t pdu[256], resp[256];
+    uint64_t lock_mid = g_pool[0].mid;
+    pool_smb2_hdr(pdu, 0x000A, &g_pool[0]);                 /* blocking LOCK (async) */
+    uint8_t *b = pdu + 64; memset(b, 0, 48); *(uint16_t *)b = 48; *(uint16_t *)(b + 2) = 1;
+    memcpy(b + 8, g_pool[0].fid, 16);
+    *(uint64_t *)(b + 24) = grain_u(d, n, 0, 8); *(uint64_t *)(b + 32) = grain_u(d, n, 8, 8);
+    *(uint32_t *)(b + 40) = 0x01;
+    uint32_t nb = htonl(64 + 48); (void)!write(g_pool[0].sock, &nb, 4); (void)!write(g_pool[0].sock, pdu, 64 + 48);
+    pool_smb2_hdr(pdu, 0x000C, &g_pool[0]);                 /* CANCEL targeting that MID */
+    *(uint64_t *)(pdu + 24) = (grain_u(d, n, 16, 1) & 1) ? grain_u(d, n, 17, 8) : lock_mid;
+    uint8_t *cb = pdu + 64; memset(cb, 0, 4); *(uint16_t *)cb = 4;
+    int r = pool_xact(&g_pool[0], pdu, 64 + 4, resp, sizeof(resp));
+    pool_reconnect(&g_pool[0]);
+    return r;
+}
+/* B15 */ static int grain_credit_exhaust(const uint8_t *d, size_t n) {
+    if (g_pool_n < 1 || !pool_ensure_fid(&g_pool[0], "credit_v")) return -1;
+    uint8_t pdu[256], resp[256]; int last = 0;
+    for (int k = 0; k < 4; k++) {
+        pool_smb2_hdr(pdu, 0x0008, &g_pool[0]);             /* READ (length drives credit charge) */
+        *(uint16_t *)(pdu + 6)  = (uint16_t)grain_u(d, n, k * 4, 2);     /* CreditCharge (fuzzed) */
+        *(uint16_t *)(pdu + 14) = (uint16_t)grain_u(d, n, k * 4 + 2, 2); /* CreditRequest (0=drain) */
+        uint8_t *b = pdu + 64; memset(b, 0, 48); *(uint16_t *)b = 49;
+        *(uint32_t *)(b + 4) = (uint32_t)grain_u(d, n, 16 + k * 4, 4);   /* Length */
+        memcpy(b + 16, g_pool[0].fid, 16);
+        last = pool_xact(&g_pool[0], pdu, 64 + 48, resp, sizeof(resp));
+    }
+    return last;
+}
+/* B16 */ static int grain_compound_unrelated_session(const uint8_t *d, size_t n) {
+    if (!pool_lazy(1)) return -1;
+    struct pool_conn *c = &g_pool[0]; uint8_t pdu[512], resp[512];
+    int ncmd = 2 + (int)(grain_u(d, n, 0, 1) % 3), off = 0, p = 1;
+    for (int i = 0; i < ncmd && off + 72 < 480; i++) {
+        pool_smb2_hdr(pdu + off, 0x000D, c);                /* ECHO, UNRELATED */
+        *(uint32_t *)((pdu + off) + 36) = (uint32_t)grain_u(d, n, p, 4);     /* TreeId */
+        *(uint64_t *)((pdu + off) + 40) = grain_u(d, n, p + 4, 8);           /* SessionId */
+        *(uint16_t *)((pdu + off) + 64) = 4;
+        int clen = (64 + 4 + 7) & ~7;
+        *(uint32_t *)((pdu + off) + 20) = (i == ncmd - 1) ? 0 : (uint32_t)clen;
+        off += clen; p += 12;
+    }
+    return pool_xact(c, pdu, off, resp, sizeof(resp));
+}
+/* C17 */ static int grain_transform_nested(const uint8_t *d, size_t n) {
+    if (!pool_lazy(1)) return -1;
+    uint8_t pdu[512], resp[256]; memset(pdu, 0, sizeof(pdu));
+    memcpy(pdu, "\xfdSMB", 4);
+    for (int i = 0; i < 16 && i < (int)n; i++) pdu[4 + i] = d[i];
+    for (int i = 0; i < 16 && 16 + i < (int)n; i++) pdu[20 + i] = d[16 + i];
+    *(uint32_t *)(pdu + 36) = (uint32_t)grain_u(d, n, 0, 4); /* OriginalMessageSize (mismatch) */
+    *(uint16_t *)(pdu + 42) = (uint16_t)grain_u(d, n, 4, 2); /* Flags/EncryptionAlgorithm */
+    *(uint64_t *)(pdu + 44) = g_pool[0].sid;
+    memcpy(pdu + 52, "\xfdSMB", 4);                         /* nested transform (double-wrap) */
+    *(uint32_t *)(pdu + 52 + 36) = (uint32_t)grain_u(d, n, 6, 4);
+    *(uint64_t *)(pdu + 52 + 44) = g_pool[0].sid;
+    int total = 104 + (int)(grain_u(d, n, 10, 1) % 64); if (total > 500) total = 500;
+    return pool_xact(&g_pool[0], pdu, total, resp, sizeof(resp));
+}
+/* C18 */ static int grain_compress_bomb(const uint8_t *d, size_t n) {
+    if (!pool_lazy(1)) return -1;
+    uint8_t pdu[512], resp[256]; memset(pdu, 0, sizeof(pdu));
+    memcpy(pdu, "\xfcSMB", 4);                              /* compression transform magic */
+    *(uint32_t *)(pdu + 4) = (uint32_t)grain_u(d, n, 0, 4); /* OriginalCompressedSegmentSize (huge) */
+    *(uint16_t *)(pdu + 8) = (uint16_t)grain_u(d, n, 4, 2); /* CompressionAlgorithm */
+    *(uint16_t *)(pdu + 10) = (uint16_t)grain_u(d, n, 6, 2);/* Flags (CHAINED?) */
+    *(uint32_t *)(pdu + 12) = (uint32_t)grain_u(d, n, 8, 4);/* Offset/Length */
+    int blen = (int)(n > 100 ? 100 : n);
+    for (int i = 0; i < blen; i++) pdu[16 + i] = d[i];
+    return pool_xact(&g_pool[0], pdu, 16 + (blen > 4 ? blen : 4), resp, sizeof(resp));
+}
+/* C19 */ static int grain_sign_downgrade(const uint8_t *d, size_t n) {
+    if (g_pool_n < 1 || !pool_ensure_fid(&g_pool[0], "sign_v")) return -1;
+    uint8_t pdu[128], resp[128];
+    pool_smb2_hdr(pdu, 0x0008, &g_pool[0]);                 /* READ */
+    *(uint32_t *)(pdu + 16) |= 0x08;                        /* SMB2_FLAGS_SIGNED */
+    for (int i = 0; i < 16; i++) pdu[48 + i] = (uint8_t)grain_u(d, n, i, 1); /* forged Signature */
+    uint8_t *b = pdu + 64; memset(b, 0, 48); *(uint16_t *)b = 49;
+    *(uint32_t *)(b + 4) = (uint32_t)grain_u(d, n, 16, 4); memcpy(b + 16, g_pool[0].fid, 16);
+    return pool_xact(&g_pool[0], pdu, 64 + 48, resp, sizeof(resp));
+}
+/* C20 */ static int grain_preauth_hash_mismatch(const uint8_t *d, size_t n) {
+    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(445) };
+    addr.sin_addr.s_addr = inet_addr(g_target_ip);
+    int sock = socket(AF_INET, SOCK_STREAM, 0); if (sock < 0) return -1;
+    struct timeval tv = {.tv_sec = 1}; setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(sock); return -1; }
+    uint8_t pdu[512]; memset(pdu, 0, sizeof(pdu));
+    memcpy(pdu, "\xfeSMB", 4); *(uint16_t *)(pdu + 4) = 64;
+    uint8_t *b = pdu + 64;
+    *(uint16_t *)b = 36; *(uint16_t *)(b + 2) = 1; *(uint16_t *)(b + 4) = 1;
+    *(uint32_t *)(b + 8) = 0x7F; memset(b + 12, 0xAA, 16); *(uint16_t *)(b + 36) = 0x0311;
+    int ctx_off = (64 + 36 + 2 + 7) & ~7; *(uint32_t *)(b + 28) = ctx_off; *(uint16_t *)(b + 32) = 1;
+    uint8_t *ctx = pdu + ctx_off; *(uint16_t *)(ctx + 0) = 1;   /* PREAUTH_INTEGRITY */
+    int hcount = 1 + (int)(grain_u(d, n, 0, 1) % 4), slen = (int)(grain_u(d, n, 1, 1) % 40);
+    *(uint16_t *)(ctx + 2) = (uint16_t)(4 + hcount * 2 + slen); /* DataLength */
+    *(uint16_t *)(ctx + 8) = (uint16_t)hcount; *(uint16_t *)(ctx + 10) = (uint16_t)slen;
+    for (int i = 0; i < hcount; i++) *(uint16_t *)(ctx + 12 + i * 2) = (uint16_t)grain_u(d, n, 2 + i, 2);
+    int total = ctx_off + 8 + 4 + hcount * 2 + slen; if (total > 480) total = 480;
+    if (g_df_buf) g_df_buf[0] = 0;
+    uint32_t nb = htonl(total); (void)!write(sock, &nb, 4); (void)!write(sock, pdu, total);
+    uint8_t resp[512]; (void)!read(sock, resp, sizeof(resp)); close(sock);
+    return g_df_buf ? (int)g_df_buf[0] : 0;
+}
+/* C21 */ static int grain_multichannel_bind_replay(const uint8_t *d, size_t n) {
+    if (!pool_lazy(1)) return -1;
+    uint8_t pdu[512], resp[256];
+    pool_smb2_hdr(pdu, 0x0001, &g_pool[0]);                 /* SESSION_SETUP */
+    *(uint64_t *)(pdu + 40) = (grain_u(d, n, 0, 1) & 1) ? grain_u(d, n, 1, 8) : g_pool[0].sid;
+    uint8_t *b = pdu + 64; memset(b, 0, 24); *(uint16_t *)b = 25;
+    b[2] = 0x01;                                            /* SMB2_SESSION_FLAG_BINDING */
+    b[3] = 1;
+    int slen = (int)(n > 128 ? 128 : n);
+    *(uint16_t *)(b + 12) = 88; *(uint16_t *)(b + 14) = (uint16_t)slen;
+    if (slen > 0) memcpy(b + 24, d, slen);
+    int r = pool_xact(&g_pool[0], pdu, 64 + 24 + slen, resp, sizeof(resp));
+    pool_reconnect(&g_pool[0]);
+    return r;
+}
+/* D22 */ static int grain_create_path_traversal(const uint8_t *d, size_t n) {
+    if (!pool_lazy(1)) return -1;
+    static const char *SEG[] = { "..\\", "\\\\", "..", ".\\", "\\", ":" };
+    char name[128]; int nl = 0; int m = 1 + (int)(grain_u(d, n, 0, 1) % 8);
+    for (int i = 0; i < m && nl < 100; i++) {
+        const char *s = SEG[grain_u(d, n, 1 + i, 1) % 6];
+        for (int j = 0; s[j] && nl < 100; j++) name[nl++] = s[j];
+        if ((grain_u(d, n, 20 + i, 1) & 1) && nl < 100) name[nl++] = 'a' + (i % 26);
+    }
+    struct pool_conn *c = &g_pool[0]; uint8_t pdu[512], resp[256]; int u16 = nl * 2;
+    for (int i = 0; i < nl; i++) { pdu[120 + i*2] = name[i]; pdu[120 + i*2 + 1] = 0; }
+    pool_smb2_hdr(pdu, 0x0005, c);
+    uint8_t *b = pdu + 64; memset(b, 0, 56); *(uint16_t *)b = 57;
+    *(uint32_t *)(b + 24) = 0x12019F; *(uint32_t *)(b + 28) = 0x80; *(uint32_t *)(b + 32) = 0x07;
+    *(uint32_t *)(b + 36) = 0x05; *(uint32_t *)(b + 40) = 0x40;
+    *(uint16_t *)(b + 44) = 120; *(uint16_t *)(b + 46) = (uint16_t)u16;
+    return pool_xact(c, pdu, 120 + u16, resp, sizeof(resp));
+}
+/* D23 */ static int grain_stream_name_edge(const uint8_t *d, size_t n) {
+    if (!pool_lazy(1)) return -1;
+    static const char *STREAMS[] = { "f::$DATA", "f:s:$DATA", "f:s:$INDEX_ALLOCATION",
+                                     "f::", "f:::", "f:s:$BAD", ":s:$DATA" };
+    const char *nm = STREAMS[grain_u(d, n, 0, 1) % 7]; int nl = (int)strlen(nm);
+    struct pool_conn *c = &g_pool[0]; uint8_t pdu[512], resp[256]; int u16 = nl * 2;
+    for (int i = 0; i < nl; i++) { pdu[120 + i*2] = nm[i]; pdu[120 + i*2 + 1] = 0; }
+    pool_smb2_hdr(pdu, 0x0005, c);
+    uint8_t *b = pdu + 64; memset(b, 0, 56); *(uint16_t *)b = 57;
+    *(uint32_t *)(b + 24) = 0x12019F; *(uint32_t *)(b + 28) = 0x80; *(uint32_t *)(b + 32) = 0x07;
+    *(uint32_t *)(b + 36) = 0x05; *(uint32_t *)(b + 40) = 0x40;
+    *(uint16_t *)(b + 44) = 120; *(uint16_t *)(b + 46) = (uint16_t)u16;
+    return pool_xact(c, pdu, 120 + u16, resp, sizeof(resp));
+}
+/* D24 */ static int grain_unicode_surrogate(const uint8_t *d, size_t n) {
+    if (!pool_lazy(1)) return -1;
+    struct pool_conn *c = &g_pool[0]; uint8_t pdu[512], resp[256];
+    int nchars = 2 + (int)(grain_u(d, n, 0, 1) % 20), u16 = 0;
+    for (int i = 0; i < nchars && u16 + 2 < 200; i++) {
+        uint16_t ch; uint8_t sel = (uint8_t)(grain_u(d, n, 1 + i, 1) % 6);
+        if      (sel < 2) ch = 0xD800 + (uint16_t)(grain_u(d, n, 40 + i, 1) & 0x3FF); /* lone high surrogate */
+        else if (sel < 3) ch = 0xDC00 + (uint16_t)(grain_u(d, n, 40 + i, 1) & 0x3FF); /* lone low surrogate */
+        else if (sel < 4) ch = 0x0300 + (uint16_t)(grain_u(d, n, 40 + i, 1) & 0x7F);  /* combining */
+        else              ch = (uint16_t)grain_u(d, n, 60 + i * 2, 2);
+        pdu[120 + u16] = ch & 0xFF; pdu[120 + u16 + 1] = ch >> 8; u16 += 2;
+    }
+    pool_smb2_hdr(pdu, 0x0005, c);
+    uint8_t *b = pdu + 64; memset(b, 0, 56); *(uint16_t *)b = 57;
+    *(uint32_t *)(b + 24) = 0x12019F; *(uint32_t *)(b + 28) = 0x80; *(uint32_t *)(b + 32) = 0x07;
+    *(uint32_t *)(b + 36) = 0x05; *(uint32_t *)(b + 40) = 0x40;
+    *(uint16_t *)(b + 44) = 120; *(uint16_t *)(b + 46) = (uint16_t)u16;
+    return pool_xact(c, pdu, 120 + u16, resp, sizeof(resp));
+}
+/* D25 */ static int grain_rename_target_edge(const uint8_t *d, size_t n) {
+    uint8_t ri[128]; memset(ri, 0, sizeof(ri));
+    ri[0] = (uint8_t)(grain_u(d, n, 0, 1) & 1);             /* ReplaceIfExists */
+    *(uint64_t *)(ri + 8) = grain_u(d, n, 1, 8);            /* RootDirectory (fuzzed) */
+    static const char *SEG[] = { "..\\", "\\\\x", "sub\\f", ":s" };
+    char nm[64]; int nl = 0; int m = 1 + (int)(grain_u(d, n, 9, 1) % 4);
+    for (int i = 0; i < m && nl < 40; i++) { const char *s = SEG[grain_u(d, n, 10 + i, 1) % 4];
+        for (int j = 0; s[j] && nl < 40; j++) nm[nl++] = s[j]; }
+    int u16 = nl * 2;
+    *(uint32_t *)(ri + 16) = (uint32_t)((grain_u(d, n, 20, 1) & 1) ? grain_u(d, n, 21, 4) : (uint32_t)u16);
+    for (int i = 0; i < nl && 20 + i*2 < 120; i++) { ri[20 + i*2] = nm[i]; ri[20 + i*2 + 1] = 0; }
+    return pool_setinfo(10, ri, 20 + u16);                  /* FILE_RENAME_INFORMATION */
+}
+/* E26 */ static int grain_pipe_transceive_bind(const uint8_t *d, size_t n) {
+    uint8_t rpc[256]; memset(rpc, 0, sizeof(rpc));
+    rpc[0] = 5; rpc[2] = 11;                                /* v5.0, ptype=BIND */
+    rpc[3] = 0x03; *(uint32_t *)(rpc + 4) = 0x00000010;
+    *(uint16_t *)(rpc + 8)  = (uint16_t)grain_u(d, n, 0, 2);/* frag_length (fuzzed) */
+    *(uint16_t *)(rpc + 16) = (uint16_t)grain_u(d, n, 2, 2);/* max_xmit_frag */
+    *(uint16_t *)(rpc + 18) = (uint16_t)grain_u(d, n, 4, 2);/* max_recv_frag */
+    rpc[24] = (uint8_t)(1 + (grain_u(d, n, 6, 1) % 8));    /* num_ctx_items (fuzzed) */
+    int extra = (int)(n > 8 ? (n - 8 > 100 ? 100 : n - 8) : 0);
+    for (int i = 0; i < extra; i++) rpc[28 + i] = d[8 + i]; /* fuzzed ctx-list */
+    return pfz_ndr_fuzz(rpc, 28 + extra);
+}
+/* E27 */ static int grain_set_integrity_deep(const uint8_t *d, size_t n) {
+    uint8_t body[8] = {0};
+    *(uint16_t *)(body + 0) = (uint16_t)grain_u(d, n, 0, 2); /* ChecksumAlgorithm */
+    *(uint32_t *)(body + 4) = (uint32_t)grain_u(d, n, 2, 4); /* Flags */
+    return pool_ioctl(0x0009C280, body, 8, 1);              /* FSCTL_SET_INTEGRITY_INFORMATION */
+}
+/* E28 */ static int grain_query_fs_info(const uint8_t *d, size_t n) {
+    if (g_pool_n < 1 || !pool_ensure_fid(&g_pool[0], "qfs_v")) return -1;
+    uint8_t pdu[128], resp[4096];
+    pool_smb2_hdr(pdu, 0x0010, &g_pool[0]);
+    uint8_t *b = pdu + 64; memset(b, 0, 41); *(uint16_t *)b = 41;
+    b[2] = 0x02;                                            /* InfoType = FILESYSTEM */
+    b[3] = (uint8_t)(1 + (grain_u(d, n, 0, 1) % 12));       /* FsInfoClass */
+    *(uint32_t *)(b + 4) = 4096; memcpy(b + 24, g_pool[0].fid, 16);
+    return pool_xact(&g_pool[0], pdu, 64 + 41, resp, sizeof(resp));
+}
+/* E29 */ static int grain_smb1_dialects(const uint8_t *d, size_t n) {
+    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(445) };
+    addr.sin_addr.s_addr = inet_addr(g_target_ip);
+    int sock = socket(AF_INET, SOCK_STREAM, 0); if (sock < 0) return -1;
+    struct timeval tv = {.tv_sec = 1}; setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(sock); return -1; }
+    uint8_t pdu[256]; memset(pdu, 0, sizeof(pdu));
+    memcpy(pdu, "\xffSMB", 4); pdu[4] = 0x72;               /* SMB1 NEGOTIATE */
+    int bc = 0, off = 37;
+    static const char *DLC[] = { "\x02NT LM 0.12", "\x02SMB 2.002", "\x02SMB 2.???", "\x02PC NETWORK PROGRAM 1.0" };
+    int nd = 1 + (int)(grain_u(d, n, 0, 1) % 5);
+    for (int i = 0; i < nd && off < 220; i++) {
+        const char *dl = DLC[grain_u(d, n, 1 + i, 1) % 4]; int dll = (int)strlen(dl) + 1;
+        if (grain_u(d, n, 20 + i, 1) & 1) dll = (int)(grain_u(d, n, 30 + i, 1) % 20); /* fuzz len */
+        for (int j = 0; j < dll && off < 240; j++) {
+            pdu[off++] = (j < (int)strlen(dl)) ? (uint8_t)dl[j] : (uint8_t)grain_u(d, n, 40 + j, 1); bc++; }
+    }
+    *(uint16_t *)(pdu + 35) = (uint16_t)bc;                 /* ByteCount */
+    if (g_df_buf) g_df_buf[0] = 0;
+    uint32_t nb = htonl(off); (void)!write(sock, &nb, 4); (void)!write(sock, pdu, off);
+    uint8_t resp[256]; (void)!read(sock, resp, sizeof(resp)); close(sock);
+    return g_df_buf ? (int)g_df_buf[0] : 0;
+}
+/* E30 */ static int grain_fsctl_reparse_get_chain(const uint8_t *d, size_t n) {
+    uint8_t rp[128]; memset(rp, 0, sizeof(rp));
+    *(uint32_t *)(rp + 0) = 0xA000000C; int dlen = 20;
+    *(uint16_t *)(rp + 4) = (uint16_t)dlen;
+    for (int i = 8; i < 8 + dlen && i < 120; i++) rp[i] = (uint8_t)grain_u(d, n, i - 8, 1);
+    pool_ioctl(0x000900A4, rp, 8 + dlen, 1);               /* SET_REPARSE_POINT */
+    if (g_pool_n < 1) return -1;
+    uint8_t pdu[256], resp[512];
+    pool_smb2_hdr(pdu, 0x000B, &g_pool[0]);
+    uint8_t *b = pdu + 64; memset(b, 0, 56); *(uint16_t *)b = 57;
+    *(uint32_t *)(b + 4) = 0x000900A8;                      /* GET_REPARSE_POINT */
+    memcpy(b + 8, g_pool[0].fid, 16);
+    *(uint32_t *)(b + 24) = 64 + 56;
+    *(uint32_t *)(b + 44) = (uint32_t)grain_u(d, n, 0, 4);  /* MaxOutputResponse (fuzzed) */
+    *(uint32_t *)(b + 48) = 1;
+    return pool_xact(&g_pool[0], pdu, 64 + 56, resp, sizeof(resp));
+}
+/* E31 */ static int grain_query_info_ea_list(const uint8_t *d, size_t n) {
+    if (g_pool_n < 1 || !pool_ensure_fid(&g_pool[0], "qeal_v")) return -1;
+    uint8_t pdu[512], resp[2048];
+    pool_smb2_hdr(pdu, 0x0010, &g_pool[0]);
+    uint8_t *b = pdu + 64; memset(b, 0, 41); *(uint16_t *)b = 41;
+    b[2] = 0x01; b[3] = 15;                                 /* FILE_FULL_EA_INFORMATION */
+    *(uint32_t *)(b + 4) = 2048; *(uint16_t *)(b + 8) = 64 + 40;
+    uint8_t *gl = b + 40; int off = 0, p = 0, cnt = 0, eoff[8], elen[8];
+    int nent = 2 + (int)(grain_u(d, n, 0, 1) % 4);
+    for (int i = 0; i < nent && off + 8 < 200; i++) {
+        int namelen = 3 + (int)(grain_u(d, n, p + 1, 1) % 6);
+        uint8_t *e = gl + off; e[4] = (uint8_t)namelen;    /* EaNameLength */
+        for (int j = 0; j < namelen; j++) e[5 + j] = 'A' + ((p + j) % 26); e[5 + namelen] = 0;
+        int len = (5 + namelen + 1 + 3) & ~3; eoff[cnt] = off; elen[cnt] = len; cnt++;
+        off += len; p += 4;
+    }
+    for (int i = 0; i < cnt; i++) {
+        uint32_t next = (i == cnt - 1) ? 0 : (uint32_t)elen[i];
+        if (off > 0 && (grain_u(d, n, 200 + i, 1) & 1))
+            next = (uint32_t)(grain_u(d, n, 210 + i * 2, 2) % (unsigned)(off + 8));
+        *(uint32_t *)(gl + eoff[i]) = next;                /* NextEntryOffset (fuzzed) */
+    }
+    *(uint32_t *)(b + 12) = (uint32_t)off; memcpy(b + 24, g_pool[0].fid, 16);
+    return pool_xact(&g_pool[0], pdu, 64 + 40 + off, resp, sizeof(resp));
+}
+/* E32 */ static int grain_set_link_root(const uint8_t *d, size_t n) {
+    uint8_t li[128]; memset(li, 0, sizeof(li));
+    li[0] = (uint8_t)(grain_u(d, n, 0, 1) & 1);             /* ReplaceIfExists */
+    *(uint64_t *)(li + 8) = grain_u(d, n, 1, 8);            /* RootDirectory (fuzzed) */
+    int namelen = 2 + (int)(grain_u(d, n, 9, 1) % 30) * 2;
+    *(uint32_t *)(li + 16) = (uint32_t)grain_u(d, n, 10, 4);/* FileNameLength (fuzzed) */
+    for (int i = 0; i < namelen && 20 + i < 120; i++) li[20 + i] = (i < (int)n) ? d[i] : '\\';
+    return pool_setinfo(11, li, 20 + namelen);             /* FILE_LINK_INFORMATION */
+}
+
+/* ─── Batch 14 (2026-07-22): F create/ctx combos · G rd/wr edge · H lock · I session/
+ * auth state · J info-class depth · K transport/framing · L more FSCTLs. Same conventions
+ * as batches 10-13; socket-raw / state grains restore the pool via pool_reconnect(). ─── */
+
+/* F1 */ static int grain_create_ctx_dup(const uint8_t *d, size_t n) {
+    if (!pool_lazy(1)) return -1;
+    struct pool_conn *c = &g_pool[0]; uint8_t pdu[1024], resp[512];
+    const char *name = "cc_dup"; int nlen = (int)strlen(name) * 2;
+    pool_smb2_hdr(pdu, 0x0005, c);
+    uint8_t *b = pdu + 64; memset(b, 0, 56); *(uint16_t *)b = 57;
+    *(uint32_t *)(b+24)=0x12019F; *(uint32_t *)(b+28)=0x80; *(uint32_t *)(b+32)=0x07;
+    *(uint32_t *)(b+36)=0x05; *(uint32_t *)(b+40)=0x40; *(uint16_t *)(b+44)=120; *(uint16_t *)(b+46)=(uint16_t)nlen;
+    for (int i=0;i<(int)strlen(name);i++){pdu[120+i*2]=name[i];pdu[120+i*2+1]=0;}
+    int ctx=(120+nlen+7)&~7;
+    static const char T[4][4]={{'M','x','A','c'},{'Q','F','i','d'},{'A','l','S','i'},{'S','e','c','D'}};
+    const char *tag=T[grain_u(d,n,0,1)%4]; int ndup=2+(int)(grain_u(d,n,1,1)%3);
+    int off=ctx, cnt=0, coff[8], clen[8];
+    for (int i=0;i<ndup && off+48<980;i++){
+        uint8_t *cc=pdu+off; int dataoff=24; int datalen=(int)(grain_u(d,n,2+i,1)%24);
+        memset(cc,0,dataoff); *(uint16_t *)(cc+4)=16; *(uint16_t *)(cc+6)=4; *(uint16_t *)(cc+10)=dataoff;
+        *(uint32_t *)(cc+12)=(uint32_t)datalen; memcpy(cc+16,tag,4);
+        for(int j=0;j<datalen && off+dataoff+j<1000;j++) cc[dataoff+j]=(uint8_t)grain_u(d,n,10+j,1);
+        int len=(dataoff+datalen+7)&~7; coff[cnt]=off; clen[cnt]=len; cnt++; off+=len;
+    }
+    for(int i=0;i<cnt;i++) *(uint32_t *)(pdu+coff[i])=(i==cnt-1)?0:(uint32_t)clen[i];
+    *(uint32_t *)(b+48)=(uint32_t)ctx; *(uint32_t *)(b+52)=(uint32_t)(off-ctx);
+    int r=pool_xact(c,pdu,off,resp,sizeof(resp));
+    if(r>=144 && *(uint32_t*)(resp+8)==0){memcpy(c->fid,resp+128,16);c->has_fid=1;}
+    return r;
+}
+/* F2 */ static int grain_create_ctx_giant_data(const uint8_t *d, size_t n) {
+    if(!pool_lazy(1)) return -1;
+    struct pool_conn *c=&g_pool[0]; uint8_t pdu[512], resp[512];
+    const char *name="cc_giant"; int nlen=(int)strlen(name)*2;
+    pool_smb2_hdr(pdu,0x0005,c);
+    uint8_t *b=pdu+64; memset(b,0,56); *(uint16_t *)b=57;
+    *(uint32_t *)(b+24)=0x12019F; *(uint32_t *)(b+28)=0x80; *(uint32_t *)(b+32)=0x07;
+    *(uint32_t *)(b+36)=0x05; *(uint32_t *)(b+40)=0x40; *(uint16_t *)(b+44)=120; *(uint16_t *)(b+46)=(uint16_t)nlen;
+    for(int i=0;i<(int)strlen(name);i++){pdu[120+i*2]=name[i];pdu[120+i*2+1]=0;}
+    int ctx=(120+nlen+7)&~7; uint8_t *cc=pdu+ctx; int dataoff=24; memset(cc,0,dataoff);
+    *(uint16_t *)(cc+4)=16; *(uint16_t *)(cc+6)=4; *(uint16_t *)(cc+10)=dataoff;
+    *(uint32_t *)(cc+12)=(uint32_t)grain_u(d,n,0,4);   /* DataLength HUGE vs 8 real bytes */
+    memcpy(cc+16,"ExtA",4);
+    for(int i=0;i<8;i++) cc[dataoff+i]=(uint8_t)grain_u(d,n,4+i,1);
+    int cclen=dataoff+8; *(uint32_t *)(b+48)=(uint32_t)ctx; *(uint32_t *)(b+52)=(uint32_t)cclen;
+    return pool_xact(c,pdu,ctx+cclen,resp,sizeof(resp));
+}
+/* F3 */ static int grain_create_twrp(const uint8_t *d, size_t n) {
+    uint8_t tw[8]; *(uint64_t *)tw=grain_u(d,n,0,8);   /* TWrp Timestamp (FILETIME, fuzzed) */
+    return pool_create_with_ctx("cc_twrp","TWrp",4,tw,8);
+}
+/* F4 */ static int grain_create_alloc_vs_eof(const uint8_t *d, size_t n) {
+    uint8_t as[8]; *(uint64_t *)as=grain_u(d,n,0,8);   /* AllocationSize */
+    int r=pool_create_with_ctx("cc_alloc_eof","AlSi",4,as,8);
+    if(r<144) return r;
+    uint8_t eof[8]; *(uint64_t *)eof=grain_u(d,n,8,8);
+    return pool_setinfo(20, eof, 8);   /* FILE_END_OF_FILE_INFORMATION (conflict with alloc) */
+}
+/* F5 */ static int grain_create_disposition_matrix(const uint8_t *d, size_t n) {
+    if(!pool_lazy(1)) return -1;
+    struct pool_conn *c=&g_pool[0]; uint8_t pdu[256], resp[256];
+    const char *name="cc_dispo"; int nlen=(int)strlen(name)*2;
+    pool_smb2_hdr(pdu,0x0005,c);
+    uint8_t *b=pdu+64; memset(b,0,56); *(uint16_t *)b=57;
+    *(uint32_t *)(b+24)=0x12019F; *(uint32_t *)(b+28)=0x80; *(uint32_t *)(b+32)=0x07;
+    *(uint32_t *)(b+36)=(uint32_t)(grain_u(d,n,0,1)%6);   /* Disposition 0-5 */
+    *(uint32_t *)(b+40)=(uint32_t)grain_u(d,n,1,4);       /* Options (DIR/NON_DIR/DELETE_ON_CLOSE..) */
+    *(uint16_t *)(b+44)=120; *(uint16_t *)(b+46)=(uint16_t)nlen;
+    for(int i=0;i<(int)strlen(name);i++){pdu[120+i*2]=name[i];pdu[120+i*2+1]=0;}
+    return pool_xact(c,pdu,120+nlen,resp,sizeof(resp));
+}
+/* F6 */ static int grain_create_impersonation(const uint8_t *d, size_t n) {
+    if(!pool_lazy(1)) return -1;
+    struct pool_conn *c=&g_pool[0]; uint8_t pdu[256], resp[256];
+    const char *name="cc_imp"; int nlen=(int)strlen(name)*2;
+    pool_smb2_hdr(pdu,0x0005,c);
+    uint8_t *b=pdu+64; memset(b,0,56); *(uint16_t *)b=57;
+    b[2]=(uint8_t)grain_u(d,n,0,1);                       /* SecurityFlags */
+    b[3]=(uint8_t)grain_u(d,n,1,1);                       /* RequestedOplockLevel */
+    *(uint32_t *)(b+4)=(uint32_t)(grain_u(d,n,2,1)%4);   /* ImpersonationLevel 0-3 */
+    *(uint32_t *)(b+24)=0x12019F; *(uint32_t *)(b+28)=0x80; *(uint32_t *)(b+32)=0x07;
+    *(uint32_t *)(b+36)=0x05; *(uint32_t *)(b+40)=0x40; *(uint16_t *)(b+44)=120; *(uint16_t *)(b+46)=(uint16_t)nlen;
+    for(int i=0;i<(int)strlen(name);i++){pdu[120+i*2]=name[i];pdu[120+i*2+1]=0;}
+    return pool_xact(c,pdu,120+nlen,resp,sizeof(resp));
+}
+/* G7 */ static int grain_write_compound_flush(const uint8_t *d, size_t n) {
+    if(g_pool_n<1 || !pool_ensure_fid(&g_pool[0],"wcf_v")) return -1;
+    struct pool_conn *c=&g_pool[0]; uint8_t pdu[512], resp[512]; int off=0;
+    for(int k=0;k<3;k++){
+        uint16_t cmd=(k==1)?0x0007:0x0009;   /* WRITE, FLUSH, WRITE */
+        pool_smb2_hdr(pdu+off,cmd,c);
+        if(k>0) *(uint32_t*)((pdu+off)+16)=0x04;   /* RELATED */
+        uint8_t *b=pdu+off+64;
+        if(cmd==0x0009){ memset(b,0,48); int wl=(int)(grain_u(d,n,k,1)%32);
+            *(uint16_t*)b=49; *(uint16_t*)(b+2)=64+48; *(uint32_t*)(b+4)=(uint32_t)wl;
+            *(uint64_t*)(b+8)=grain_u(d,n,4+k,8); memset(b+16,0xFF,16);
+            for(int i=0;i<wl && i<(int)n;i++) b[48+i]=d[i];
+            int clen=(64+48+wl+7)&~7; *(uint32_t*)((pdu+off)+20)=(k==2)?0:(uint32_t)clen; off+=clen;
+        } else { memset(b,0,24); *(uint16_t*)b=24; memset(b+8,0xFF,16);
+            int clen=(64+24+7)&~7; *(uint32_t*)((pdu+off)+20)=(uint32_t)clen; off+=clen; }
+    }
+    return pool_xact(c,pdu,off,resp,sizeof(resp));
+}
+/* G8 */ static int grain_read_padding_edge(const uint8_t *d, size_t n) {
+    if(g_pool_n<1 || !pool_ensure_fid(&g_pool[0],"rpe_v")) return -1;
+    uint8_t pdu[128], resp[256];
+    pool_smb2_hdr(pdu,0x0008,&g_pool[0]);
+    uint8_t *b=pdu+64; memset(b,0,48); *(uint16_t*)b=49;
+    b[2]=(uint8_t)grain_u(d,n,0,1); b[3]=(uint8_t)grain_u(d,n,1,1);   /* Padding, Flags */
+    *(uint32_t*)(b+4)=(uint32_t)grain_u(d,n,2,4); *(uint64_t*)(b+8)=grain_u(d,n,6,8);
+    memcpy(b+16,g_pool[0].fid,16);
+    *(uint32_t*)(b+32)=(uint32_t)grain_u(d,n,14,4);   /* MinimumCount vs Length */
+    return pool_xact(&g_pool[0],pdu,64+48,resp,sizeof(resp));
+}
+/* G9 */ static int grain_write_zero_length(const uint8_t *d, size_t n) {
+    if(g_pool_n<1 || !pool_ensure_fid(&g_pool[0],"wzl_v")) return -1;
+    uint8_t pdu[128], resp[128];
+    pool_smb2_hdr(pdu,0x0009,&g_pool[0]);
+    uint8_t *b=pdu+64; memset(b,0,48); *(uint16_t*)b=49;
+    *(uint16_t*)(b+2)=(uint16_t)grain_u(d,n,0,2);   /* DataOffset non-zero */
+    *(uint32_t*)(b+4)=0;                              /* Length = 0 */
+    *(uint64_t*)(b+8)=grain_u(d,n,2,8); memcpy(b+16,g_pool[0].fid,16);
+    return pool_xact(&g_pool[0],pdu,64+48,resp,sizeof(resp));
+}
+/* G10 */ static int grain_write_rdma_channel(const uint8_t *d, size_t n) {
+    if(g_pool_n<1 || !pool_ensure_fid(&g_pool[0],"wrc_v")) return -1;
+    uint8_t pdu[256], resp[256];
+    pool_smb2_hdr(pdu,0x0009,&g_pool[0]);
+    uint8_t *b=pdu+64; memset(b,0,48); *(uint16_t*)b=49;
+    *(uint16_t*)(b+2)=64+48; *(uint32_t*)(b+4)=(uint32_t)grain_u(d,n,0,4);
+    *(uint64_t*)(b+8)=grain_u(d,n,4,8); memcpy(b+16,g_pool[0].fid,16);
+    *(uint32_t*)(b+32)=1+(uint32_t)(grain_u(d,n,12,1)&1);   /* Channel RDMA_V1/V1_INVALIDATE */
+    int ndesc=1+(int)(grain_u(d,n,13,1)%4);
+    *(uint16_t*)(b+40)=64+48; *(uint16_t*)(b+42)=(uint16_t)(ndesc*16);
+    uint8_t *ci=b+48; int p=14;
+    for(int i=0;i<ndesc && 48+i*16<200;i++){uint8_t *desc=ci+i*16;
+        *(uint64_t*)(desc+0)=grain_u(d,n,p,8); *(uint32_t*)(desc+8)=(uint32_t)grain_u(d,n,p+8,4);
+        *(uint32_t*)(desc+12)=(uint32_t)grain_u(d,n,p+12,4); p+=16;}
+    return pool_xact(&g_pool[0],pdu,64+48+ndesc*16,resp,sizeof(resp));
+}
+/* G11 */ static int grain_read_beyond_eof(const uint8_t *d, size_t n) {
+    if(g_pool_n<1 || !pool_ensure_fid(&g_pool[0],"rbe_v")) return -1;
+    uint8_t pdu[128], resp[256];
+    pool_smb2_hdr(pdu,0x0008,&g_pool[0]);
+    uint8_t *b=pdu+64; memset(b,0,48); *(uint16_t*)b=49;
+    *(uint32_t*)(b+4)=(uint32_t)(0xFFFFFFF0u+(grain_u(d,n,0,1)&0x0F));   /* Length huge */
+    *(uint64_t*)(b+8)=(grain_u(d,n,1,1)&1)?0xFFFFFFFFFFFFFFF0ULL:grain_u(d,n,2,8); /* Offset overflow */
+    memcpy(b+16,g_pool[0].fid,16);
+    return pool_xact(&g_pool[0],pdu,64+48,resp,sizeof(resp));
+}
+/* H12 */ static int grain_lock_unlock_mismatch(const uint8_t *d, size_t n) {
+    if(g_pool_n<1 || !pool_ensure_fid(&g_pool[0],"lum_v")) return -1;
+    uint8_t pdu[128], resp[128];
+    pool_smb2_hdr(pdu,0x000A,&g_pool[0]);
+    uint8_t *b=pdu+64; memset(b,0,48); *(uint16_t*)b=48; *(uint16_t*)(b+2)=1;
+    *(uint32_t*)(b+4)=(uint32_t)grain_u(d,n,0,4);   /* LockSequenceNumber (mismatch) */
+    memcpy(b+8,g_pool[0].fid,16);
+    *(uint64_t*)(b+24)=grain_u(d,n,4,8); *(uint64_t*)(b+32)=grain_u(d,n,12,8);
+    *(uint32_t*)(b+40)=0x04;   /* UNLOCK a range never locked */
+    return pool_xact(&g_pool[0],pdu,64+48,resp,sizeof(resp));
+}
+/* H13 */ static int grain_lock_shared_excl_conflict(const uint8_t *d, size_t n) {
+    if(!pool_lazy(2)) return -1;
+    if(!pool_ensure_fid(&g_pool[0],"lse_shared") || !pool_ensure_fid(&g_pool[1],"lse_shared")) return -1;
+    uint64_t off=grain_u(d,n,0,8), len=grain_u(d,n,8,8);
+    uint8_t pdu[128], resp[128];
+    pool_smb2_hdr(pdu,0x000A,&g_pool[0]);
+    { uint8_t *b=pdu+64; memset(b,0,48); *(uint16_t*)b=48; *(uint16_t*)(b+2)=1;
+      memcpy(b+8,g_pool[0].fid,16); *(uint64_t*)(b+24)=off; *(uint64_t*)(b+32)=len;
+      *(uint32_t*)(b+40)=0x01|0x10; }   /* SHARED | FAIL_IMMEDIATELY */
+    pool_xact(&g_pool[0],pdu,64+48,resp,sizeof(resp));
+    pool_smb2_hdr(pdu,0x000A,&g_pool[1]);
+    { uint8_t *b=pdu+64; memset(b,0,48); *(uint16_t*)b=48; *(uint16_t*)(b+2)=1;
+      memcpy(b+8,g_pool[1].fid,16); *(uint64_t*)(b+24)=off; *(uint64_t*)(b+32)=len;
+      *(uint32_t*)(b+40)=0x02|0x10; }   /* EXCLUSIVE | FAIL_IMMEDIATELY on same range */
+    return pool_xact(&g_pool[1],pdu,64+48,resp,sizeof(resp));
+}
+/* H14 */ static int grain_lock_reflexive(const uint8_t *d, size_t n) {
+    if(g_pool_n<1 || !pool_ensure_fid(&g_pool[0],"lrx_v")) return -1;
+    uint64_t off=grain_u(d,n,0,8), len=grain_u(d,n,8,8);
+    uint8_t pdu[128], resp[128]; int r=0;
+    for(int k=0;k<2;k++){
+        pool_smb2_hdr(pdu,0x000A,&g_pool[0]);
+        uint8_t *b=pdu+64; memset(b,0,48); *(uint16_t*)b=48; *(uint16_t*)(b+2)=1;
+        memcpy(b+8,g_pool[0].fid,16); *(uint64_t*)(b+24)=off; *(uint64_t*)(b+32)=len;
+        *(uint32_t*)(b+40)=(uint32_t)(grain_u(d,n,16,4)|0x10);   /* identical range twice */
+        r=pool_xact(&g_pool[0],pdu,64+48,resp,sizeof(resp));
+    }
+    return r;
+}
+/* I15 */ static int grain_session_reauth_switch(const uint8_t *d, size_t n) {
+    if(!pool_lazy(1)) return -1;
+    uint8_t pdu[512], resp[256];
+    pool_smb2_hdr(pdu,0x0001,&g_pool[0]);
+    *(uint64_t*)(pdu+40)=g_pool[0].sid;   /* re-auth on the EXISTING session */
+    uint8_t *b=pdu+64; memset(b,0,24); *(uint16_t*)b=25; b[3]=1;
+    int slen=(int)(n>150?150:n);
+    *(uint16_t*)(b+12)=88; *(uint16_t*)(b+14)=(uint16_t)slen;
+    if(slen>0) memcpy(b+24,d,slen);   /* different-user NTLMSSP blob (fuzzed) */
+    int r=pool_xact(&g_pool[0],pdu,64+24+slen,resp,sizeof(resp));
+    pool_reconnect(&g_pool[0]);
+    return r;
+}
+/* I16 */ static int grain_guest_anon_auth(const uint8_t *d, size_t n) {
+    struct sockaddr_in addr={.sin_family=AF_INET,.sin_port=htons(445)};
+    addr.sin_addr.s_addr=inet_addr(g_target_ip);
+    int sock=socket(AF_INET,SOCK_STREAM,0); if(sock<0) return -1;
+    struct timeval tv={.tv_sec=1}; setsockopt(sock,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv));
+    if(connect(sock,(struct sockaddr*)&addr,sizeof(addr))<0){close(sock);return -1;}
+    uint8_t neg[128]; memset(neg,0,sizeof(neg)); memcpy(neg,"\xfeSMB",4); *(uint16_t*)(neg+4)=64;
+    {uint8_t*nb2=neg+64;*(uint16_t*)nb2=36;*(uint16_t*)(nb2+2)=1;*(uint16_t*)(nb2+36)=0x0311;}
+    uint32_t nl=htonl(64+38); (void)!write(sock,&nl,4); (void)!write(sock,neg,64+38);
+    uint8_t tmp[512]; (void)!read(sock,tmp,sizeof(tmp));
+    uint8_t pdu[256]; memset(pdu,0,sizeof(pdu)); memcpy(pdu,"\xfeSMB",4);
+    *(uint16_t*)(pdu+4)=64; *(uint16_t*)(pdu+12)=1;   /* SESSION_SETUP */
+    uint8_t *b=pdu+64; *(uint16_t*)b=25; b[3]=1;
+    uint8_t ntlm[32]; memset(ntlm,0,sizeof(ntlm)); memcpy(ntlm,"NTLMSSP\0",8);
+    *(uint32_t*)(ntlm+8)=1;                            /* type 1 NEGOTIATE */
+    *(uint32_t*)(ntlm+12)=(uint32_t)grain_u(d,n,0,4); /* NegotiateFlags (fuzzed; ANONYMOUS?) */
+    *(uint16_t*)(b+12)=88; *(uint16_t*)(b+14)=32; memcpy(b+24,ntlm,32);
+    int total=64+24+32;
+    if(g_df_buf) g_df_buf[0]=0;
+    uint32_t nb=htonl(total); (void)!write(sock,&nb,4); (void)!write(sock,pdu,total);
+    uint8_t resp[256]; (void)!read(sock,resp,sizeof(resp)); close(sock);
+    return g_df_buf?(int)g_df_buf[0]:0;
+}
+/* I17 */ static int grain_logoff_reuse_sid(const uint8_t *d, size_t n) {
+    if(!pool_lazy(1)) return -1;
+    uint64_t stale=g_pool[0].sid; uint8_t pdu[128], resp[128];
+    pool_smb2_hdr(pdu,0x0002,&g_pool[0]);   /* LOGOFF */
+    {uint8_t*b=pdu+64;memset(b,0,4);*(uint16_t*)b=4;}
+    pool_xact(&g_pool[0],pdu,64+4,resp,sizeof(resp));
+    pool_smb2_hdr(pdu,0x000D,&g_pool[0]);   /* ECHO reusing the stale SessionId */
+    *(uint64_t*)(pdu+40)=(grain_u(d,n,0,1)&1)?grain_u(d,n,1,8):stale;
+    {uint8_t*b=pdu+64;memset(b,0,4);*(uint16_t*)b=4;}
+    int r=pool_xact(&g_pool[0],pdu,64+4,resp,sizeof(resp));
+    g_pool[0].sid=0; pool_reconnect(&g_pool[0]);
+    return r;
+}
+/* I18 */ static int grain_tcon_ipc_vs_disk(const uint8_t *d, size_t n) {
+    if(!pool_lazy(1)) return -1;
+    struct pool_conn *c=&g_pool[0]; uint8_t pdu[256], resp[256];
+    const uint8_t ipc[]={'\\',0,'\\',0,'1',0,'2',0,'7',0,'.',0,'0',0,'.',0,'0',0,'.',0,'1',0,'\\',0,'I',0,'P',0,'C',0,'$',0};
+    pool_smb2_hdr(pdu,0x0003,c);
+    {uint8_t*b=pdu+64;*(uint16_t*)b=9;*(uint16_t*)(b+4)=72;*(uint16_t*)(b+6)=sizeof(ipc);memcpy(b+8,ipc,sizeof(ipc));}
+    int r=pool_xact(c,pdu,64+8+sizeof(ipc),resp,sizeof(resp));
+    uint32_t ipc_tid=0; if(r>40) ipc_tid=*(uint32_t*)(resp+36);
+    if(!ipc_tid) return -1;
+    uint32_t saved=c->tid; c->tid=ipc_tid;
+    const char *name="ipc_confuse"; int nlen=(int)strlen(name)*2;
+    pool_smb2_hdr(pdu,0x0005,c);   /* disk CREATE on the IPC$ tid → tree-type confusion */
+    {uint8_t*b=pdu+64;memset(b,0,56);*(uint16_t*)b=57;
+     *(uint32_t*)(b+24)=0x12019F;*(uint32_t*)(b+28)=0x80;*(uint32_t*)(b+32)=0x07;
+     *(uint32_t*)(b+36)=0x05;*(uint32_t*)(b+40)=0x40;*(uint16_t*)(b+44)=120;*(uint16_t*)(b+46)=(uint16_t)nlen;
+     for(int i=0;i<(int)strlen(name);i++){pdu[120+i*2]=name[i];pdu[120+i*2+1]=0;}}
+    int r2=pool_xact(c,pdu,120+nlen,resp,sizeof(resp));
+    c->tid=saved; (void)d;(void)n;
+    return r2;
+}
+/* J19 */ static int grain_query_all_info(const uint8_t *d, size_t n) {
+    if(g_pool_n<1 || !pool_ensure_fid(&g_pool[0],"qai_v")) return -1;
+    uint8_t pdu[128], resp[4096];
+    pool_smb2_hdr(pdu,0x0010,&g_pool[0]);
+    uint8_t *b=pdu+64; memset(b,0,41); *(uint16_t*)b=41; b[2]=0x01; b[3]=18; /* FILE_ALL_INFORMATION */
+    *(uint32_t*)(b+4)=(uint32_t)grain_u(d,n,0,4); memcpy(b+24,g_pool[0].fid,16);
+    return pool_xact(&g_pool[0],pdu,64+41,resp,sizeof(resp));
+}
+/* J20 */ static int grain_set_basic_time_edge(const uint8_t *d, size_t n) {
+    uint8_t bi[40]; memset(bi,0,sizeof(bi));
+    static const uint64_t T[]={0,1,0x7FFFFFFFFFFFFFFFULL,0xFFFFFFFFFFFFFFFFULL,0x8000000000000000ULL};
+    for(int i=0;i<4;i++) *(uint64_t*)(bi+i*8)=(grain_u(d,n,i,1)&1)?grain_u(d,n,8+i*8,8):T[grain_u(d,n,i,1)%5];
+    *(uint32_t*)(bi+32)=(uint32_t)grain_u(d,n,4,4);   /* Attributes */
+    return pool_setinfo(4, bi, 40);   /* FILE_BASIC_INFORMATION (ksmbd_NTtimeToUnix edge) */
+}
+/* J21 */ static int grain_query_stream_info(const uint8_t *d, size_t n) {
+    if(g_pool_n<1 || !pool_ensure_fid(&g_pool[0],"qsi_v")) return -1;
+    uint8_t pdu[128], resp[4096];
+    pool_smb2_hdr(pdu,0x0010,&g_pool[0]);
+    uint8_t *b=pdu+64; memset(b,0,41); *(uint16_t*)b=41; b[2]=0x01; b[3]=22; /* FILE_STREAM_INFORMATION */
+    *(uint32_t*)(b+4)=(uint32_t)grain_u(d,n,0,4); memcpy(b+24,g_pool[0].fid,16);
+    return pool_xact(&g_pool[0],pdu,64+41,resp,sizeof(resp));
+}
+/* J22 */ static int grain_set_pipe_info(const uint8_t *d, size_t n) {
+    if(!pool_lazy(1)) return -1;
+    struct pool_conn *c=&g_pool[0]; uint8_t pdu[256], resp[256];
+    const uint8_t ipc[]={'\\',0,'\\',0,'1',0,'2',0,'7',0,'.',0,'0',0,'.',0,'0',0,'.',0,'1',0,'\\',0,'I',0,'P',0,'C',0,'$',0};
+    pool_smb2_hdr(pdu,0x0003,c);
+    {uint8_t*b=pdu+64;*(uint16_t*)b=9;*(uint16_t*)(b+4)=72;*(uint16_t*)(b+6)=sizeof(ipc);memcpy(b+8,ipc,sizeof(ipc));}
+    int r=pool_xact(c,pdu,64+8+sizeof(ipc),resp,sizeof(resp));
+    uint32_t ipc_tid=0; if(r>40) ipc_tid=*(uint32_t*)(resp+36);
+    if(!ipc_tid) return -1;
+    uint32_t saved=c->tid; c->tid=ipc_tid;
+    const uint8_t pn[]={'s',0,'r',0,'v',0,'s',0,'v',0,'c',0};
+    pool_smb2_hdr(pdu,0x0005,c);
+    {uint8_t*b=pdu+64;memset(b,0,56);*(uint16_t*)b=57;*(uint32_t*)(b+24)=0x12019F;
+     *(uint32_t*)(b+32)=0x07;*(uint32_t*)(b+36)=0x01;*(uint16_t*)(b+44)=120;*(uint16_t*)(b+46)=sizeof(pn);
+     memcpy(pdu+120,pn,sizeof(pn));}
+    int rc=pool_xact(c,pdu,120+sizeof(pn),resp,sizeof(resp));
+    int ok=(rc>=144 && *(uint32_t*)(resp+8)==0); uint8_t pfid[16];
+    if(ok){ memcpy(pfid,resp+128,16);
+        pool_smb2_hdr(pdu,0x0011,c);
+        uint8_t *b=pdu+64; memset(b,0,32); *(uint16_t*)b=33; b[2]=1; b[3]=23; /* FILE_PIPE_INFORMATION */
+        *(uint32_t*)(b+4)=8; *(uint16_t*)(b+8)=64+32; memcpy(b+16,pfid,16);
+        *(uint32_t*)(b+32)=(uint32_t)grain_u(d,n,0,4); *(uint32_t*)(b+36)=(uint32_t)grain_u(d,n,4,4);
+        rc=pool_xact(c,pdu,64+32+8,resp,sizeof(resp)); }
+    c->tid=saved;
+    return rc;
+}
+/* J23 */ static int grain_query_network_openinfo(const uint8_t *d, size_t n) {
+    if(g_pool_n<1 || !pool_ensure_fid(&g_pool[0],"qno_v")) return -1;
+    static const uint8_t CLS[]={34,6,35,5,21};   /* NETWORK_OPEN/INTERNAL/ATTR_TAG/STANDARD/EA */
+    uint8_t pdu[128], resp[2048];
+    pool_smb2_hdr(pdu,0x0010,&g_pool[0]);
+    uint8_t *b=pdu+64; memset(b,0,41); *(uint16_t*)b=41; b[2]=0x01; b[3]=CLS[grain_u(d,n,0,1)%5];
+    *(uint32_t*)(b+4)=(uint32_t)grain_u(d,n,1,4); memcpy(b+24,g_pool[0].fid,16);
+    return pool_xact(&g_pool[0],pdu,64+41,resp,sizeof(resp));
+}
+/* K24 */ static int grain_pipelined_requests(const uint8_t *d, size_t n) {
+    if(!pool_lazy(1)) return -1;
+    uint8_t pdu[128]; int nreq=4+(int)(grain_u(d,n,0,1)%20);
+    for(int i=0;i<nreq;i++){ pool_smb2_hdr(pdu,0x000D,&g_pool[0]);
+        uint8_t *b=pdu+64; memset(b,0,4); *(uint16_t*)b=4;
+        uint32_t nb=htonl(64+4);
+        if(write(g_pool[0].sock,&nb,4)<0) break;
+        if(write(g_pool[0].sock,pdu,64+4)<0) break; }
+    uint8_t resp[256]; int r=(int)read(g_pool[0].sock,resp,sizeof(resp));
+    pool_reconnect(&g_pool[0]);
+    return r>0?r:0;
+}
+/* K25 */ static int grain_oversize_pdu(const uint8_t *d, size_t n) {
+    if(!pool_lazy(1)) return -1;
+    uint8_t pdu[600]; memset(pdu,0,sizeof(pdu));
+    pool_smb2_hdr(pdu,0x0009,&g_pool[0]);
+    uint8_t *b=pdu+64; *(uint16_t*)b=49; *(uint16_t*)(b+2)=64+48;
+    *(uint32_t*)(b+4)=(uint32_t)grain_u(d,n,0,4);   /* Length huge */
+    if(g_pool[0].has_fid) memcpy(b+16,g_pool[0].fid,16); else memset(b+16,0xFF,16);
+    int body=(int)(grain_u(d,n,4,2)%400);
+    uint32_t claim=(uint32_t)(0x00FFFFF0u+(grain_u(d,n,6,1)&0x0F));   /* near-max RFC1001 len */
+    uint32_t nb=htonl(claim);
+    (void)!write(g_pool[0].sock,&nb,4); (void)!write(g_pool[0].sock,pdu,64+48+body);
+    uint8_t resp[256]; int r=(int)read(g_pool[0].sock,resp,sizeof(resp));
+    pool_reconnect(&g_pool[0]);
+    return r>0?r:0;
+}
+/* K26 */ static int grain_partial_pdu_dribble(const uint8_t *d, size_t n) {
+    if(!pool_lazy(1)) return -1;
+    uint8_t pdu[128]; pool_smb2_hdr(pdu,0x000D,&g_pool[0]);
+    uint8_t *b=pdu+64; memset(b,0,4); *(uint16_t*)b=4;
+    int len=64+4; uint32_t nb=htonl(len);
+    (void)!write(g_pool[0].sock,&nb,4);
+    for(int i=0;i<len;i++) (void)!write(g_pool[0].sock,pdu+i,1);   /* one byte at a time */
+    uint8_t resp[128]; int r=(int)read(g_pool[0].sock,resp,sizeof(resp));
+    (void)d;(void)n;
+    return r>0?r:0;
+}
+/* K27 */ static int grain_compound_padding(const uint8_t *d, size_t n) {
+    if(!pool_lazy(1)) return -1;
+    struct pool_conn *c=&g_pool[0]; uint8_t pdu[1024], resp[512];
+    int ncmd=2+(int)(grain_u(d,n,0,1)%3), off=0, p=1;
+    for(int i=0;i<ncmd && off+128<980;i++){
+        pool_smb2_hdr(pdu+off,0x000D,c); *(uint16_t*)((pdu+off)+64)=4;
+        int real=(64+4+7)&~7;
+        uint32_t pad=(uint32_t)((real+8+(grain_u(d,n,p,1)%48)+7)&~7);   /* NextCommand > real (gap) */
+        *(uint32_t*)((pdu+off)+20)=(i==ncmd-1)?0:pad;
+        off += (i==ncmd-1)?real:(int)pad; p++;
+    }
+    return pool_xact(c,pdu,off,resp,sizeof(resp));
+}
+/* L28 */ static int grain_fsctl_set_object_id(const uint8_t *d, size_t n) {
+    uint8_t body[64]; for(int i=0;i<64;i++) body[i]=(uint8_t)grain_u(d,n,i%32,1);
+    return pool_ioctl(0x00090098, body, 64, 1);   /* FSCTL_SET_OBJECT_ID */
+}
+/* L29 */ static int grain_fsctl_lmr_set_link(const uint8_t *d, size_t n) {
+    uint8_t body[64]; memset(body,0,sizeof(body));
+    *(uint32_t*)(body+0)=(uint32_t)grain_u(d,n,0,4); *(uint32_t*)(body+4)=(uint32_t)grain_u(d,n,4,4);
+    for(int i=8;i<56 && i-8<(int)n;i++) body[i]=(uint8_t)grain_u(d,n,i-8,1);
+    return pool_ioctl(0x001400EC, body, 56, 1);   /* LMR_SET_LINK_TRACKING_INFORMATION */
+}
+/* L30 */ static int grain_fsctl_query_file_regions(const uint8_t *d, size_t n) {
+    uint8_t body[20]; memset(body,0,sizeof(body));
+    *(uint64_t*)(body+0)=grain_u(d,n,0,8); *(uint64_t*)(body+8)=grain_u(d,n,8,8);
+    return pool_ioctl(0x00090284, body, 20, 1);   /* FSCTL_QUERY_FILE_REGIONS */
+}
+/* L31 */ static int grain_fsctl_duplicate_extents_v2(const uint8_t *d, size_t n) {
+    if(g_pool_n<1 || !pool_ensure_fid(&g_pool[0],"dupex2_v")) return -1;
+    uint8_t body[56]; memset(body,0,sizeof(body));
+    *(uint64_t*)(body+0)=48; memcpy(body+8,g_pool[0].fid,16);   /* SourceFileId */
+    *(uint64_t*)(body+24)=grain_u(d,n,0,8); *(uint64_t*)(body+32)=grain_u(d,n,8,8);
+    *(uint64_t*)(body+40)=grain_u(d,n,16,8); *(uint32_t*)(body+48)=(uint32_t)grain_u(d,n,24,4);
+    return pool_ioctl(0x000983E8, body, 56, 1);   /* DUPLICATE_EXTENTS_TO_FILE_EX */
+}
+/* L32 */ static int grain_fsctl_offload_read_token(const uint8_t *d, size_t n) {
+    if(g_pool_n<1 || !pool_ensure_fid(&g_pool[0],"offr_v")) return -1;
+    uint8_t rin[32]; memset(rin,0,sizeof(rin));
+    *(uint32_t*)(rin+0)=32; *(uint32_t*)(rin+8)=(uint32_t)grain_u(d,n,0,4);
+    *(uint64_t*)(rin+16)=grain_u(d,n,4,8); *(uint64_t*)(rin+24)=grain_u(d,n,12,8);
+    uint8_t pdu[256], resp[1024];
+    pool_smb2_hdr(pdu,0x000B,&g_pool[0]);
+    uint8_t *b=pdu+64; memset(b,0,56); *(uint16_t*)b=57; *(uint32_t*)(b+4)=0x00094264; /* OFFLOAD_READ */
+    memcpy(b+8,g_pool[0].fid,16); *(uint32_t*)(b+24)=64+56; *(uint32_t*)(b+28)=32;
+    *(uint32_t*)(b+44)=1024; *(uint32_t*)(b+48)=1; memcpy(b+56,rin,32);
+    int r=pool_xact(&g_pool[0],pdu,64+56+32,resp,sizeof(resp));
+    uint8_t token[512]; memset(token,0,sizeof(token));
+    if(r>=64+48){ uint32_t oo=*(uint32_t*)(resp+64+36), oc=*(uint32_t*)(resp+64+40);
+        if(oc>=16 && oo+16<=(uint32_t)r){ int t=(int)(oc>512?512:oc); if(oo+(uint32_t)t<=(uint32_t)r) memcpy(token,resp+oo,t); } }
+    uint8_t win[544]; memset(win,0,sizeof(win));   /* 32B header + 512B token = 544 */
+    *(uint32_t*)(win+0)=544; *(uint64_t*)(win+8)=grain_u(d,n,20,8);
+    *(uint64_t*)(win+16)=grain_u(d,n,28,8); *(uint64_t*)(win+24)=grain_u(d,n,36,8);
+    memcpy(win+32,token,512);
+    if(grain_u(d,n,44,1)&1) for(int i=0;i<16;i++) win[32+i]=(uint8_t)grain_u(d,n,45+i,1); /* corrupt token */
+    uint8_t pdu2[720]; memset(pdu2,0,sizeof(pdu2));
+    pool_smb2_hdr(pdu2,0x000B,&g_pool[0]);
+    uint8_t *b2=pdu2+64; memset(b2,0,56); *(uint16_t*)b2=57; *(uint32_t*)(b2+4)=0x00098268; /* OFFLOAD_WRITE */
+    memcpy(b2+8,g_pool[0].fid,16); *(uint32_t*)(b2+24)=64+56; *(uint32_t*)(b2+28)=544;
+    *(uint32_t*)(b2+44)=1024; *(uint32_t*)(b2+48)=1; memcpy(b2+56,win,544);
+    return pool_xact(&g_pool[0],pdu2,64+56+544,resp,sizeof(resp));
+}
+
+/* ─── Batch 15 (2026-07-22): M crypto/signing deep · N durable/lease/oplock state ·
+ * O vfs/path/xattr · P rd/wr/copy data-path · Q info/query edges · R conn lifecycle.
+ * Diminishing returns past here — validate coverage before batch 16. Same conventions. ── */
+
+/* M1 */ static int grain_encrypt_then_compound(const uint8_t *d, size_t n) {
+    if(!pool_lazy(1)) return -1;
+    uint8_t pdu[512], resp[256]; memset(pdu,0,sizeof(pdu));
+    memcpy(pdu,"\xfdSMB",4);
+    for(int i=0;i<16 && i<(int)n;i++) pdu[4+i]=d[i];
+    for(int i=0;i<16 && 16+i<(int)n;i++) pdu[20+i]=d[16+i];
+    *(uint16_t*)(pdu+42)=(uint16_t)grain_u(d,n,0,2); *(uint64_t*)(pdu+44)=g_pool[0].sid;
+    int off=52;   /* "ciphertext" = a 2-cmd ECHO compound (parsed after decrypt attempt) */
+    for(int k=0;k<2;k++){uint8_t*h=pdu+off;memcpy(h,"\xfeSMB",4);*(uint16_t*)(h+4)=64;
+        *(uint16_t*)(h+12)=0x000D;*(uint16_t*)(h+64)=4;int cl=(64+4+7)&~7;
+        *(uint32_t*)(h+20)=(k==0)?(uint32_t)cl:0;off+=cl;}
+    *(uint32_t*)(pdu+36)=(uint32_t)(off-52);   /* OriginalMessageSize */
+    return pool_xact(&g_pool[0],pdu,off,resp,sizeof(resp));
+}
+/* M2 */ static int grain_sign_compound_mixed(const uint8_t *d, size_t n) {
+    if(!pool_lazy(1)) return -1;
+    struct pool_conn *c=&g_pool[0]; uint8_t pdu[512], resp[512]; int ncmd=3, off=0;
+    for(int i=0;i<ncmd;i++){ pool_smb2_hdr(pdu+off,0x000D,c);
+        if(grain_u(d,n,i,1)&1){ *(uint32_t*)((pdu+off)+16)|=0x08;   /* SIGNED (some cmds only) */
+            for(int j=0;j<16;j++) (pdu+off)[48+j]=(uint8_t)grain_u(d,n,4+j,1); }
+        *(uint16_t*)((pdu+off)+64)=4; int cl=(64+4+7)&~7;
+        *(uint32_t*)((pdu+off)+20)=(i==ncmd-1)?0:(uint32_t)cl; off+=cl; }
+    return pool_xact(c,pdu,off,resp,sizeof(resp));
+}
+/* M3 */ static int grain_encrypt_wrong_session(const uint8_t *d, size_t n) {
+    if(!pool_lazy(1)) return -1;
+    uint8_t pdu[256], resp[256]; memset(pdu,0,sizeof(pdu)); memcpy(pdu,"\xfdSMB",4);
+    for(int i=0;i<16 && i<(int)n;i++) pdu[4+i]=d[i];
+    for(int i=0;i<16 && 16+i<(int)n;i++) pdu[20+i]=d[16+i];
+    *(uint32_t*)(pdu+36)=(uint32_t)grain_u(d,n,0,4); *(uint16_t*)(pdu+42)=(uint16_t)grain_u(d,n,4,2);
+    *(uint64_t*)(pdu+44)=(grain_u(d,n,6,1)&1)?grain_u(d,n,7,8):(g_pool[0].sid^1); /* WRONG SessionId */
+    int blen=(int)(n>150?150:n); if(blen>0) memcpy(pdu+52,d,blen);
+    return pool_xact(&g_pool[0],pdu,52+(blen>4?blen:4),resp,sizeof(resp));
+}
+/* M4 */ static int grain_gss_mechlist_mic(const uint8_t *d, size_t n) {
+    if(!pool_lazy(1)) return -1;
+    uint8_t pdu[512], resp[256];
+    pool_smb2_hdr(pdu,0x0001,&g_pool[0]);
+    uint8_t *b=pdu+64; memset(b,0,24); *(uint16_t*)b=25; b[3]=1;
+    uint8_t sec[256]; int sl=0;
+    sec[sl++]=0x60; sec[sl++]=(uint8_t)grain_u(d,n,0,1);
+    sec[sl++]=0x06; sec[sl++]=0x06; memcpy(sec+sl,"\x2b\x06\x01\x05\x05\x02",6); sl+=6;
+    sec[sl++]=0xA0; sec[sl++]=(uint8_t)grain_u(d,n,1,1);
+    sec[sl++]=0x30; sec[sl++]=(uint8_t)grain_u(d,n,2,1);
+    sec[sl++]=0xA3; sec[sl++]=(uint8_t)grain_u(d,n,3,1);   /* [3] mechListMIC */
+    sec[sl++]=0x04; sec[sl++]=(uint8_t)grain_u(d,n,4,1);   /* OCTET STRING fuzzed len */
+    int extra=(int)(grain_u(d,n,5,1)%40);
+    for(int i=0;i<extra && sl<240;i++) sec[sl++]=(uint8_t)grain_u(d,n,6+i,1);
+    *(uint16_t*)(b+12)=88; *(uint16_t*)(b+14)=(uint16_t)sl; memcpy(b+24,sec,sl);
+    int r=pool_xact(&g_pool[0],pdu,64+24+sl,resp,sizeof(resp)); pool_reconnect(&g_pool[0]); return r;
+}
+/* M5 */ static int grain_negotiate_signing_ctx(const uint8_t *d, size_t n) {
+    struct sockaddr_in addr={.sin_family=AF_INET,.sin_port=htons(445)};
+    addr.sin_addr.s_addr=inet_addr(g_target_ip);
+    int sock=socket(AF_INET,SOCK_STREAM,0); if(sock<0) return -1;
+    struct timeval tv={.tv_sec=1}; setsockopt(sock,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv));
+    if(connect(sock,(struct sockaddr*)&addr,sizeof(addr))<0){close(sock);return -1;}
+    uint8_t pdu[512]; memset(pdu,0,sizeof(pdu)); memcpy(pdu,"\xfeSMB",4); *(uint16_t*)(pdu+4)=64;
+    uint8_t *b=pdu+64; *(uint16_t*)b=36; *(uint16_t*)(b+2)=1; *(uint16_t*)(b+4)=1;
+    *(uint32_t*)(b+8)=0x7F; memset(b+12,0xAA,16); *(uint16_t*)(b+36)=0x0311;
+    int ctx_off=(64+36+2+7)&~7; *(uint32_t*)(b+28)=ctx_off; *(uint16_t*)(b+32)=1;
+    uint8_t *ctx=pdu+ctx_off; *(uint16_t*)(ctx+0)=8;   /* SMB2_SIGNING_CAPABILITIES */
+    int sc=1+(int)(grain_u(d,n,0,1)%6); *(uint16_t*)(ctx+2)=(uint16_t)(2+sc*2); *(uint16_t*)(ctx+8)=(uint16_t)sc;
+    for(int i=0;i<sc;i++) *(uint16_t*)(ctx+10+i*2)=(uint16_t)grain_u(d,n,1+i,2);
+    int total=ctx_off+8+2+sc*2; if(total>480) total=480;
+    if(g_df_buf) g_df_buf[0]=0;
+    uint32_t nb=htonl(total); (void)!write(sock,&nb,4); (void)!write(sock,pdu,total);
+    uint8_t resp[512]; (void)!read(sock,resp,sizeof(resp)); close(sock);
+    return g_df_buf?(int)g_df_buf[0]:0;
+}
+/* N6 */ static int grain_lease_upgrade_downgrade(const uint8_t *d, size_t n) {
+    uint8_t lk[16]; for(int i=0;i<16;i++) lk[i]=(uint8_t)grain_u(d,n,i,1);
+    uint8_t lc[52]; memset(lc,0,sizeof(lc)); memcpy(lc,lk,16); *(uint32_t*)(lc+16)=0x07; /* RWH */
+    pool_create_with_ctx("cc_lud","RqLs",4,lc,52);
+    memset(lc,0,sizeof(lc)); memcpy(lc,lk,16); *(uint32_t*)(lc+16)=(uint32_t)(grain_u(d,n,16,4)&0x07);
+    return pool_create_with_ctx("cc_lud","RqLs",4,lc,52);   /* re-request (down/upgrade) same key */
+}
+/* N7 */ static int grain_durable_v1_v2_mix(const uint8_t *d, size_t n) {
+    uint8_t dh1[16]; memset(dh1,0,sizeof(dh1));
+    int r=pool_create_with_ctx("cc_dvm","DHnQ",4,dh1,16);   /* v1 durable */
+    uint8_t dc[36]; memset(dc,0,sizeof(dc)); memcpy(dc,g_pool[0].fid,16);
+    for(int i=0;i<16;i++) dc[16+i]=(uint8_t)grain_u(d,n,i,1);
+    *(uint32_t*)(dc+32)=(uint32_t)grain_u(d,n,16,4);
+    pool_create_with_ctx("cc_dvm","DH2C",4,dc,36);   /* v2 reconnect of a v1 durable */
+    return r;
+}
+/* N8 */ static int grain_oplock_level2_break(const uint8_t *d, size_t n) {
+    if(!pool_lazy(2)) return -1;
+    struct pool_conn *c=&g_pool[0];
+    const char *name="opl2_shared"; int nlen=(int)strlen(name)*2;
+    uint8_t pdu[256], resp[256];
+    pool_smb2_hdr(pdu,0x0005,c);
+    {uint8_t*b=pdu+64;memset(b,0,56);*(uint16_t*)b=57;b[3]=1;   /* RequestedOplockLevel=LEVEL2 */
+     *(uint32_t*)(b+24)=0x12019F;*(uint32_t*)(b+28)=0x80;*(uint32_t*)(b+32)=0x07;
+     *(uint32_t*)(b+36)=0x05;*(uint32_t*)(b+40)=0x40;*(uint16_t*)(b+44)=120;*(uint16_t*)(b+46)=(uint16_t)nlen;
+     for(int i=0;i<(int)strlen(name);i++){pdu[120+i*2]=name[i];pdu[120+i*2+1]=0;}}
+    int r=pool_xact(c,pdu,120+nlen,resp,sizeof(resp));
+    if(r>=144 && *(uint32_t*)(resp+8)==0){memcpy(c->fid,resp+128,16);c->has_fid=1;}
+    pool_create_file(&g_pool[1],name);
+    {uint8_t p2[128];pool_smb2_hdr(p2,0x0009,&g_pool[1]);uint8_t*b=p2+64;memset(b,0,48);
+     *(uint16_t*)b=49;*(uint16_t*)(b+2)=64+48;memcpy(b+16,g_pool[1].fid,16);
+     pool_xact(&g_pool[1],p2,64+48,resp,sizeof(resp));}   /* write → breaks LEVEL2 on conn0 */
+    pool_smb2_hdr(pdu,0x0012,c);
+    {uint8_t*b=pdu+64;memset(b,0,24);*(uint16_t*)b=24;b[2]=(uint8_t)grain_u(d,n,0,1);memcpy(b+8,c->fid,16);}
+    r=pool_xact(c,pdu,64+24,resp,sizeof(resp)); c->has_fid=0; return r;
+}
+/* N9 */ static int grain_lease_parent_key(const uint8_t *d, size_t n) {
+    uint8_t lc[52]; memset(lc,0,sizeof(lc));
+    for(int i=0;i<16;i++) lc[i]=(uint8_t)grain_u(d,n,i,1);   /* LeaseKey */
+    *(uint32_t*)(lc+16)=0x07; *(uint32_t*)(lc+24)=0x04;      /* State; PARENT_LEASE_KEY_SET */
+    for(int i=0;i<16;i++) lc[32+i]=(uint8_t)grain_u(d,n,16+i,1);   /* ParentLeaseKey (nonexistent) */
+    *(uint16_t*)(lc+48)=(uint16_t)grain_u(d,n,32,2);         /* Epoch */
+    return pool_create_with_ctx("cc_lpk","RqLs",4,lc,52);
+}
+/* N10 */ static int grain_durable_timeout_zero(const uint8_t *d, size_t n) {
+    uint8_t dh[32]; memset(dh,0,sizeof(dh));
+    *(uint32_t*)(dh+4)=(uint32_t)grain_u(d,n,0,4);   /* Timeout=0 (default path) + Flags */
+    for(int i=0;i<16;i++) dh[16+i]=(uint8_t)grain_u(d,n,4+i,1);
+    return pool_create_with_ctx("cc_dtz","DH2Q",4,dh,32);
+}
+/* N11 */ static int grain_persistent_handle_ca(const uint8_t *d, size_t n) {
+    uint8_t dh[32]; memset(dh,0,sizeof(dh));
+    *(uint32_t*)(dh+0)=(uint32_t)grain_u(d,n,0,4); *(uint32_t*)(dh+4)=0x02; /* PERSISTENT on non-CA share */
+    for(int i=0;i<16;i++) dh[16+i]=(uint8_t)grain_u(d,n,4+i,1);
+    return pool_create_with_ctx("cc_pca","DH2Q",4,dh,32);
+}
+/* O12 */ static int grain_xattr_name_max(const uint8_t *d, size_t n) {
+    int namelen=250+(int)(grain_u(d,n,0,1)%12); if(namelen>253) namelen=253;
+    uint8_t ea[300]; memset(ea,0,sizeof(ea));
+    ea[5]=(uint8_t)namelen; *(uint16_t*)(ea+6)=2;
+    for(int i=0;i<namelen;i++) ea[8+i]='A'+(i%26); ea[8+namelen]=0;
+    ea[8+namelen+1]=(uint8_t)grain_u(d,n,1,1); ea[8+namelen+2]=(uint8_t)grain_u(d,n,2,1);
+    return pool_setinfo(15, ea, 8+namelen+1+2);   /* EaNameLength at XATTR_NAME_MAX boundary */
+}
+/* O13 */ static int grain_filename_null_embed(const uint8_t *d, size_t n) {
+    if(!pool_lazy(1)) return -1;
+    struct pool_conn *c=&g_pool[0]; uint8_t pdu[256], resp[256];
+    int nchars=3+(int)(grain_u(d,n,0,1)%10), u16=0;
+    for(int i=0;i<nchars && u16+2<120;i++){
+        uint16_t ch=(grain_u(d,n,1+i,1)%4==0)?0x0000:(uint16_t)('a'+(i%26));   /* embedded NUL */
+        pdu[120+u16]=ch&0xFF; pdu[120+u16+1]=ch>>8; u16+=2; }
+    pool_smb2_hdr(pdu,0x0005,c);
+    uint8_t *b=pdu+64;memset(b,0,56);*(uint16_t*)b=57;
+    *(uint32_t*)(b+24)=0x12019F;*(uint32_t*)(b+28)=0x80;*(uint32_t*)(b+32)=0x07;
+    *(uint32_t*)(b+36)=0x05;*(uint32_t*)(b+40)=0x40;*(uint16_t*)(b+44)=120;*(uint16_t*)(b+46)=(uint16_t)u16;
+    return pool_xact(c,pdu,120+u16,resp,sizeof(resp));
+}
+/* O14 */ static int grain_filename_max_path(const uint8_t *d, size_t n) {
+    if(!pool_lazy(1)) return -1;
+    struct pool_conn *c=&g_pool[0]; uint8_t pdu[1024], resp[256];
+    int nchars=200+(int)(grain_u(d,n,0,1)%56), u16=0;
+    for(int i=0;i<nchars && u16+2<800;i++){
+        uint8_t ch=(grain_u(d,n,1,1)&1)?(uint8_t)('a'+(i%26)):(uint8_t)grain_u(d,n,10+(i%40),1);
+        if(ch=='\\'||ch=='/'||ch==0) ch='x';
+        pdu[120+u16]=ch; pdu[120+u16+1]=0; u16+=2; }
+    pool_smb2_hdr(pdu,0x0005,c);
+    uint8_t *b=pdu+64;memset(b,0,56);*(uint16_t*)b=57;
+    *(uint32_t*)(b+24)=0x12019F;*(uint32_t*)(b+28)=0x80;*(uint32_t*)(b+32)=0x07;
+    *(uint32_t*)(b+36)=0x05;*(uint32_t*)(b+40)=0x40;*(uint16_t*)(b+44)=120;*(uint16_t*)(b+46)=(uint16_t)u16;
+    return pool_xact(c,pdu,120+u16,resp,sizeof(resp));
+}
+/* O15 */ static int grain_stream_delete(const uint8_t *d, size_t n) {
+    if(!pool_lazy(1)) return -1;
+    struct pool_conn *c=&g_pool[0]; uint8_t pdu[256], resp[256];
+    const char *nm="sd_f:strm:$DATA"; int nl=(int)strlen(nm);
+    for(int i=0;i<nl;i++){pdu[120+i*2]=nm[i];pdu[120+i*2+1]=0;}
+    pool_smb2_hdr(pdu,0x0005,c);
+    {uint8_t*b=pdu+64;memset(b,0,56);*(uint16_t*)b=57;
+     *(uint32_t*)(b+24)=0x12019F;*(uint32_t*)(b+28)=0x80;*(uint32_t*)(b+32)=0x07;
+     *(uint32_t*)(b+36)=0x05;*(uint32_t*)(b+40)=0x40;*(uint16_t*)(b+44)=120;*(uint16_t*)(b+46)=(uint16_t)(nl*2);}
+    int r=pool_xact(c,pdu,120+nl*2,resp,sizeof(resp));
+    if(r>=144 && *(uint32_t*)(resp+8)==0){memcpy(c->fid,resp+128,16);c->has_fid=1;
+        uint8_t disp[1]; disp[0]=1; pool_setinfo(13, disp, 1);}   /* delete-on-close the stream */
+    (void)d;(void)n; return r;
+}
+/* O16 */ static int grain_hardlink_cross_share(const uint8_t *d, size_t n) {
+    uint8_t li[128]; memset(li,0,sizeof(li)); li[0]=(uint8_t)(grain_u(d,n,0,1)&1);
+    static const char *T[]={"..\\..\\etc\\x","\\\\other\\y","..\\..\\..\\z"};
+    const char *t=T[grain_u(d,n,1,1)%3]; int nl=(int)strlen(t);
+    *(uint32_t*)(li+16)=(uint32_t)(nl*2);
+    for(int i=0;i<nl;i++){li[20+i*2]=t[i];li[20+i*2+1]=0;}
+    return pool_setinfo(11, li, 20+nl*2);   /* FILE_LINK target escaping the share */
+}
+/* O17 */ static int grain_casefold_share_name(const uint8_t *d, size_t n) {
+    if(!pool_lazy(1)) return -1;
+    struct pool_conn *c=&g_pool[0]; uint8_t pdu[256], resp[256];
+    const char *pre="\\\\127.0.0.1\\"; uint8_t path[128]; int pl=0;
+    for(int i=0;pre[i];i++){path[pl++]=pre[i];path[pl++]=0;}
+    int m=1+(int)(grain_u(d,n,0,1)%12);
+    for(int i=0;i<m && pl+2<120;i++){
+        uint8_t ch=(grain_u(d,n,1+i,1)&1)?(uint8_t)('A'+(i%26)):(uint8_t)('a'+(i%26));
+        if(grain_u(d,n,20+i,1)%4==0) ch=(uint8_t)(0x80+grain_u(d,n,30+i,1)%0x40);   /* non-ASCII */
+        path[pl++]=ch; path[pl++]=(grain_u(d,n,40+i,1)&1)?(uint8_t)grain_u(d,n,50+i,1):0; }
+    pool_smb2_hdr(pdu,0x0003,c);
+    {uint8_t*b=pdu+64;*(uint16_t*)b=9;*(uint16_t*)(b+4)=72;*(uint16_t*)(b+6)=(uint16_t)pl;memcpy(b+8,path,pl);}
+    return pool_xact(c,pdu,64+8+pl,resp,sizeof(resp));
+}
+/* P18 */ static int grain_copychunk_self(const uint8_t *d, size_t n) {
+    if(g_pool_n<1 || !pool_ensure_fid(&g_pool[0],"ccs_v")) return -1;
+    uint8_t pdu[512], resp[512]; uint8_t rkey[24]; memset(rkey,0,sizeof(rkey));
+    {pool_smb2_hdr(pdu,0x000B,&g_pool[0]);uint8_t*rb=pdu+64;memset(rb,0,64);*(uint16_t*)rb=57;
+     *(uint32_t*)(rb+4)=0x00140078;memcpy(rb+8,g_pool[0].fid,16);
+     *(uint32_t*)(rb+24)=120;*(uint32_t*)(rb+44)=4096;*(uint32_t*)(rb+48)=1;
+     int rk=pool_xact(&g_pool[0],pdu,120,resp,sizeof(resp));
+     if(rk>=12 && *(uint32_t*)(resp+8)==0){uint32_t oo=*(uint32_t*)(resp+64+32),oc=*(uint32_t*)(resp+64+36);
+       if(oc>=24 && oo+24<=(uint32_t)rk) memcpy(rkey,resp+oo,24);}}
+    pool_smb2_hdr(pdu,0x000B,&g_pool[0]);
+    uint8_t *b=pdu+64;memset(b,0,64);*(uint16_t*)b=57;*(uint32_t*)(b+4)=0x001440F2;
+    memcpy(b+8,g_pool[0].fid,16);   /* TARGET == SOURCE (self-copy) */
+    uint8_t in[256];memset(in,0,sizeof(in));memcpy(in,rkey,24);
+    int nch=1+(int)(grain_u(d,n,0,1)%4);*(uint32_t*)(in+24)=(uint32_t)nch; uint64_t base=grain_u(d,n,1,8);
+    for(int i=0;i<nch;i++){int o=32+i*24;*(uint64_t*)(in+o)=base;
+        *(uint64_t*)(in+o+8)=base+(grain_u(d,n,9,2)%64);*(uint32_t*)(in+o+16)=(uint32_t)grain_u(d,n,11,4);}
+    int ilen=32+nch*24;*(uint32_t*)(b+24)=120;*(uint32_t*)(b+28)=(uint32_t)ilen;
+    *(uint32_t*)(b+44)=4096;*(uint32_t*)(b+48)=1;memcpy(pdu+120,in,ilen);
+    return pool_xact(&g_pool[0],pdu,120+ilen,resp,sizeof(resp));
+}
+/* P19 */ static int grain_write_sparse_hole(const uint8_t *d, size_t n) {
+    if(g_pool_n<1 || !pool_ensure_fid(&g_pool[0],"wsh_v")) return -1;
+    uint8_t sp[1]; sp[0]=1; pool_ioctl(0x000900C4, sp, 1, 1);   /* FSCTL_SET_SPARSE */
+    uint8_t pdu[256], resp[128]; int r=0;
+    for(int k=0;k<3;k++){ pool_smb2_hdr(pdu,0x0009,&g_pool[0]);
+        uint8_t *b=pdu+64;memset(b,0,48);*(uint16_t*)b=49;*(uint16_t*)(b+2)=64+48;
+        int wl=1+(int)(grain_u(d,n,k,1)%16);*(uint32_t*)(b+4)=(uint32_t)wl;
+        *(uint64_t*)(b+8)=grain_u(d,n,4+k*8,8);   /* scattered offsets (holes between) */
+        memcpy(b+16,g_pool[0].fid,16);
+        for(int i=0;i<wl && i<(int)n;i++) b[48+i]=d[i];
+        r=pool_xact(&g_pool[0],pdu,64+48+wl,resp,sizeof(resp)); }
+    return r;
+}
+/* P20 */ static int grain_read_compound_close(const uint8_t *d, size_t n) {
+    if(g_pool_n<1 || !pool_ensure_fid(&g_pool[0],"rcc_v")) return -1;
+    struct pool_conn *c=&g_pool[0]; uint8_t pdu[256], resp[512]; int off=0;
+    pool_smb2_hdr(pdu+off,0x0008,c);
+    {uint8_t*b=pdu+off+64;memset(b,0,48);*(uint16_t*)b=49;
+     *(uint32_t*)(b+4)=(uint32_t)grain_u(d,n,0,4);*(uint64_t*)(b+8)=grain_u(d,n,4,8);memcpy(b+16,c->fid,16);}
+    {int cl=(64+48+7)&~7;*(uint32_t*)((pdu+off)+20)=(uint32_t)cl;off+=cl;}
+    pool_smb2_hdr(pdu+off,0x0006,c); *(uint32_t*)((pdu+off)+16)=0x04;   /* RELATED CLOSE */
+    {uint8_t*b=pdu+off+64;memset(b,0,24);*(uint16_t*)b=24;memset(b+8,0xFF,16);
+     *(uint32_t*)((pdu+off)+20)=0;off+=64+24;}
+    int r=pool_xact(c,pdu,off,resp,sizeof(resp)); c->has_fid=0; return r;
+}
+/* P21 */ static int grain_set_eof_shrink_race(const uint8_t *d, size_t n) {
+    if(g_pool_n<1 || !pool_ensure_fid(&g_pool[0],"eof_v")) return -1;
+    uint8_t pdu[256], resp[256];
+    pool_smb2_hdr(pdu,0x0009,&g_pool[0]);
+    {uint8_t*b=pdu+64;memset(b,0,48);*(uint16_t*)b=49;*(uint16_t*)(b+2)=64+48;
+     *(uint32_t*)(b+4)=64;memcpy(b+16,g_pool[0].fid,16);
+     pool_xact(&g_pool[0],pdu,64+48+64,resp,sizeof(resp));}
+    uint8_t eof[8]; *(uint64_t*)eof=grain_u(d,n,0,8)%64; pool_setinfo(20, eof, 8);   /* shrink */
+    pool_smb2_hdr(pdu,0x0008,&g_pool[0]);
+    {uint8_t*b=pdu+64;memset(b,0,48);*(uint16_t*)b=49;*(uint32_t*)(b+4)=128;
+     *(uint64_t*)(b+8)=grain_u(d,n,8,8)%128;memcpy(b+16,g_pool[0].fid,16);}   /* read past new EOF */
+    return pool_xact(&g_pool[0],pdu,64+48,resp,sizeof(resp));
+}
+/* P22 */ static int grain_append_past_max(const uint8_t *d, size_t n) {
+    if(g_pool_n<1 || !pool_ensure_fid(&g_pool[0],"apm_v")) return -1;
+    uint8_t pdu[256], resp[128]; int r=0; uint64_t off=grain_u(d,n,0,8);
+    for(int k=0;k<3;k++){ pool_smb2_hdr(pdu,0x0009,&g_pool[0]);
+        uint8_t *b=pdu+64;memset(b,0,48);*(uint16_t*)b=49;*(uint16_t*)(b+2)=64+48;
+        int wl=1+(int)(grain_u(d,n,k,1)%32);*(uint32_t*)(b+4)=(uint32_t)wl;
+        *(uint64_t*)(b+8)=off;memcpy(b+16,g_pool[0].fid,16);
+        for(int i=0;i<wl && i<(int)n;i++) b[48+i]=d[i];
+        r=pool_xact(&g_pool[0],pdu,64+48+wl,resp,sizeof(resp)); off+=grain_u(d,n,8+k,4); }
+    return r;
+}
+/* Q23 */ static int grain_query_full_ea_size(const uint8_t *d, size_t n) {
+    if(g_pool_n<1 || !pool_ensure_fid(&g_pool[0],"qfe_v")) return -1;
+    uint8_t pdu[128], resp[256];
+    pool_smb2_hdr(pdu,0x0010,&g_pool[0]);
+    uint8_t *b=pdu+64;memset(b,0,41);*(uint16_t*)b=41;b[2]=0x01;b[3]=15;
+    *(uint32_t*)(b+4)=(uint32_t)(grain_u(d,n,0,1)%32);   /* tiny OutputBufferLength → truncation */
+    memcpy(b+24,g_pool[0].fid,16);
+    return pool_xact(&g_pool[0],pdu,64+41,resp,sizeof(resp));
+}
+/* Q24 */ static int grain_set_rename_stream(const uint8_t *d, size_t n) {
+    uint8_t ri[128]; memset(ri,0,sizeof(ri)); ri[0]=(uint8_t)(grain_u(d,n,0,1)&1);
+    const char *t=":newstream:$DATA"; int nl=(int)strlen(t);
+    *(uint32_t*)(ri+16)=(uint32_t)(nl*2);
+    for(int i=0;i<nl;i++){ri[20+i*2]=t[i];ri[20+i*2+1]=0;}
+    return pool_setinfo(10, ri, 20+nl*2);   /* FILE_RENAME to a stream */
+}
+/* Q25 */ static int grain_query_dir_short_buf(const uint8_t *d, size_t n) {
+    if(g_pool_n<1) return -1;
+    uint8_t pdu[256], resp[512];
+    pool_smb2_hdr(pdu,0x0005,&g_pool[0]);
+    {uint8_t*b=pdu+64;memset(b,0,56);*(uint16_t*)b=57;*(uint32_t*)(b+24)=0x100081;*(uint32_t*)(b+28)=0x10;
+     *(uint32_t*)(b+32)=0x07;*(uint32_t*)(b+36)=0x01;*(uint32_t*)(b+40)=0x01;*(uint16_t*)(b+44)=120;}
+    int r=pool_xact(&g_pool[0],pdu,120,resp,sizeof(resp));
+    if(r<144 || *(uint32_t*)(resp+8)!=0) return -1;
+    uint8_t dfid[16];memcpy(dfid,resp+128,16);
+    pool_smb2_hdr(pdu,0x000E,&g_pool[0]);
+    uint8_t *b=pdu+64;memset(b,0,32);*(uint16_t*)b=33;b[2]=1;memcpy(b+8,dfid,16);
+    *(uint16_t*)(b+24)=64+32;*(uint16_t*)(b+26)=2;
+    *(uint32_t*)(b+28)=(uint32_t)(grain_u(d,n,0,1)%24);   /* OutputBufferLength < one entry */
+    pdu[96]='*';pdu[97]=0;
+    return pool_xact(&g_pool[0],pdu,98,resp,sizeof(resp));
+}
+/* Q26 */ static int grain_set_disposition_dir(const uint8_t *d, size_t n) {
+    if(g_pool_n<1) return -1;
+    uint8_t pdu[256], resp[256];
+    pool_smb2_hdr(pdu,0x0005,&g_pool[0]);
+    {uint8_t*b=pdu+64;memset(b,0,56);*(uint16_t*)b=57;*(uint32_t*)(b+24)=0x10000F;*(uint32_t*)(b+28)=0x10;
+     *(uint32_t*)(b+32)=0x07;*(uint32_t*)(b+36)=0x01;*(uint32_t*)(b+40)=0x01;*(uint16_t*)(b+44)=120;}
+    int r=pool_xact(&g_pool[0],pdu,120,resp,sizeof(resp));
+    if(r<144 || *(uint32_t*)(resp+8)!=0) return -1;
+    uint8_t dfid[16];memcpy(dfid,resp+128,16);
+    pool_smb2_hdr(pdu,0x0011,&g_pool[0]);
+    uint8_t *b=pdu+64;memset(b,0,32);*(uint16_t*)b=33;b[2]=1;b[3]=13;   /* FILE_DISPOSITION */
+    *(uint32_t*)(b+4)=1;*(uint16_t*)(b+8)=64+32;memcpy(b+16,dfid,16);
+    b[32]=(uint8_t)(grain_u(d,n,0,1)|1);   /* DeletePending on a (non-empty) dir */
+    return pool_xact(&g_pool[0],pdu,64+32+1,resp,sizeof(resp));
+}
+/* Q27 */ static int grain_query_attr_tag_reparse(const uint8_t *d, size_t n) {
+    if(g_pool_n<1 || !pool_ensure_fid(&g_pool[0],"qatr_v")) return -1;
+    uint8_t rp[64];memset(rp,0,sizeof(rp));*(uint32_t*)(rp+0)=0xA000000C;
+    *(uint16_t*)(rp+4)=20;for(int i=8;i<28;i++) rp[i]=(uint8_t)grain_u(d,n,i-8,1);
+    pool_ioctl(0x000900A4, rp, 28, 1);
+    uint8_t pdu[128], resp[512];
+    pool_smb2_hdr(pdu,0x0010,&g_pool[0]);
+    uint8_t *b=pdu+64;memset(b,0,41);*(uint16_t*)b=41;b[2]=0x01;b[3]=35;   /* FILE_ATTRIBUTE_TAG */
+    *(uint32_t*)(b+4)=(uint32_t)grain_u(d,n,0,4);memcpy(b+24,g_pool[0].fid,16);
+    return pool_xact(&g_pool[0],pdu,64+41,resp,sizeof(resp));
+}
+/* R28 */ static int grain_tcon_max_trees(const uint8_t *d, size_t n) {
+    if(!pool_lazy(1)) return -1;
+    struct pool_conn *c=&g_pool[0]; uint8_t pdu[256], resp[256]; int r=0;
+    const uint8_t path[]={'\\',0,'\\',0,'1',0,'2',0,'7',0,'.',0,'0',0,'.',0,'0',0,'.',0,'1',0,'\\',0,'s',0,'h',0,'a',0,'r',0,'e',0};
+    int nt=8+(int)(grain_u(d,n,0,1)%40);   /* many tcons, no tdis → tree-table pressure */
+    for(int k=0;k<nt;k++){ pool_smb2_hdr(pdu,0x0003,c);
+        {uint8_t*b=pdu+64;*(uint16_t*)b=9;*(uint16_t*)(b+4)=72;*(uint16_t*)(b+6)=sizeof(path);memcpy(b+8,path,sizeof(path));}
+        r=pool_xact(c,pdu,64+8+sizeof(path),resp,sizeof(resp)); }
+    pool_reconnect(c); return r;
+}
+/* R29 */ static int grain_session_max_opens(const uint8_t *d, size_t n) {
+    if(!pool_lazy(1)) return -1;
+    struct pool_conn *c=&g_pool[0]; uint8_t pdu[256], resp[256]; int r=0;
+    int no=8+(int)(grain_u(d,n,0,1)%40);
+    for(int k=0;k<no;k++){ char nm[8]; int nl=0; nm[nl++]='o';nm[nl++]='p';
+        nm[nl++]='0'+(k/10);nm[nl++]='0'+(k%10);
+        pool_smb2_hdr(pdu,0x0005,c);
+        uint8_t *b=pdu+64;memset(b,0,56);*(uint16_t*)b=57;
+        *(uint32_t*)(b+24)=0x12019F;*(uint32_t*)(b+28)=0x80;*(uint32_t*)(b+32)=0x07;
+        *(uint32_t*)(b+36)=0x05;*(uint32_t*)(b+40)=0x40;*(uint16_t*)(b+44)=120;*(uint16_t*)(b+46)=(uint16_t)(nl*2);
+        for(int i=0;i<nl;i++){pdu[120+i*2]=nm[i];pdu[120+i*2+1]=0;}
+        r=pool_xact(c,pdu,120+nl*2,resp,sizeof(resp)); }   /* no CLOSE → open-file-table pressure */
+    pool_reconnect(c); return r;
+}
+/* R30 */ static int grain_conn_negotiate_twice(const uint8_t *d, size_t n) {
+    struct sockaddr_in addr={.sin_family=AF_INET,.sin_port=htons(445)};
+    addr.sin_addr.s_addr=inet_addr(g_target_ip);
+    int sock=socket(AF_INET,SOCK_STREAM,0); if(sock<0) return -1;
+    struct timeval tv={.tv_sec=1}; setsockopt(sock,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv));
+    if(connect(sock,(struct sockaddr*)&addr,sizeof(addr))<0){close(sock);return -1;}
+    uint8_t neg[128], resp[256];
+    for(int k=0;k<2;k++){ memset(neg,0,sizeof(neg));memcpy(neg,"\xfeSMB",4);*(uint16_t*)(neg+4)=64;
+        uint8_t*b=neg+64;*(uint16_t*)b=36;*(uint16_t*)(b+2)=1;
+        *(uint16_t*)(b+36)=(k==0)?0x0311:(uint16_t)grain_u(d,n,0,2);   /* re-NEGOTIATE (2nd fuzzed) */
+        uint32_t nb=htonl(64+38);(void)!write(sock,&nb,4);(void)!write(sock,neg,64+38);
+        (void)!read(sock,resp,sizeof(resp)); }
+    int rv=g_df_buf?(int)g_df_buf[0]:0; close(sock); return rv;
+}
+/* R31 */ static int grain_session_setup_no_negotiate(const uint8_t *d, size_t n) {
+    struct sockaddr_in addr={.sin_family=AF_INET,.sin_port=htons(445)};
+    addr.sin_addr.s_addr=inet_addr(g_target_ip);
+    int sock=socket(AF_INET,SOCK_STREAM,0); if(sock<0) return -1;
+    struct timeval tv={.tv_sec=1}; setsockopt(sock,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv));
+    if(connect(sock,(struct sockaddr*)&addr,sizeof(addr))<0){close(sock);return -1;}
+    uint8_t pdu[256]; memset(pdu,0,sizeof(pdu));
+    memcpy(pdu,"\xfeSMB",4);*(uint16_t*)(pdu+4)=64;*(uint16_t*)(pdu+12)=1;   /* SESSION_SETUP first */
+    uint8_t *b=pdu+64;*(uint16_t*)b=25;b[3]=1;
+    int slen=(int)(n>100?100:n);*(uint16_t*)(b+12)=88;*(uint16_t*)(b+14)=(uint16_t)slen;
+    if(slen>0) memcpy(b+24,d,slen);
+    if(g_df_buf) g_df_buf[0]=0;
+    uint32_t nb=htonl(64+24+slen);(void)!write(sock,&nb,4);(void)!write(sock,pdu,64+24+slen);
+    uint8_t resp[256];(void)!read(sock,resp,sizeof(resp));close(sock);
+    return g_df_buf?(int)g_df_buf[0]:0;
+}
+/* R32 */ static int grain_interim_response_flood(const uint8_t *d, size_t n) {
+    if(g_pool_n<1 || !pool_ensure_fid(&g_pool[0],"irf_v")) return -1;
+    uint8_t pdu[128]; int nreq=6+(int)(grain_u(d,n,0,1)%30);
+    for(int k=0;k<nreq;k++){ pool_smb2_hdr(pdu,0x000A,&g_pool[0]);   /* blocking LOCK → interim resp */
+        uint8_t *b=pdu+64;memset(b,0,48);*(uint16_t*)b=48;*(uint16_t*)(b+2)=1;memcpy(b+8,g_pool[0].fid,16);
+        *(uint64_t*)(b+24)=grain_u(d,n,k,8);*(uint64_t*)(b+32)=grain_u(d,n,8,8);*(uint32_t*)(b+40)=0x01;
+        uint32_t nb=htonl(64+48);
+        if(write(g_pool[0].sock,&nb,4)<0) break;
+        if(write(g_pool[0].sock,pdu,64+48)<0) break; }
+    uint8_t resp[256]; int r=(int)read(g_pool[0].sock,resp,sizeof(resp));
+    pool_reconnect(&g_pool[0]); return r>0?r:0;
 }
 
 static const struct { const char *name; int (*fn)(const uint8_t *, size_t); } GRAINS[] = {
@@ -3753,6 +6099,128 @@ static const struct { const char *name; int (*fn)(const uint8_t *, size_t); } GR
     { "dacl_deep",    grain_dacl_deep    },
     { "sign",         grain_sign         },
     { "rpc_opnum",    grain_rpc_opnum    },
+    /* batch 10 (2026-07-22): parser-DEPTH grains — chain/array walks left at
+     * iteration count 1 by the single-element grains (GRAIN.md §9) */
+    { "set_ea_chain",        grain_set_ea_chain        },
+    { "negotiate_ctx_multi", grain_negotiate_ctx_multi },
+    { "compound_chain",      grain_compound_chain      },
+    { "ndr_xattr",           grain_ndr_xattr           },
+    { "dir_pattern",         grain_dir_pattern         },
+    { "transport_frame",     grain_transport_frame     },
+    /* batch 11 (2026-07-22): more chain/array-walk depth grains */
+    { "lock_array",          grain_lock_array          },
+    { "create_ctx_chain",    grain_create_ctx_chain    },
+    { "copychunk_multi",     grain_copychunk_multi     },
+    { "quota_chain",         grain_quota_chain         },
+    { "rdma_channel_desc",   grain_rdma_channel_desc   },
+    /* batch 12 (2026-07-22): interaction + protocol-parse depth */
+    { "compound_related_fid", grain_compound_related_fid },
+    { "reparse_symlink",     grain_reparse_symlink     },
+    { "dfs_referral_ex",     grain_dfs_referral_ex     },
+    { "negotiate_dialects",  grain_negotiate_dialects  },
+    { "spnego_asn1",         grain_spnego_asn1         },
+    /* batch 13 (2026-07-22): 32-grain backlog — A chain/array, B state/concurrency,
+     * C crypto/transform, D path/name, E fsctl/info breadth */
+    { "create_dh2q_internals",     grain_create_dh2q_internals     },
+    { "notify_output_walk",        grain_notify_output_walk        },
+    { "query_dir_resume",          grain_query_dir_resume          },
+    { "set_ea_private",            grain_set_ea_private            },
+    { "ioctl_inout_overlap",       grain_ioctl_inout_overlap       },
+    { "sd_owner_group",            grain_sd_owner_group            },
+    { "sd_sacl",                   grain_sd_sacl                   },
+    { "durable_reconnect_race",    grain_durable_reconnect_race    },
+    { "lease_break_ack_mismatch",  grain_lease_break_ack_mismatch  },
+    { "oplock_break_race",         grain_oplock_break_race         },
+    { "logoff_inflight",           grain_logoff_inflight           },
+    { "tdis_open_fid",             grain_tdis_open_fid             },
+    { "close_durable_scavenger",   grain_close_durable_scavenger   },
+    { "cancel_async_target",       grain_cancel_async_target       },
+    { "credit_exhaust",            grain_credit_exhaust            },
+    { "compound_unrelated_session", grain_compound_unrelated_session },
+    { "transform_nested",          grain_transform_nested          },
+    { "compress_bomb",             grain_compress_bomb             },
+    { "sign_downgrade",            grain_sign_downgrade            },
+    { "preauth_hash_mismatch",     grain_preauth_hash_mismatch     },
+    { "multichannel_bind_replay",  grain_multichannel_bind_replay  },
+    { "create_path_traversal",     grain_create_path_traversal     },
+    { "stream_name_edge",          grain_stream_name_edge          },
+    { "unicode_surrogate",         grain_unicode_surrogate         },
+    { "rename_target_edge",        grain_rename_target_edge        },
+    { "pipe_transceive_bind",      grain_pipe_transceive_bind      },
+    { "set_integrity_deep",        grain_set_integrity_deep        },
+    { "query_fs_info",             grain_query_fs_info             },
+    { "smb1_dialects",             grain_smb1_dialects             },
+    { "fsctl_reparse_get_chain",   grain_fsctl_reparse_get_chain   },
+    { "query_info_ea_list",        grain_query_info_ea_list        },
+    { "set_link_root",             grain_set_link_root             },
+    /* batch 14 (2026-07-22): F create/ctx · G rd/wr edge · H lock · I session · J info ·
+     * K transport · L more FSCTLs */
+    { "create_ctx_dup",            grain_create_ctx_dup            },
+    { "create_ctx_giant_data",     grain_create_ctx_giant_data     },
+    { "create_twrp",               grain_create_twrp               },
+    { "create_alloc_vs_eof",       grain_create_alloc_vs_eof       },
+    { "create_disposition_matrix", grain_create_disposition_matrix },
+    { "create_impersonation",      grain_create_impersonation      },
+    { "write_compound_flush",      grain_write_compound_flush      },
+    { "read_padding_edge",         grain_read_padding_edge         },
+    { "write_zero_length",         grain_write_zero_length         },
+    { "write_rdma_channel",        grain_write_rdma_channel        },
+    { "read_beyond_eof",           grain_read_beyond_eof           },
+    { "lock_unlock_mismatch",      grain_lock_unlock_mismatch      },
+    { "lock_shared_excl_conflict", grain_lock_shared_excl_conflict },
+    { "lock_reflexive",            grain_lock_reflexive            },
+    { "session_reauth_switch",     grain_session_reauth_switch     },
+    { "guest_anon_auth",           grain_guest_anon_auth           },
+    { "logoff_reuse_sid",          grain_logoff_reuse_sid          },
+    { "tcon_ipc_vs_disk",          grain_tcon_ipc_vs_disk          },
+    { "query_all_info",            grain_query_all_info            },
+    { "set_basic_time_edge",       grain_set_basic_time_edge       },
+    { "query_stream_info",         grain_query_stream_info         },
+    { "set_pipe_info",             grain_set_pipe_info             },
+    { "query_network_openinfo",    grain_query_network_openinfo    },
+    { "pipelined_requests",        grain_pipelined_requests        },
+    { "oversize_pdu",              grain_oversize_pdu              },
+    { "partial_pdu_dribble",       grain_partial_pdu_dribble       },
+    { "compound_padding",          grain_compound_padding          },
+    { "fsctl_set_object_id",       grain_fsctl_set_object_id       },
+    { "fsctl_lmr_set_link",        grain_fsctl_lmr_set_link        },
+    { "fsctl_query_file_regions",  grain_fsctl_query_file_regions  },
+    { "fsctl_duplicate_extents_v2", grain_fsctl_duplicate_extents_v2 },
+    { "fsctl_offload_read_token",  grain_fsctl_offload_read_token  },
+    /* batch 15 (2026-07-22): M crypto · N durable/lease/oplock · O vfs/path · P data-path ·
+     * Q info edges · R conn lifecycle */
+    { "encrypt_then_compound",     grain_encrypt_then_compound     },
+    { "sign_compound_mixed",       grain_sign_compound_mixed       },
+    { "encrypt_wrong_session",     grain_encrypt_wrong_session     },
+    { "gss_mechlist_mic",          grain_gss_mechlist_mic          },
+    { "negotiate_signing_ctx",     grain_negotiate_signing_ctx     },
+    { "lease_upgrade_downgrade",   grain_lease_upgrade_downgrade   },
+    { "durable_v1_v2_mix",         grain_durable_v1_v2_mix         },
+    { "oplock_level2_break",       grain_oplock_level2_break       },
+    { "lease_parent_key",          grain_lease_parent_key          },
+    { "durable_timeout_zero",      grain_durable_timeout_zero      },
+    { "persistent_handle_ca",      grain_persistent_handle_ca      },
+    { "xattr_name_max",            grain_xattr_name_max            },
+    { "filename_null_embed",       grain_filename_null_embed       },
+    { "filename_max_path",         grain_filename_max_path         },
+    { "stream_delete",             grain_stream_delete             },
+    { "hardlink_cross_share",      grain_hardlink_cross_share      },
+    { "casefold_share_name",       grain_casefold_share_name       },
+    { "copychunk_self",            grain_copychunk_self            },
+    { "write_sparse_hole",         grain_write_sparse_hole         },
+    { "read_compound_close",       grain_read_compound_close       },
+    { "set_eof_shrink_race",       grain_set_eof_shrink_race       },
+    { "append_past_max",           grain_append_past_max           },
+    { "query_full_ea_size",        grain_query_full_ea_size        },
+    { "set_rename_stream",         grain_set_rename_stream         },
+    { "query_dir_short_buf",       grain_query_dir_short_buf       },
+    { "set_disposition_dir",       grain_set_disposition_dir       },
+    { "query_attr_tag_reparse",    grain_query_attr_tag_reparse    },
+    { "tcon_max_trees",            grain_tcon_max_trees            },
+    { "session_max_opens",         grain_session_max_opens         },
+    { "conn_negotiate_twice",      grain_conn_negotiate_twice      },
+    { "session_setup_no_negotiate", grain_session_setup_no_negotiate },
+    { "interim_response_flood",    grain_interim_response_flood    },
 };
 #define N_GRAINS ((int)(sizeof(GRAINS) / sizeof(GRAINS[0])))
 
@@ -3773,12 +6241,12 @@ int pfz_grain_run(int i, const void *data, int len) {
      * why they stayed shallow (ft<100): they never reached their real code, they
      * bailed at the g_pool_n guard. Lazily establish a 2-connection authed pool,
      * each with an open fid (pfz_pool_init_authed → pool_create_file), so those
-     * grains reach deep VFS/IOCTL code like the write/truncate grains do. It runs
-     * ONCE (pfz_reset only clears the coverage counter, so g_pool persists across
-     * iterations → two handshakes per grain, not per input) and BEFORE pfz_reset
-     * so the setup traffic's coverage is cleared and only the grain's own coverage
-     * is measured. */
-    if (g_pool_n < 2) pfz_pool_init_authed(2);
+     * grains reach deep VFS/IOCTL code like the write/truncate grains do. LAZY (#3): the
+     * pool is no longer initialized here for EVERY grain — that did 2 fresh NTLMv2 handshakes
+     * per grain (even non-pool ones), flooding the single ksmbd.mountd IPC daemon → auth
+     * timeouts → the 0-exec storm. Pool-based grains now call pool_lazy() themselves, so only
+     * they pay the pool auth. --everytime-auth restores the original blanket init below. */
+    if (everytime_auth() && g_pool_n < 2) pfz_pool_init_authed(2);
     pfz_reset();
     return GRAINS[i].fn((const uint8_t *)data, (size_t)len);
 }
@@ -3804,7 +6272,7 @@ int pfz_grain_run(int i, const void *data, int len) {
 static int g_combo_obj_open = 0;
 static void combo_open_shared(int two)
 {
-    if (g_pool_n < 1) return;
+    if (!pool_lazy(1)) return;
     if (!g_combo_obj_open) {
         pool_create_file(&g_pool[0], "combo_obj");              /* conn0 → combo_obj */
         if (two && g_pool_n >= 2)

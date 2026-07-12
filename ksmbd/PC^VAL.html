@@ -363,14 +363,30 @@
       <pre class="mono"><code><span class="tok-c">/* one record in the shared ring — kernel/kcov_dataflow.c */</span>
 area[i]     = type_marker | ((nfields) &lt;&lt; 24) | seq;  <span class="tok-c">// 0xE=args 0xF=ret 0xC=cmp</span>
 area[i + 1] = <span class="tok-k">pc</span>;                                <span class="tok-c">// raw program counter, untouched</span>
-area[i + 2] = meta;                              <span class="tok-c">// arg index | size | pointer</span>
-area[i + 3] = <span class="tok-v">value</span>;   <span class="tok-c">// a scalar, OR up to N decomposed struct fields</span></code></pre>
-      <p>One nice detail: when the traced argument is a <em>pointer to a struct</em>, the Clang pass
-        also emits the struct's field offsets, and the kernel walks them with
-        <code>copy_from_kernel_nofault</code> (a fault-safe read) to record several fields per argument.
-        So a buried <code>length</code> member three fields deep inside a request struct becomes its own
-        piece of cargo. Everything is read defensively — a bad pointer yields a
-        <code>0xBADADD85</code> sentinel instead of a crash.</p>
+area[i + 2] = meta;                              <span class="tok-c">// source arg_idx | size | ptr</span>
+area[i + 3] = <span class="tok-v">value</span>;   <span class="tok-c">// a scalar, OR up to N struct fields</span></code></pre>
+      <p>The <code>arg_idx</code> packed into that metadata word is worth a second look, because it's the
+        one number the kernel copies through untouched and the harness later keys features on. It's the
+        <em>source-level</em> parameter number — the <code>len</code> in
+        <code>smb2_read(len, offset)</code> is argument&nbsp;0, always — <strong>not</strong> the position
+        of a machine register in the lowered calling convention. The compiler earns that: it recovers the
+        source→IR mapping from debug info (<code>DILocalVariable::getArg()</code>, which the frontend
+        stamps <em>before</em> the ABI rewrites anything), so a hidden struct-return pointer or a C++
+        <code>this</code> handle inserted ahead of the real arguments never shifts the numbering. The
+        kernel never sees that complexity — the meaning of <code>arg_idx</code> was fixed at compile time,
+        which is what makes a <code>(PC, arg_idx, value)</code> feature stable to fold on.</p>
+      <p>The same discipline is what lets the kernel stay dumb about structs. When an argument carries a
+        struct, the Clang pass also emits the struct's <code>[offset, size]</code> field table, and the
+        kernel walks it with <code>copy_from_kernel_nofault</code> (a fault-safe read) to record several
+        fields per argument — so a <code>length</code> buried three fields deep in a request struct
+        becomes its own piece of cargo. The kernel only ever sees <em>one</em> shape here — a pointer plus
+        that table — but the compiler feeds it from three: a genuine <em>pointer-to-struct</em> argument;
+        a small <em>by-value</em> struct the ABI smeared across registers or coerced to an integer, which
+        the pass reassembles (from its <code>DW_OP_LLVM_fragment</code> pieces) back into a stack slot in
+        source layout; and a struct <em>return</em> lowered to a hidden <code>sret</code> buffer, traced
+        through that buffer so nothing is dropped just because the value came back indirectly. All the ABI
+        variety is resolved compiler-side; the kernel reads defensively and uniformly — a bad pointer or a
+        field it can't fault in yields a <code>0xBADADD85</code> sentinel instead of a crash.</p>
       <div class="note"><b>Why raw?</b> Keeping the fold out of the kernel means the <i>policy</i> — how
         aggressively to reward values, how to split the map, whether to run value-blind at all — lives
         in the userspace harness where it can be changed and A/B-tested without rebooting into a new

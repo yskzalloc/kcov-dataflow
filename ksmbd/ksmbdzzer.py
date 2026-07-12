@@ -51,6 +51,7 @@ def _dts():
 import sys as _sys, os as _os, re as _re, builtins as _bi
 _LOG_COLOR = "\033[38;2;107;181;163m"   # #6bb5a3 — ksmbdzzer.py
 _LOG_RESET = "\033[0m"
+_PINK_BOLD = "\033[1m\033[38;2;255;192;203m"   # #FFC0CB bold — engine banner (which arm is running)
 _LOG_TS_RE = _re.compile(r'^\s*\[\s*\d+\.\d{6}\]\s*')   # a pre-existing dmesg stamp
 # In-guest liveness heartbeat: EVERY log line stamps this. The in-guest watchdog (below)
 # uses it to tell a USERSPACE stall (Python alive, no output) from healthy work — so it
@@ -187,6 +188,60 @@ def _atomic_write_text(path: Path, blob: str):
     tmp.write_text(blob)
     os.replace(tmp, path)                 # atomic on the same filesystem
 
+def _ensure_posix_user(name: str, uid: int) -> str:
+    """Make `name` getpwnam()-able so ksmbd.mountd can resolve `force user = name`
+    in [aclshare] (share.c force_user() drops the share on a getpwnam NULL → the #42
+    BAD_NETWORK_NAME). Returns a short status string describing HOW it was provisioned.
+
+    Why not just useradd: under virtme-ng the guest root is the host fs over 9p/
+    virtiofs, where shadow-utils' lock (a link()-based /etc/passwd.lock) is
+    unsupported, so useradd dies with 'cannot lock /etc/passwd; try again later'
+    and never writes the entry. A plain append needs no lock, so fall back to it."""
+    def _has(db):
+        return subprocess.run(['getent', db, name], capture_output=True).returncode == 0
+    if _has('passwd'):
+        return 'already present'
+    ua = subprocess.run(['useradd', '-M', '-s', '/usr/sbin/nologin', '-u', str(uid), name],
+                        capture_output=True, text=True)
+    if _has('passwd'):
+        return 'useradd'
+    # Lock-free fallback: append the entries directly (single writer, init-time only).
+    # Works when /etc is 9p/virtiofs (writable, just lock-unfriendly).
+    _pw_line = f'{name}:x:{uid}:{uid}:ksmbd fuzz user:/nonexistent:/usr/sbin/nologin\n'
+    _gr_line = f'{name}:x:{uid}:\n'
+    try:
+        if not _has('group'):
+            with open('/etc/group', 'a') as f:
+                f.write(_gr_line)
+        with open('/etc/passwd', 'a') as f:
+            f.write(_pw_line)
+        if _has('passwd'):
+            return f'passwd-append (useradd could not lock: {ua.stderr.strip()[:60]})'
+    except OSError:
+        pass  # /etc is READ-ONLY (post-rebase VM: ext RO) — fall through to bind-mount.
+    # Read-only /etc: bind-mount writable copies of passwd (+group) with `name` appended.
+    # A bind mount edits the MOUNT NAMESPACE, not the RO backing fs, so it succeeds where
+    # both useradd (needs a lock) and a plain append (needs write perms) fail. The copy
+    # preserves every existing entry (root/nobody/…), so nothing else stops resolving.
+    import shutil
+    try:
+        pw_new, gr_new = '/tmp/.ksmbd_etc_passwd', '/tmp/.ksmbd_etc_group'
+        shutil.copy('/etc/passwd', pw_new)
+        with open(pw_new, 'a') as f:
+            f.write(_pw_line)
+        subprocess.run(['mount', '--bind', pw_new, '/etc/passwd'], capture_output=True)
+        if not _has('group'):
+            shutil.copy('/etc/group', gr_new)
+            with open(gr_new, 'a') as f:
+                f.write(_gr_line)
+            subprocess.run(['mount', '--bind', gr_new, '/etc/group'], capture_output=True)
+        if _has('passwd'):
+            return f'bind-mount (/etc read-only; useradd: {ua.stderr.strip()[:50]})'
+    except OSError as e:
+        return (f'FAILED — useradd rc={ua.returncode} ({ua.stderr.strip()[:60]}); '
+                f'append+bind-mount also failed: {e}')
+    return f'FAILED — useradd rc={ua.returncode} ({ua.stderr.strip()[:70]}); append+bind-mount had no effect'
+
 def corpus_save(corpus, features, value_pool):
     """Persist corpus to the hot /tmp DB AND write-through to the host-durable mirror.
     BOTH writes are atomic so a VM panic mid-save cannot corrupt either copy — the
@@ -244,15 +299,19 @@ def cmd_init(install_deps=False):
     # via getpwnam() at load — if `fuzz` is not in /etc/passwd, mountd DROPS the share and
     # a tree-connect returns BAD_NETWORK_NAME (the #42 aclshare failure). ksmbd.adduser only
     # populates the ksmbd SMB user DB, not /etc/passwd, so create the POSIX user too.
-    # (-M no home, nologin shell; harmless if it already exists.)
-    _ua = subprocess.run(['useradd', '-M', '-s', '/usr/sbin/nologin', 'fuzz'],
-                         capture_output=True, text=True)
-    _pw = subprocess.run(['getent', 'passwd', 'fuzz'], capture_output=True, text=True)
-    if _pw.returncode == 0:
-        print(f'[init]     system user OK: {_pw.stdout.strip()}')
+    # uid is fixed (not auto) so ownership is stable across resumes.
+    _prov = _ensure_posix_user('fuzz', 4242)
+    if _prov.startswith('FAILED'):
+        # Ground-truth WHY the lock-free append could not help: fs type of /etc (9p/
+        # virtiofs/overlay) + any stale shadow lock files left by a killed useradd.
+        _fs = subprocess.run(['stat', '-f', '-c', '%T', '/etc'], capture_output=True, text=True).stdout.strip()
+        _locks = subprocess.run('ls -1 /etc/passwd.lock /etc/.pwd.lock /etc/shadow.lock /etc/group.lock',
+                                shell=True, capture_output=True, text=True).stdout.split()
+        print(f'[init]     !!! system user fuzz {_prov} — aclshare will be dropped '
+              f'[/etc fs={_fs or "?"}; stale locks={_locks or "none"}]')
     else:
-        print(f'[init]     !!! system user fuzz MISSING (useradd rc={_ua.returncode}: '
-              f'{_ua.stderr.strip()[:120]}) — force-user shares (aclshare) will be dropped')
+        _pw = subprocess.run(['getent', 'passwd', 'fuzz'], capture_output=True, text=True)
+        print(f'[init]     system user OK via {_prov}: {_pw.stdout.strip()}')
     subprocess.run(f'ksmbd.adduser -C {CONF_FILE} -P {PWDB} -a fuzz -p fuzz'.split(), capture_output=True)
 
     # RDMA setup (before ksmbd.mountd so listener binds to IB device)
@@ -279,6 +338,27 @@ def cmd_init(install_deps=False):
 
     # Mount CIFS share (try 3.1.1, fallback to 3.0)
     print('[init] 6/9 mounting //127.0.0.1/share (dialect 3.1.1→3.0→2.1)')
+    # Turn on ksmbd's session-setup/auth diagnostics ONLY around the mount so a rejection
+    # prints its EXACT reason ("Unexpected OID", "authentication failed", a krb5/IPC error)
+    # instead of just STATUS_INVALID_PARAMETER — then silence it before the fuzz run, which
+    # would otherwise flood dmesg with millions of ops. TWO independent switches:
+    #  (1) ksmbd_debug() is gated by the ksmbd_debug_types BITMASK (glob.h), NOT dynamic-debug
+    #      — toggle it via the ksmbd-control class attr ('all' flips 0↔KSMBD_DEBUG_ALL; a fresh
+    #      boot starts at 0, so one write enables, a second disables).
+    #  (2) generic pr_debug() in the VFS/RDMA ksmbd calls into uses real dynamic-debug.
+    def _ksmbd_debug(on):
+        try:
+            with open('/sys/class/ksmbd-control/debug', 'w') as _d:
+                _d.write('all')            # toggle: 0→ALL to enable, ALL→0 to disable
+        except OSError as _e:
+            if on:
+                print(f'[init]     (ksmbd_debug bitmask not enabled: {_e})')
+    try:
+        with open('/sys/kernel/debug/dynamic_debug/control', 'w') as _dd:
+            _dd.write('file fs/smb/server/* +p')
+    except OSError as _e:
+        print(f'[init]     (dynamic-debug not enabled: {_e})')
+    _ksmbd_debug(True)
     mounted = False
     for vers in ['3.1.1', '3.0', '2.1']:
         print(f'[init]     mount attempt vers={vers} ...')
@@ -292,7 +372,22 @@ def cmd_init(install_deps=False):
         print(f'[init]     vers={vers} failed rc={r.returncode}: {r.stderr.decode().strip()[:120]}')
     if not mounted:
         print(f'[-] CIFS mount failed (all dialects): {r.stderr.decode().strip()}')
+        # Dump the ksmbd kernel-side reason (dynamic-debug enabled above) — the ground
+        # truth for WHY session setup was rejected, so we don't guess from the status code.
+        try:
+            _dk = subprocess.run(['dmesg'], capture_output=True, text=True)
+            _kl = [l for l in _dk.stdout.splitlines()
+                   if any(k in l for k in ('ksmbd', 'smb2', 'ntlm', 'OID', 'auth', 'spnego', 'IPC'))]
+            if _kl:
+                print('[init]     ksmbd kernel log (session-setup cause):')
+                for l in _kl[-14:]:
+                    print(f'[init]       {l}')
+        except OSError as _de:
+            print(f'[init]     (dmesg dump failed: {_de!r})')
         return
+    # Mount OK — silence ksmbd's SMB/AUTH debug so the fuzz run doesn't flood dmesg with
+    # per-op logging (millions of ops). The pr_err() paths still print if something breaks.
+    _ksmbd_debug(False)
 
     # Write test file
     try:
@@ -1620,6 +1715,157 @@ def cmd_validate(args):
           f"create_ctx, ndr_rpc, compound, spnego_auth")
 
 
+def cmd_selftest(args):
+    """Pre-P2 grain-VALIDITY gate — the "a grain must work" principle, made measurable.
+
+    Before P2 spends any LibFuzzer budget, run EACH grain a few times straight through
+    ctypes (pfz_grain_run → pfz_get_features) and check whether it actually reaches ksmbd
+    KERNEL code (produces kcov-dataflow coverage). A grain that yields ZERO kernel PCs on
+    every try is not a meaningful fuzz target no matter how many execs it would burn:
+      • BAIL  = returned <0 every run → it bailed at a prerequisite (no authed pool, no fid,
+                connect/auth failed, share/config missing). It never executed.
+      • DEAD  = ran (>=0) but 0 kernel PCs → its PDU never reached a ksmbd handler (rejected
+                pre-dispatch, wrong target, or the scenario is inert).
+      • WORKS = reached >= --min-pcs kernel PCs → a real, meaningful grain; pcs is its depth.
+
+    This is a seconds-scale filter over the WHOLE fleet (no VM re-boot, no LibFuzzer), so it
+    answers "are our N grains meaningful?" directly and cheaply. It requires ksmbd running
+    (`ksmbdzzer.py init` first) and the coverage bridge intact (a non-blind kernel — if EVERY
+    grain reads 0 PCs, the ksmbd kcov remote hooks are missing, not the grains). Writes the
+    meaningful set to grain/WORKING_SUBSET.txt (coverage-desc) for `-t` scoping.
+    """
+    import time
+    lib = _get_lib()                     # loads .so + pfz_init(octet): coverage handle + session + raw sock
+    # Per-grain RAW-pool re-establisher. The batch-10+ grains use the raw-socket g_pool[]
+    # (pool_ensure_fid / pool_lazy), and the conn-disrupting grains (encrypt, session_setup,
+    # smb1_*, sign, oplock_ack, logoff*, tdis*) tear that pool DOWN — and pool_lazy's _tried_n
+    # guard deliberately won't re-auth a dead-but-present pool (a throughput choice for gfuzz).
+    # In a real gfuzz run each grain is its OWN process with a fresh pool, so this contamination
+    # can't happen; here all grains share ONE process, so a disruptor makes every pool grain
+    # AFTER it false-BAIL. Re-establish g_pool[] (pfz_pool_init → pool_connect_one, the raw
+    # authed pool these grains actually use) before EACH grain to reproduce the fresh-process
+    # isolation and give an accurate WORKS/BAIL split.
+    try:
+        lib.pfz_pool_init.argtypes = [ctypes.c_int]
+        lib.pfz_pool_init.restype = ctypes.c_int
+        lib.pfz_pool_fids_ready.restype = ctypes.c_int
+        _pool_reset = True
+        pn = lib.pfz_pool_init(2)     # one-time establish of the raw g_pool[] (2 conns + fids)
+        print(f"{_dts()} [selftest] raw pool ready ({pn} conn); RESET+RETRY on all-repeats-bail "
+              f"(heals a socket a conn-disrupting grain closed; re-auths ≈ #disruptors, no storm)", flush=True)
+    except Exception as _e:
+        _pool_reset = False
+        print(f"{_dts()} [selftest] WARN pool API unavailable ({_e!r}) — pool grains may false-BAIL", flush=True)
+    n = lib.pfz_grain_count()
+    sel = set(args.target) if getattr(args, 'target', None) else None
+    # Architectural exclusions — grains that CANNOT produce per-SMB-connection kcov coverage,
+    # so the selftest can't measure them (they are NOT broken and STAY in the GRAINS[] registry
+    # for real gfuzz, which reaches ksmbd via these paths a different way):
+    #   ipc  — SMBD_GENL netlink, not an SMB connection → the IP-handle remote hook never fires
+    #   rdma — needs the RXE/SMBDirect data-plane, which the loopback selftest can't drive
+    # Reported as EXCL and left OUT of the WORKS/DEAD verdict (deactivated from the map's
+    # accounting only, per "comment in the map, not remove").
+    EXCLUDE = {"ipc", "rdma"}
+    repeats = max(1, int(getattr(args, 'repeats', 4)))
+    thresh  = max(1, int(getattr(args, 'min_pcs', 1)))
+    FEATN = 8192
+    FEAT = (ctypes.c_uint32 * FEATN)()
+    def _cov():
+        # ksmbd's kcov merge (kcov_df_remote_stop) lands AFTER the response is sent, so a
+        # single-op grain can read g_df_buf BEFORE the merge → flaky 0. Poll briefly for it
+        # (pfz_get_features doesn't reset g_df_buf, so re-reading is safe/idempotent). This
+        # closes the async-merge race that made single-op grains flaky-DEAD.
+        p = lib.pfz_get_features(FEAT, FEATN)
+        for _ in range(6):
+            if p > 0:
+                break
+            time.sleep(0.003)
+            p = lib.pfz_get_features(FEAT, FEATN)
+        return p
+    print(f"{_dts()} [selftest] {n} grains x {repeats} runs — verify each reaches ksmbd kernel "
+          f"code (>= {thresh} PC). WORKS=real / DEAD=ran-but-0-cov / BAIL=prereq-failed", flush=True)
+    works, dead, bail, excl, skipped = [], [], [], [], 0
+    t0 = time.time()
+    for i in range(n):
+        name = lib.pfz_grain_name(i).decode('ascii', 'replace')
+        if sel is not None and name not in sel:
+            skipped += 1
+            continue
+        if name in EXCLUDE:
+            # architectural — measurable coverage impossible in the loopback selftest, but the
+            # grain stays live for real gfuzz. Report and skip the WORKS/DEAD verdict entirely.
+            excl.append(name)
+            print(f"{_dts()}   [EXCL ] {name:30} (architectural — no per-conn kcov in selftest; "
+                  f"stays in fleet for gfuzz)", flush=True)
+            continue
+        best_pcs, best_ret, ran = 0, -99, False
+        for k in range(repeats):
+            # deterministic-but-varied 64-byte seed per (grain, try) so a few code paths open
+            seed = bytes(((i * 131 + k * 17 + j * 7) & 0xFF) for j in range(64))
+            ret = lib.pfz_grain_run(i, seed, len(seed))
+            pcs = _cov()                              # kernel-PC count (polls past the merge race)
+            best_ret = max(best_ret, ret)
+            best_pcs = max(best_pcs, pcs)
+            if ret >= 0:
+                ran = True
+        # Bailed on EVERY repeat? A prior conn-disrupting grain (encrypt/session_setup/smb1_*/
+        # sign/logoff/tdis) closes the pool SOCKET but leaves has_fid=1, so pool_ensure_fid
+        # reuses the stale conn and pool_xact fails on the dead socket → false BAIL. A FULL
+        # pfz_pool_init (fresh socket + fid) heals that; retry ONCE. This runs only for a
+        # bailed grain and re-heals the pool for the FOLLOWING grains too, so re-auths ≈
+        # #disruptors, NOT #grains — no storm. A genuinely-broken grain still bails on retry.
+        if not ran and _pool_reset:
+            try:
+                lib.pfz_pool_init(2)              # heal the raw g_pool[]
+                try:
+                    lib.pfz_reopen_smb_fd()       # heal the libsmbclient scratch fd (rmxattr etc.)
+                except Exception:
+                    pass
+                seed = bytes(((i * 131 + 99 * 17 + j * 7) & 0xFF) for j in range(64))
+                ret = lib.pfz_grain_run(i, seed, len(seed))
+                pcs = _cov()
+                best_ret = max(best_ret, ret)
+                best_pcs = max(best_pcs, pcs)
+                if ret >= 0:
+                    ran = True
+            except Exception:
+                pass
+        if best_pcs >= thresh:
+            verdict = "WORKS"; works.append((name, best_pcs))
+        elif not ran:
+            verdict = "BAIL"; bail.append(name)
+        else:
+            verdict = "DEAD"; dead.append(name)
+        bar = "#" * min(40, best_pcs // 8)
+        print(f"{_dts()}   [{verdict:5}] {name:30} pcs={best_pcs:6} ret={best_ret:4}  {bar}", flush=True)
+    dt = time.time() - t0
+    print(f"{_dts()} [selftest] DONE {dt:.1f}s — {len(works)} WORKS / {len(dead)} DEAD / "
+          f"{len(bail)} BAIL" + (f" / {len(excl)} EXCL" if excl else "")
+          + (f" / {skipped} skipped" if skipped else "") + f"  (of {n})", flush=True)
+    if excl:
+        print(f"{_dts()}   EXCL (architectural — kept in fleet, unmeasurable here): {sorted(excl)}", flush=True)
+    if bail:
+        print(f"{_dts()}   BAIL (prereq/setup failed — need pool/auth/fid/config): {sorted(bail)}", flush=True)
+    if dead:
+        print(f"{_dts()}   DEAD (ran but 0 kernel PCs — remove or fix): {sorted(dead)}", flush=True)
+    if works and not dead and not bail:
+        print(f"{_dts()}   all grains reached the kernel — fleet is fully meaningful", flush=True)
+    # persist the meaningful subset (coverage-desc) for `-t` scoping / campaign curation
+    try:
+        out = SCRIPT_DIR / 'grain' / 'WORKING_SUBSET.txt'
+        out.parent.mkdir(exist_ok=True)
+        with open(out, 'w') as f:
+            f.write(f"# ksmbdzzer selftest {_dts()} — grains that reached ksmbd kernel code "
+                    f"(>= {thresh} PC), coverage desc. {len(works)}/{n - skipped} working.\n")
+            f.write("# regenerate: ksmbdzzer.py selftest ; use: "
+                    "-t $(grep -v '^#' grain/WORKING_SUBSET.txt)\n")
+            for name, pcs in sorted(works, key=lambda x: -x[1]):
+                f.write(f"{name}\n")
+        print(f"{_dts()} [selftest] wrote {len(works)} working grains → {out}", flush=True)
+    except OSError as e:
+        print(f"{_dts()} [selftest] could not write WORKING_SUBSET.txt: {e}", flush=True)
+
+
 def cmd_grain_fuzz(args):
     """Clean 4-PHASE GRAIN orchestrator (the consolidated architecture):
         P1 enumerate grains (the normal-scenario library)
@@ -1676,6 +1922,26 @@ def cmd_grain_fuzz(args):
             return
     print(f"ksmbdzzer 4-phase GRAIN fuzzer — {rounds} round(s), {procs} CPUs, {n} grains",
           flush=True)
+    # Which coverage/mutator ablation is this run? (set by engine_compare_campagin.sh via
+    # KSMBDZZER_ENGINE). Shown in #FFC0CB bold so the active arm is unmistakable in a
+    # combined multi-arm log. Re-teal (_LOG_COLOR) after the name so the trailing key stays
+    # in this module's colour; the print override appends the final reset.
+    _eng = os.environ.get('KSMBDZZER_ENGINE', 'dataflow')
+    print(f"  [ENGINE] gfuzz coverage/mutator engine = {_PINK_BOLD}{_eng}{_LOG_RESET}{_LOG_COLOR}"
+          f"   (dataflow = pc⊕val coverage + i2s · dataflow-vec = whole-arg vector, "
+          f"value-class-normalized (pointer/scalar) + i2s · dataflow-rel = dataflow-vec + "
+          f"within-record pairwise cmp3 · pc-i2s = pc-only + i2s · pc-havoc = pc-only + havoc)",
+          flush=True)
+    # Auth policy → grain env (grains are launched with os.environ). --everytime-auth restores
+    # the original per-grain fresh-NTLMv2 pool handshake; default is lazy/session-reuse.
+    if getattr(args, 'everytime_auth', False):
+        os.environ['KSMBDZZER_EVERYTIME_AUTH'] = '1'
+        print("  [auth] --everytime-auth: EVERY grain does a fresh pool NTLMv2 handshake "
+              "(heavier ksmbd.mountd load)", flush=True)
+    else:
+        os.environ.pop('KSMBDZZER_EVERYTIME_AUTH', None)
+        print("  [auth] lazy/session-reuse (default): only pool grains authenticate the pool "
+              "— avoids the per-grain mountd auth storm", flush=True)
     # In-guest watchdog: recover a USERSPACE stall (hung grain/wave) by killing the
     # stuck grain children in-guest instead of letting the host reboot the VM. Kernel
     # wedges (which starve this thread too) still fall through to the host watchdog.
@@ -1821,10 +2087,33 @@ def cmd_grain_fuzz(args):
                       f"round (intermediate rounds stay fast so feed-forward reaches round "
                       f"{rnd+1})", flush=True)
                 pairs = []
+            # Optional P3 budget. KSMBDZZER_P3_MAX_COMBOS caps the all-pairs sweep so a
+            # TIME-BOXED run (the engine-comparison campaign) finishes P3 and powers off
+            # cleanly instead of tripping the VM hard-cap mid-sweep — the failure mode where
+            # PREP alone (one harness compiled per pair) burns ~20 min and the sweep never
+            # completes. 0 = skip P3 entirely; N>0 = run only the first N pairs; unset =
+            # full C(n+1,2). Capping bounds PREP too (harness count == pair count). P3 is a
+            # crash-yield refinement and contributes nothing to the coverage comparison, so
+            # the comparison arms default it to 0.
+            _p3cap = os.environ.get('KSMBDZZER_P3_MAX_COMBOS')
+            if pairs and _p3cap is not None and _p3cap.isdigit() and int(_p3cap) < len(pairs):
+                _cap = int(_p3cap)
+                print(f"{_dts()}   [P3 cap] KSMBDZZER_P3_MAX_COMBOS={_cap}: "
+                      f"{'SKIP P3' if _cap == 0 else f'sampling {_cap}/{len(pairs)} combos'} "
+                      f"(budget-bounded so the VM powers off before the hard-cap)", flush=True)
+                pairs = pairs[:_cap]
             if pairs:
                 _pt = time.time()
                 _cf0 = len(list(FINDINGS_DIR.glob('*.json'))) if FINDINGS_DIR.exists() else 0
+                # generate_grain_combo_pool() is a SILENT stretch (1 compile of the generic
+                # combo harness + up to C(n+1,2) symlinks + dict writes) that used to print
+                # nothing until [P3 START] — a run killed here looked wedged. Bracket it so the
+                # phase is visible while it builds.
+                print(f"{_dts()}   [P3 PREP] building {len(pairs)} all-pairs combo harnesses "
+                      f"(1 compile + symlink pool)…", flush=True)
                 cgrains = generate_grain_combo_pool(pairs, vpool)   # 1 compile + symlinks
+                print(f"{_dts()}   [P3 PREP END] {time.time()-_pt:.0f}s — {len(cgrains)} combo "
+                      f"harnesses ready; starting the execution sweep", flush=True)
                 print(f"{_dts()}   [P3 START] combination phase: {len(cgrains)}/{len(pairs)} "
                       f"all-pairs grain combos (C({n}+1,2), r=2 over every grain), {procs}-way "
                       f"execution pool — the highest crash/finding-yield phase", flush=True)
@@ -1854,6 +2143,14 @@ def cmd_grain_fuzz(args):
         except Exception as _p4e:
             print(f"{_dts()}   [P4] corpus save failed: {_p4e!r}", flush=True)
     print("=== 4-phase grain campaign done ===", flush=True)
+    # Force immediate exit. After the campaign, lingering daemons (ksmbd.mountd, the KDC)
+    # and the daemon watchdog thread keep the process/serial pipe open, so a plain return
+    # leaves gfuzz "done" but not exited — vng never sees the --exec command finish and the
+    # host STALL watchdog burns 420s per arm before killing the idle VM. os._exit(0) skips
+    # atexit/thread-join and terminates now; all output is already flushed, and the shell's
+    # trailing `poweroff -f` then powers the guest off cleanly.
+    sys.stdout.flush(); sys.stderr.flush()
+    os._exit(0)
 
 
 def _default_procs():
@@ -1935,6 +2232,11 @@ def main():
                          '(default: 1). This is the depth knob (round-based, not time-based).')
     gp.add_argument('-procs', type=int, default=_default_procs(), metavar='N',
                     help='Parallel grain workers (default: all CPUs). P3 combination needs >= 2.')
+    gp.add_argument('--everytime-auth', dest='everytime_auth', action='store_true',
+                    help='Make EVERY grain do a fresh pool NTLMv2 handshake up front (original '
+                         'behaviour). Default is lazy/session-reuse: only pool-based grains '
+                         'authenticate the pool, avoiding the per-grain mountd-IPC auth storm '
+                         'that 0-execs the fleet under -procs>1.')
     gp.add_argument('--grain-sat', dest='grain_sat', type=float, default=0.02, metavar='R',
                     help='Per-grain coverage-saturation ratio: stop a grain when new-feature '
                          'growth drops below R for a few windows (default: 0.02).')
@@ -1948,12 +2250,95 @@ def main():
     gp.add_argument('--verbose', action='store_true',
                     help='Extra per-grain diagnostics (i2s hits, kernel-PC counts).')
 
+    stp = sub.add_parser(
+        'selftest',
+        help=('Pre-P2 grain-VALIDITY check: run each grain a few times and verify it '
+              'reaches ksmbd KERNEL code (produces coverage). Cheap fleet-wide filter '
+              'for "which grains are meaningful" — WORKS/DEAD/BAIL per grain + writes '
+              'grain/WORKING_SUBSET.txt. Needs `init` first + a non-blind kernel.'),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=('examples:\n'
+                '  ksmbdzzer.py init && ksmbdzzer.py selftest        # validate the whole fleet\n'
+                '  ksmbdzzer.py selftest --repeats 5 --min-pcs 3      # stricter\n'
+                '  ksmbdzzer.py selftest -t write copychunk lock_array # a subset\n'))
+    stp.add_argument('--repeats', type=int, default=3, metavar='N',
+                     help='Runs per grain; MAX kernel-PC count is taken (default 3). More = '
+                          'lets pool-bootstrap/ramp settle, fewer false DEADs.')
+    stp.add_argument('--min-pcs', dest='min_pcs', type=int, default=1, metavar='N',
+                     help='Min kernel PCs to count a grain as WORKS (default 1 = reached ksmbd '
+                          'at all). Raise to filter shallow reject-path grains.')
+    stp.add_argument('-t', '--target', dest='target', nargs='+', metavar='GRAIN', default=None,
+                     help='Only check these grains (default: whole fleet).')
+
+    bg = sub.add_parser(
+        'build-grains',
+        help=('HOST-side pre-build of the whole grain fleet so the in-guest P1 hits '
+              'the compile cache and skips clang (turns the 11–20 min 9p rebuild into '
+              'seconds). Grains are deterministic, so this is safe to reuse every run.'))
+    bg.add_argument('--dynamic', action='store_true',
+                    help=('Link -lksmbdzzer with an rpath to libksmbdzzer.so (default is '
+                          'STATIC-embed: libksmbdzzer.c compiled into each grain, no '
+                          '.so runtime dependency — more robust over 9p).'))
+
     args = parser.parse_args()
     if args.cmd == 'init': cmd_init(install_deps=args.install_deps)
     elif args.cmd in ('gfuzz', 'fuzz'): cmd_grain_fuzz(args)
+    elif args.cmd == 'selftest': cmd_selftest(args)
     elif args.cmd == 'validate': cmd_validate(args)
     elif args.cmd == 'probe-test': cmd_probe_test()
+    elif args.cmd == 'build-grains': cmd_build_grains(args)
     else: parser.print_help()
+
+
+def cmd_build_grains(args):
+    """HOST-side pre-build of the grain fleet (P1 offload).
+
+    Grains are deterministic — the per-round value_pool goes into the .dict, not the
+    C source, so identical source ⇒ identical binary. Building the fleet here on the
+    native FS (seconds) lets the in-guest P1 hit the byte-identical-source compile
+    cache and SKIP clang, instead of recompiling ~34 harnesses over the slow 9p mount
+    (~11–20 min — the biggest driver of timeout-flakiness). If a binary is missing or
+    stale in-guest, P1 still falls back and compiles it (the existing _compile path),
+    so this is a pure speedup, never a hard dependency.
+
+    Default build is STATIC-embed (libksmbdzzer.c compiled into each grain; no
+    libksmbdzzer.so runtime dep — robust over 9p). --dynamic keeps the -lksmbdzzer link.
+    Full `-static` is impossible: libsmbclient ships only as a .so, so it stays dynamic."""
+    import sys, glob, time as _t
+    sys.path.insert(0, str(SCRIPT_DIR))
+    os.environ['KSMBDZZER_FORCE_BUILD'] = '1'   # explicit rebuild: bypass the compile cache
+    if getattr(args, 'dynamic', False):
+        os.environ.pop('KSMBDZZER_STATIC', None)
+        print("  [build-grains] DYNAMIC build (-lksmbdzzer, rpath to libksmbdzzer.so)",
+              flush=True)
+    else:
+        os.environ['KSMBDZZER_STATIC'] = '1'
+        print("  [build-grains] STATIC-embed build (libksmbdzzer.c compiled into each "
+              "grain; only system .so remain dynamic — robust over 9p)", flush=True)
+    lib = _get_lib()
+    if lib is None:
+        print("  [build-grains] libksmbdzzer.so failed to load — build the .so first "
+              "(cc -shared ... libksmbdzzer.c). Aborting.", flush=True)
+        return
+    n = lib.pfz_grain_count()
+    grains = [(i, lib.pfz_grain_name(i).decode()) for i in range(n)]
+    vpool = [0, 64, 4096, 0x1000, 0xFFFF, 0x40000116]   # binary-independent (→ .dict only)
+    from grain import generate_grains, generate_all_grains, generate_v2_grains
+    from grain.gen import GRAIN_DIR
+    t0 = _t.time(); total = 0
+    for label, fn in (('lib', lambda: generate_grains(grains, vpool)),
+                      ('raw', lambda: generate_all_grains(vpool)),
+                      ('v2',  lambda: generate_v2_grains())):
+        try:
+            got = [x for x in (fn() or []) if x and x[0]]
+            total += len(got)
+            print(f"  [build-grains] {label}: {len(got)} harness(es)", flush=True)
+        except Exception as e:
+            print(f"  [build-grains] {label} FAILED: {e!r}", flush=True)
+    bins = [p for p in glob.glob(str(GRAIN_DIR / 'grain_*'))
+            if not p.endswith('.c') and not p.endswith('.dict')]
+    print(f"  [build-grains] done in {_t.time()-t0:.0f}s — {total} built this run, "
+          f"{len(bins)} grain binaries now in {GRAIN_DIR}", flush=True)
 
 
 def cmd_probe_test():

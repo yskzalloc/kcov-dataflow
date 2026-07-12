@@ -17,6 +17,76 @@ SCRIPT_DIR = Path(__file__).parent
 # so reusing them across arms is correct). Override with KSMBDZZER_GRAIN_DIR.
 GRAIN_DIR = Path(os.environ.get('KSMBDZZER_GRAIN_DIR', str(SCRIPT_DIR / '.grains')))
 CRASH_DIR = Path('/tmp/ksmbdzzer_crashes')
+
+# ─── static-embed build (host pre-build offload) ────────────────────────────
+# Grains are DETERMINISTIC — the per-round value_pool is fed to libFuzzer via the
+# .dict, NOT baked into the C source, so identical source ⇒ identical binary. That
+# means the whole fleet can be pre-built ON THE HOST (`ksmbdzzer.py build-grains`,
+# native FS, seconds) and the in-guest P1 then hits the compile cache and SKIPS clang
+# entirely, instead of recompiling over the slow 9p mount (~11–20 min — the biggest
+# source of timeout-driven flakiness). Full `-static` is impossible here: libsmbclient
+# ships only as a .so (plus a tree of samba-private .so with no static archives), so a
+# grain must load it dynamically at runtime. STATIC mode instead EMBEDS our own
+# libksmbdzzer.c straight into each grain and drops -lksmbdzzer/rpath — the grain then
+# depends only on stable system .so (libsmbclient, libcrypto, …), NOT on libksmbdzzer.so
+# being loadable over 9p. Toggle with KSMBDZZER_STATIC=1 (set by build-grains).
+def _static_build():
+    v = os.environ.get('KSMBDZZER_STATIC')
+    return bool(v and v != '0')
+
+_SAMBA_INC = next((p for p in ('/usr/include/samba-4.0',) if os.path.isdir(p)), None)
+
+def _grain_clang_argv(bp, sp, ntlmv2, dyn_extra_libs):
+    """clang argv for one grain harness.
+    dynamic (default): link -lksmbdzzer with an rpath to the .so.
+    static  (KSMBDZZER_STATIC=1): compile libksmbdzzer.c straight in — no .so dep."""
+    LIB_DIR = str(SCRIPT_DIR.parent)
+    argv = ['clang', '-fsanitize=fuzzer', '-O2']
+    if ntlmv2:
+        argv += ['-DUSE_NTLMV2']
+    argv += [f'-I{GRAIN_DIR}']
+    if _static_build():
+        argv += [f'-I{LIB_DIR}']
+        if _SAMBA_INC:
+            argv += [f'-I{_SAMBA_INC}']
+        # libksmbdzzer.c always needs the full system-lib set (crypto/pthread/rdma).
+        return argv + ['-o', str(bp), str(sp), str(Path(LIB_DIR) / 'libksmbdzzer.c'),
+                       '-lsmbclient', '-lpthread', '-lrdmacm', '-libverbs', '-lcrypto']
+    return argv + ['-o', str(bp), str(sp),
+                   f'-L{LIB_DIR}', '-lksmbdzzer', f'-Wl,-rpath,{LIB_DIR}'] + dyn_extra_libs
+
+
+def _clang_atomic(bp, sp, ntlmv2, extra):
+    """Compile grain `sp` to `bp`, but link to a UNIQUE temp path first and
+    os.replace() it into bp only on success.
+
+    clang's `-o` overwrites its output IN PLACE. Doing that to bp while a
+    previous instance of the same grain is still exec'ing off the 9p GRAIN_DIR
+    truncates the file under ld.so's mmap — the loader then dereferences a NULL
+    l_info entry reading ->d_un (offset 8) and dies with "segfault at 8" in
+    ld-linux (the storm we saw dominate the havoc engine's log). os.replace
+    swaps the directory entry atomically on the same fs, so a running exec keeps
+    the OLD inode (unlinked-on-last-close) and never sees a half-written ELF.
+    Returns the CompletedProcess of the clang run (rc + stderr) for the caller."""
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=str(Path(bp).parent), prefix='.build.')
+    os.close(fd)
+    rr = subprocess.run(_grain_clang_argv(Path(tmp), sp, ntlmv2, extra),
+                        capture_output=True)
+    if rr.returncode == 0:
+        try:
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, str(bp))       # atomic swap; running execs keep old inode
+            return rr
+        except OSError:
+            pass
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    return rr
+
+
 # Durability (overcomes "learning lost on VM wedge"): the distilled DB — arbiter
 # feedback (fb.bin), and a corpus/value_pool mirror — lives on the repo mount
 # (9p-visible to the host), NOT guest /tmp. A VM crash costs the in-flight round,
@@ -156,8 +226,15 @@ def _compile(name, src, value_pool=None, extra_dict=None):
     old_src = sp.read_text() if sp.exists() else None
     sp.write_text(src)
     dp = _write_dict(name, extra_dict, value_pool)
-    if bp.exists() and old_src == src:
-        deps = [Path(LIB_DIR) / 'libksmbdzzer.so',
+    # KSMBDZZER_FORCE_BUILD (set by `build-grains`) bypasses the cache so an explicit
+    # rebuild — e.g. switching dynamic⇄static — actually re-runs clang even when the
+    # source is byte-identical to what produced the current binary.
+    _force = os.environ.get('KSMBDZZER_FORCE_BUILD')
+    if bp.exists() and old_src == src and not (_force and _force != '0'):
+        # libksmbdzzer.c is a dep because STATIC builds embed it (a .so-only dep would
+        # miss a lib edit); the .so covers the dynamic case. Both are listed so a lib
+        # change invalidates the cache regardless of which mode produced the binary.
+        deps = [Path(LIB_DIR) / 'libksmbdzzer.so', Path(LIB_DIR) / 'libksmbdzzer.c',
                 SCRIPT_DIR / 'common.h', SCRIPT_DIR / 'ntlmv2.h',
                 SCRIPT_DIR.parent / 'libksmbdzzer.h']
         try:
@@ -167,21 +244,21 @@ def _compile(name, src, value_pool=None, extra_dict=None):
         except OSError:
             pass
 
-    link_flags = [f'-L{LIB_DIR}', '-lksmbdzzer', f'-Wl,-rpath,{LIB_DIR}']
-
-    # Try with NTLMv2 (requires libcrypto)
-    r = subprocess.run(
-        ['clang', '-fsanitize=fuzzer', '-O2', '-DUSE_NTLMV2',
-         f'-I{GRAIN_DIR}', '-o', str(bp), str(sp)] + link_flags + ['-lcrypto'],
-        capture_output=True)
+    # Try with NTLMv2 (requires libcrypto). _clang_atomic links to a temp then
+    # os.replace()s into bp, so an in-flight exec of the prior binary is never
+    # truncated mid-mmap (the ld-linux "segfault at 8" storm).
+    r = _clang_atomic(bp, sp, True, ['-lcrypto'])
     if r.returncode == 0:
         return (str(bp), dp)
     # Fallback: without NTLMv2 (guest auth only)
-    r = subprocess.run(
-        ['clang', '-fsanitize=fuzzer', '-O2',
-         f'-I{GRAIN_DIR}', '-o', str(bp), str(sp)] + link_flags,
-        capture_output=True)
-    return (str(bp), dp) if r.returncode == 0 else (None, None)
+    r2 = _clang_atomic(bp, sp, False, [])
+    if r2.returncode == 0:
+        return (str(bp), dp)
+    # Both failed — surface the (static path's) reason so build-grains isn't silent.
+    err = (r.stderr or b'').decode('utf-8', 'replace').strip().splitlines()
+    if err:
+        print(f"  [_compile] grain_{name} FAILED: {err[-1]}", flush=True)
+    return (None, None)
 
 
 # ─── VFS-based grains (use mounted file, no socket needed) ──────────────────
@@ -1316,18 +1393,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         if hdr_src.exists():
             import shutil; shutil.copy2(hdr_src, GRAIN_DIR / hdr)
     sp.write_text(src)
-    LIB_DIR = str(SCRIPT_DIR.parent)
-    link_flags = [f'-L{LIB_DIR}', '-lksmbdzzer', f'-Wl,-rpath,{LIB_DIR}']
-    # Link with -lpthread
-    r = subprocess.run(
-        ['clang', '-fsanitize=fuzzer', '-O2', '-DUSE_NTLMV2',
-         f'-I{GRAIN_DIR}', '-o', str(bp), str(sp)] + link_flags + ['-lcrypto', '-lpthread'],
-        capture_output=True)
+    # Same static-embed vs dynamic build path as _compile (mt_race also needs
+    # -lpthread), and the same atomic temp+replace so a live exec is never
+    # truncated mid-mmap.
+    r = _clang_atomic(bp, sp, True, ['-lcrypto', '-lpthread'])
     if r.returncode != 0:
-        r = subprocess.run(
-            ['clang', '-fsanitize=fuzzer', '-O2',
-             f'-I{GRAIN_DIR}', '-o', str(bp), str(sp)] + link_flags + ['-lpthread'],
-            capture_output=True)
+        r = _clang_atomic(bp, sp, False, ['-lpthread'])
     return (str(bp), dp) if r.returncode == 0 else (None, None)
 
 
@@ -1792,8 +1863,16 @@ int LLVMFuzzerInitialize(int *a, char ***b){ (void)a; (void)b;
        readiness so a grain that stays shallow because fids<2 (raw guest auth or
        create failed) is visible as a harness gap, not mistaken for a hardened
        target. Captured by run_grains → "[!] PREREQ ...". */
-    int _pn = pfz_pool_init_authed(2);
-    pfz_err("POOL grain=%(name)s n=%%d fids=%%d\\n", _pn, pfz_pool_fids_ready());
+    /* Pool init is LAZY by default (#3): pool-based grains (copychunk/lease/compound) init the
+       pool on their first op via pool_lazy(); the non-pool majority never does the pool auth,
+       so there is no per-grain NTLMv2 storm against ksmbd.mountd. With `gfuzz --everytime-auth`
+       (KSMBDZZER_EVERYTIME_AUTH) every grain does a fresh pool NTLMv2 handshake up front — the
+       original behaviour, kept switchable for A/B and stress testing. */
+    const char *_ea = getenv("KSMBDZZER_EVERYTIME_AUTH");
+    if (_ea && _ea[0] && _ea[0] != '0') {
+        int _pn = pfz_pool_init_authed(2);
+        pfz_err("POOL grain=%(name)s n=%%d fids=%%d\\n", _pn, pfz_pool_fids_ready());
+    }
     return 0;
 }
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size){
@@ -1999,7 +2078,7 @@ def _fuzz_until_saturated(cmd, sat_ratio=0.02, poll=5, patience=3,
     proc = subprocess.Popen(cmd + [f'-max_total_time={int(max_time)}'],
                             stderr=subprocess.PIPE, stdout=subprocess.DEVNULL,
                             text=True, bufsize=1, env=env, start_new_session=True)
-    st = {'ft': 0, 'ft0': None, 'cov': 0, 'execs': 0, 'tail': [], 'pool': None}
+    st = {'ft': 0, 'ft0': None, 'cov': 0, 'execs': 0, 'tail': [], 'pool': None, 'keep': []}
     ftre = re.compile(r'\bft:\s*(\d+)')
     covre = re.compile(r'\bcov:\s*(\d+)')
     exre = re.compile(r'^#(\d+)\b')
@@ -2008,6 +2087,13 @@ def _fuzz_until_saturated(cmd, sat_ratio=0.02, poll=5, patience=3,
         for line in proc.stderr:
             if 'POOL grain=' in line:     # #4 prerequisite report from the grain harness
                 st['pool'] = line.strip()
+            # Persist the low-volume harness diagnostics that would otherwise be lost to
+            # the rolling-tail trim on a long run: CMP_SAMPLE (first 16 cmp operands +
+            # their PTR/TRIV/OK class → is the i2s ring starved by filtering?) and
+            # GRAIN_SETUP_FAIL (connect-vs-auth death cause). Kept in a separate,
+            # never-trimmed list (bounded) and prepended to the returned tail.
+            if ('CMP_SAMPLE' in line or 'GRAIN_SETUP_FAIL' in line) and len(st['keep']) < 48:
+                st['keep'].append(line)
             m = ftre.search(line)
             if m:
                 st['ft'] = int(m.group(1))
@@ -2029,15 +2115,49 @@ def _fuzz_until_saturated(cmd, sat_ratio=0.02, poll=5, patience=3,
     last_ft = 0
     low = 0
     saturated = False
+    # MIN-EXECS FLOOR before a grain may be declared saturated. libFuzzer's first
+    # ~2 execs are the initial/replayed inputs (no CustomMutator); the i2s/RedQueen
+    # only starts splicing from exec ~3 and needs a run of mutations to land a
+    # trace_cmp/entry-arg splice. A network-slow grain (ops racing a busy ksmbd) that
+    # plateaus in ft at ~4 execs was killed at min_time BEFORE the RedQueen ever ramped,
+    # so CMP_I2S_HITS/RET_TOKEN_HITS read 0 even though the engine works. Hold off the
+    # saturation break until MIN_SAT_EXECS so value-injection gets to explore the
+    # plateau (often finding coverage plain havoc missed — the point of i2s). Still
+    # hard-bounded by max_time, so a truly stuck grain is not extended indefinitely.
+    MIN_SAT_EXECS = 32
+    # Above this exec count, a plateaued grain (ratio<sat_ratio) is a fast-flat monkey —
+    # break immediately instead of waiting out `patience` windows (~10s saved per grain).
+    FAST_FLAT_EXECS = 200000
+    # FAST-BAIL a MISALIGNED free-runner (#2). A grain whose session never established
+    # free-runs the harness IN-PROCESS (no SMB round-trip), so its exec rate is orders of
+    # magnitude above what a networked grain can reach — even loopback RTT caps a real grain
+    # far below this. Such grains contribute ~0 kernel PCs yet burned their FULL budget (the
+    # "misaligned, ft<100" grains that hit the 2^23 exec cap = ~90% of the dataflow-arm
+    # fleet, the dominant wasted wall-clock). Kill one the moment the rate proves non-
+    # networked AND coverage stayed shallow. min_time is still honored (a briefly-fast
+    # productive grain gets its ramp), and ALIGNED grains (ft high) are never bailed.
+    NET_IMPOSSIBLE_EXECS = 50000     # floor before the rate test can fire
+    NET_IMPOSSIBLE_RATE  = 20000     # execs/s no real SMB-round-trip grain can sustain
     while proc.poll() is None:
         time.sleep(poll)
         ft = st['ft']
         elapsed = time.time() - start
         ratio = (ft - last_ft) / max(1, ft)   # relative feature growth this window
         last_ft = ft
-        if elapsed >= min_time and ratio < sat_ratio:
+        # Misaligned free-runner (#2): non-networked exec rate + shallow coverage → bail now.
+        if (elapsed >= min_time and st['execs'] > NET_IMPOSSIBLE_EXECS
+                and st['execs'] / max(0.1, elapsed) > NET_IMPOSSIBLE_RATE
+                and ft < ALIGN_MIN_FT):
+            saturated = True
+            break
+        if elapsed >= min_time and ratio < sat_ratio and st['execs'] >= MIN_SAT_EXECS:
             low += 1
-            if low >= patience:
+            # Fast-flat monkey: a grain churning a huge exec count with NO feature growth
+            # is DEFINITIVELY saturated — a productive grain would still be minting features
+            # (ratio>=sat_ratio resets `low`). Break without the full `patience` wait so its
+            # wasted budget goes to productive grains. min_time is still honored (RedQueen got
+            # its ramp) and the pre_kill_delay desync still staggers teardown (no exit-storm).
+            if low >= patience or st['execs'] >= FAST_FLAT_EXECS:
                 saturated = True
                 break
         else:
@@ -2083,7 +2203,7 @@ def _fuzz_until_saturated(cmd, sat_ratio=0.02, poll=5, patience=3,
         print(f"    [!] PREREQ {st['pool']} — pool-based grains will BAIL "
               f"(harness gap, not a hardening signal)", flush=True)
     return (st['ft'], st['cov'], st['execs'], time.time() - start, saturated,
-            "".join(st['tail']), st['ft0'] or 0)
+            "".join(st['keep']) + "".join(st['tail']), st['ft0'] or 0)
 
 
 _KASAN_PATTERNS = (
@@ -2195,6 +2315,100 @@ def _run_bounded(cmd, env=None, timeout=120):
     return False
 
 
+import threading as _threading
+# Fleet-wide DEDUPLICATED kernel-PC union (#1). Each C grain dumps its raw 2^17-bit
+# pc_bitmap to env GRAIN_PCBMP whenever it finds new PCs; we OR every grain's bitmap into
+# this one. popcount(union) is the throughput-FAIR primary metric — vs the per-grain
+# popcount SUM (_fleet_kpcs) which double-counts shared PCs and rewards the cheapest-per-
+# exec engine (havoc reached 20x the SUM purely by cycling more grains). Cumulative across
+# waves AND rounds (a union only grows), so it is a module global, not reset per run_grains.
+_PC_UNION_BYTES = (1 << 17) // 8              # 16384 — matches C pc_bitmap / g_pc_bitmap
+_pc_union = bytearray(_PC_UNION_BYTES)
+_pc_union_lock = _threading.Lock()
+
+
+def _pc_union_add(path):
+    """OR one grain's dumped PC bitmap into the fleet union; return the union popcount.
+    Missing/short file (grain found no new PCs, or was SIGKILLed before a dump) → no-op.
+    Idempotent: the union only grows, so re-reading a stale dump is harmless."""
+    try:
+        with open(path, 'rb') as fh:
+            b = fh.read(_PC_UNION_BYTES)
+    except OSError:
+        b = None
+    with _pc_union_lock:
+        if b:
+            u = (int.from_bytes(_pc_union, 'big')
+                 | int.from_bytes(b.ljust(_PC_UNION_BYTES, b'\0'), 'big'))
+            _pc_union[:] = u.to_bytes(_PC_UNION_BYTES, 'big')
+        return bin(int.from_bytes(_pc_union, 'big')).count('1')
+
+
+# ─── guest-tmpfs exec staging (keep the loader off the 9p mount) ─────────────
+# GRAIN_DIR lives on the 9p host mount so the compile cache survives VM runs.
+# But exec'ing an ELF (or dlopen'ing its rpath'd libksmbdzzer.so) straight off
+# 9p is what produced the ld-linux "segfault at 8" storm: 9p's mmap/page-cache
+# coherence is loose, so the loader can map a stale/half-updated page and fault
+# reading a NULL l_info->d_un. The atomic re-link (_clang_atomic) closes the
+# in-place-rewrite race; staging closes the rest by copying each grain (and, for
+# the dynamic build, libksmbdzzer.so) into guest-local tmpfs and running it from
+# there — the loader then only ever reads stable, 9p-independent pages. Even the
+# custom clang faulted this way because it, too, is run off the mounted repo;
+# for the grains this removes 9p from the loader's path entirely.
+_STAGE_DIR = Path(os.environ.get('KSMBDZZER_STAGE_DIR', '/dev/shm/ksmbdzzer_bin'))
+
+
+def _stage_file_atomic(src, dst):
+    """Copy src→dst race-safely, skipping when dst is already current. Parallel
+    _run_one slots stage the SAME binary (every combo-pool symlink resolves to
+    grain_gc), so a unique-temp + os.replace keeps a concurrent exec from ever
+    seeing a half-copied file — the same discipline as _copy_header_atomic."""
+    try:
+        s = os.stat(src)
+        if dst.exists():
+            d = dst.stat()
+            if d.st_size == s.st_size and d.st_mtime >= s.st_mtime:
+                return                     # already staged and current
+    except OSError:
+        return
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=str(dst.parent), prefix='.stage.')
+    os.close(fd)
+    try:
+        shutil.copy2(src, tmp)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, str(dst))          # atomic on the same tmpfs
+    except OSError:
+        try: os.unlink(tmp)
+        except OSError: pass
+
+
+def _stage_for_exec(binary):
+    """Return (run_path, env_overrides) for exec'ing `binary` from guest tmpfs
+    instead of the 9p GRAIN_DIR. Follows combo-pool symlinks to the real
+    grain_gc, stages the ELF, and (for the dynamic build) stages libksmbdzzer.so
+    and points LD_LIBRARY_PATH at it — LD_LIBRARY_PATH is searched before the
+    clang-emitted DT_RUNPATH, so the .so is resolved from tmpfs too. STATIC
+    grains have no .so dep, so that copy is a no-op. Never fatal: on any error it
+    falls back to the original 9p path so a run is never blocked."""
+    try:
+        _STAGE_DIR.mkdir(parents=True, exist_ok=True)
+        real = Path(os.path.realpath(binary))    # resolve grain_gc_a_b → grain_gc
+        dst = _STAGE_DIR / real.name
+        _stage_file_atomic(real, dst)
+        if not dst.exists():
+            return binary, {}
+        env_over = {}
+        so_src = SCRIPT_DIR.parent / 'libksmbdzzer.so'
+        if so_src.exists():
+            _stage_file_atomic(so_src, _STAGE_DIR / 'libksmbdzzer.so')
+            prev = os.environ.get('LD_LIBRARY_PATH', '')
+            env_over['LD_LIBRARY_PATH'] = f"{_STAGE_DIR}:{prev}".rstrip(':')
+        return str(dst), env_over
+    except OSError:
+        return binary, {}
+
+
 def run_grains(grains, sat_ratio=0.02, max_time=180, parallelism=4, out_stats=None):
     """Run grain harnesses in PARALLEL — each libFuzzer grain on its OWN
     127.0.0.<n> so ksmbd routes each grain's kernel coverage to its own buffer
@@ -2203,6 +2417,10 @@ def run_grains(grains, sat_ratio=0.02, max_time=180, parallelism=4, out_stats=No
     crash check + result aggregation are serial. Returns list of crashes."""
     from concurrent.futures import ThreadPoolExecutor
     CRASH_DIR.mkdir(exist_ok=True)
+    # Per-grain high-water of the flaky per-process i2s counters (see _run_one). Persists
+    # across this round's waves + retries so a productive invocation isn't zeroed by a later
+    # flaky 0-exec one. {name: {'ch','rh','execs','kpcs','cmpr','entr','retr'}}
+    run_grains._i2s_hw = {}
     live_dict = Path('/tmp/ksmbdzzer_live.dict')
     PERSISTENT_CORPUS = Path('/tmp/ksmbdzzer_corpus_persistent')
     PERSISTENT_CORPUS.mkdir(exist_ok=True)
@@ -2307,8 +2525,18 @@ def run_grains(grains, sat_ratio=0.02, max_time=180, parallelism=4, out_stats=No
 
     def _run_one(slot_item):
         slot, (binary, dict_path) = slot_item
-        name = Path(binary).stem
+        name = Path(binary).stem                   # keep the 9p name → corpus/metrics routing
+        # Run from guest tmpfs, not the 9p GRAIN_DIR, so ld.so never faults on a
+        # stale/half-written 9p page (the "segfault at 8" storm). run_bin is the
+        # staged ELF; stage_env points LD_LIBRARY_PATH at the staged .so.
+        run_bin, stage_env = _stage_for_exec(binary)
         corpus_dir = PERSISTENT_CORPUS / name      # per-grain corpus (feedforward)
+        # HIGH-WATER across a grain's invocations (retry-on-dead + waves). The i2s counters
+        # are per-PROCESS; a grain gets run several times and some invocations flakily 0-exec
+        # (init races). Reporting the LAST invocation zeroed a productive run's CMP_I2S_HITS —
+        # the campaign table read 0 while the engine was actually splicing hundreds. Take the
+        # max so one flaky invocation can't clobber the real signal.
+        _hw = run_grains._i2s_hw
         corpus_dir.mkdir(exist_ok=True)
         # Each grain gets a GLOBALLY-unique loopback IP (octet = its index in
         # the whole grain list, not just within the batch). ksmbd derives the
@@ -2317,13 +2545,21 @@ def run_grains(grains, sat_ratio=0.02, max_time=180, parallelism=4, out_stats=No
         # batch 2 re-register a handle on the same 127.0.0.x batch 1 had just
         # used, and stale routing left batch-2 grains coverage-blind.
         ip = f"127.0.0.{2 + (slot % 250)}"   # %250 keeps octet in [2,251]; concurrent
-        env = {**os.environ, 'GRAIN_IP': ip}  # grains (one batch) never alias mod 250
+        # Per-slot PC-bitmap dump path for the fleet UNION metric (#1). slot is the GLOBAL
+        # index (unique within a round), so concurrent grains never collide; clear any stale
+        # dump from a prior round reusing this slot before the grain writes its own.
+        pcbmp = f'/tmp/ksmbdzzer_pcbmp_{slot}.bin'
+        try: os.unlink(pcbmp)
+        except OSError: pass
+        # stage_env (LD_LIBRARY_PATH → staged .so) folds in last so the loader
+        # resolves libksmbdzzer.so from tmpfs, not the 9p rpath.
+        env = {**os.environ, 'GRAIN_IP': ip, 'GRAIN_PCBMP': pcbmp, **stage_env}  # never alias mod 250
         # Arbiter cross-round feedback (g_fb): grains load_feedback() from this file
         # if the director wrote one this round. Host-durable path (survives VM wedge).
         _fb = FUZZDB / 'fb.bin'
         if _fb.exists():
             env['GRAIN_FB'] = str(_fb)
-        _prune_corpus(corpus_dir, binary, env)     # dedup-by-path bound (fix #6)
+        _prune_corpus(corpus_dir, run_bin, env)    # dedup-by-path bound (fix #6); staged binary
         dicts = [f'-dict={dict_path}']
         if live_dict.exists():
             dicts.append(f'-dict={live_dict}')
@@ -2352,24 +2588,66 @@ def run_grains(grains, sat_ratio=0.02, max_time=180, parallelism=4, out_stats=No
             seed_args = [f'-seed={((int(_s) * 0x9E3779B1) ^ (slot + 1)) & 0x7fffffff}']
         try:
             ft, cov, execs, elapsed, sat, tail, ft0 = _fuzz_until_saturated(
-                [binary, '-max_len=512', '-print_final_stats=1'] + seed_args + dicts + [str(corpus_dir)],
+                [run_bin, '-max_len=512', '-print_final_stats=1'] + seed_args + dicts + [str(corpus_dir)],
                 sat_ratio=sat_ratio, max_time=jmax, env=env, pre_kill_delay=pre_kill)
+            _pc_union_add(pcbmp)             # fold this grain's PCs into the dedup fleet union (#1)
+            try: os.unlink(pcbmp)
+            except OSError: pass
             kpcs = _parse_kernel_pcs(tail)   # distinct kernel PCs reached (alignment gate)
             rh, ch, rd = _parse_i2s_hits(tail)   # reverse-flow proof (RedQueen return tokens)
+            cmpr, entr, retr = _parse_df_recs(tail)   # df_buf record census (0xC/0xE/0xF delivered)
+            cmpd = _parse_cmpdict(tail)   # persistent cmp-operand ring size (starved vs splice-bug)
+            # Fold into the per-grain high-water, then REPORT the high-water — a later flaky
+            # 0-exec invocation must not zero a productive one's CMP_I2S_HITS.
+            h = _hw.setdefault(name, {'ch':0,'rh':0,'execs':0,'kpcs':0,'cmpr':0,'entr':0,'retr':0,'cmpd':0})
+            h['ch']=max(h['ch'],ch); h['rh']=max(h['rh'],rh); h['execs']=max(h['execs'],execs)
+            h['kpcs']=max(h['kpcs'],kpcs); h['cmpr']=max(h['cmpr'],cmpr)
+            h['entr']=max(h['entr'],entr); h['retr']=max(h['retr'],retr)
+            h['cmpd']=max(h['cmpd'],cmpd)
+            rh, ch, execs = h['rh'], h['ch'], h['execs']
+            kpcs, cmpr, entr, retr, cmpd = h['kpcs'], h['cmpr'], h['entr'], h['retr'], h['cmpd']
             if rh or ch:
                 vlog(f"[i2s] {name}: RET_TOKEN_HITS={rh} CMP_I2S_HITS={ch} RET_DICT={rd}"
                      f"  (reverse-flow RedQueen fired)")
+            # DIAGNOSTIC (always print): whether the kernel actually delivered 0xC comparison
+            # records to userspace this grain. DF_CMP_RECS=0 ⇒ trace_cmp→dataflow path dead
+            # (so CMP_I2S_HITS can never be >0); DF_CMP_RECS>0 & CMP_I2S_HITS=0 ⇒ the splice
+            # never matched an operand in the input (a userspace i2s issue). CMP_DICT then
+            # disambiguates: CMP_DICT=0 ⇒ ring starved (operands all filtered), CMP_DICT>0 ⇒
+            # injection/gate bug.
+            if cmpr or entr or retr:
+                print(f"    [df-recs] {name}: DF_CMP_RECS={cmpr} DF_ENT_RECS={entr} "
+                      f"DF_RET_RECS={retr} CMP_DICT={cmpd} (CMP_I2S_HITS={ch})", flush=True)
+            # Forward the low-volume harness diagnostics captured (never-trimmed) by the
+            # reader: the first few CMP_SAMPLE operand classes (starved-ring evidence) and
+            # any GRAIN_SETUP_FAIL (the connect-vs-auth death cause). Dedup so a periodic
+            # re-emit doesn't spam; bound so a long run stays readable.
+            _seen = set(); _n = 0
+            for _ln in tail.splitlines():
+                _p = _ln.split('|', 1)[-1].strip() if '|' in _ln else _ln.strip()
+                if 'CMP_SAMPLE' in _p or 'GRAIN_SETUP_FAIL' in _p:
+                    if _p in _seen:
+                        continue
+                    _seen.add(_p); _n += 1
+                    if _n <= 10:
+                        print(f"    [{name}] {_p}", flush=True)
             # A userspace crash leaves a crash-/oom-/timeout-* input in the corpus dir.
             # Carry the stderr tail so the report loop can export a reproducer.
             crashed = any(p.name.startswith(('crash-', 'oom-', 'timeout-'))
                           for p in corpus_dir.iterdir()) if corpus_dir.exists() else False
             return (name, binary, ip, corpus_dir, ft, cov, execs, elapsed, sat, kpcs,
-                    tail if crashed else None, ft0)
+                    tail if crashed else None, ft0, rh, ch)
         except Exception as e:
-            return (name, binary, ip, corpus_dir, 0, 0, 0, 0.0, False, 0, None, 0)
+            return (name, binary, ip, corpus_dir, 0, 0, 0, 0.0, False, 0, None, 0, 0, 0)
 
     try:
         nbatches = (len(grains) + parallelism - 1) // parallelism
+        # Fleet-wide engine-comparison metrics. The per-grain KERNEL_PCS/RET_TOKEN_HITS/
+        # CMP_I2S_HITS the C harness emits go to each grain's PIPED stderr (consumed by
+        # _fuzz_until_saturated's reader), so they never reach the campaign LOG the
+        # engine_compare table greps. Sum them here and print ONE fleet line per
+        # run_grains call so the table's KERNEL_PCS=/RET_TOKEN_HITS=/CMP_I2S_HITS= grep hits.
+        _fleet_kpcs = _fleet_rh = _fleet_ch = 0
         # LIGHTENED RESTART: reset ksmbd only when we actually need a fresh server
         # — before the FIRST wave, or after a wave that showed session-setup death
         # (any 0-exec grain). An unconditional per-wave `ksmbd.control -s` cost
@@ -2421,6 +2699,18 @@ def run_grains(grains, sat_ratio=0.02, max_time=180, parallelism=4, out_stats=No
                 print(f"{_dts()}     [retry] {len(dead_idx)} dead grain(s) re-run"
                       f"{' after reset' if server_down else ' in place'} → {revived} "
                       f"revived (restarts {restarts}/{MAX_RESTARTS_PER_ROUND})", flush=True)
+            # SESSION-DRAIN (#5): many 0-exec grains in a wave = ksmbd hit its connection/
+            # session ceiling (the EAGAIN pile-up — earlier grains' sessions not yet reaped).
+            # Launching the next wave's mass-spawn straight into a still-saturated server just
+            # 0-execs it too, the pile-up spiral that crippled the dataflow arms (~90% of their
+            # grains never established a session). Give the server extra settle proportional to
+            # the death count so it can drain before the next spawn. Bounded (≤8s) so a healthy
+            # wave pays nothing and a bad one doesn't stall the round.
+            if len(dead_idx) >= max(2, (len(batch) + 1) // 2):
+                _drain = min(8.0, 1.0 * len(dead_idx))
+                print(f"{_dts()}     [drain] {len(dead_idx)} setup-death(s) this wave → "
+                      f"{_drain:.0f}s session drain before next spawn", flush=True)
+                time.sleep(_drain)
             # STARVATION GUARD (#3): a wave that hugely overshoots means the guest is
             # CPU-starved (host overload) — clock skews, CIFS times out (180s),
             # coverage/timing unreliable. Surface it loudly with the host load.
@@ -2439,7 +2729,8 @@ def run_grains(grains, sat_ratio=0.02, max_time=180, parallelism=4, out_stats=No
             # on the first bug). Doing it in-process would re-serialize the
             # parallel batch on a full dmesg read every round. libFuzzer still
             # writes any userspace crash-* input to each grain's corpus dir. ──
-            for (name, binary, ip, cdir, ft, cov, execs, elapsed, sat, kpcs, crash_tail, ft0) in results:
+            for (name, binary, ip, cdir, ft, cov, execs, elapsed, sat, kpcs, crash_tail, ft0, rh, ch) in results:
+                _fleet_kpcs += kpcs or 0; _fleet_rh += rh or 0; _fleet_ch += ch or 0
                 # Export a reproducer for any grain that left a libFuzzer crash
                 # input (userspace crash / sanitizer abort). Kernel KASAN/BUG still
                 # come from the serial console host-side; this captures the rest.
@@ -2476,6 +2767,18 @@ def run_grains(grains, sat_ratio=0.02, max_time=180, parallelism=4, out_stats=No
                             out_stats[name] = {'ft0': ft0, 'ft': ft,
                                                'aligned': ft >= ALIGN_MIN_FT,
                                                'productive': productive}
+            # Fleet metrics to the LOG AFTER EVERY WAVE (grepped by the engine_compare
+            # table). Per-wave, NOT once at the end: a run that WEDGES mid-P2 (a grain hangs
+            # the kernel) never returns from run_grains, so an end-only print is lost — but
+            # the completed waves' KERNEL_PCS/RET_TOKEN_HITS/CMP_I2S_HITS still land here and
+            # the table's _maxnum() takes the high-water total. (The per-grain counters live
+            # only on the grains' piped stderr, so gen.py must surface them to the log.)
+            with _pc_union_lock:
+                _union_pop = bin(int.from_bytes(_pc_union, 'big')).count('1')
+            print(f"{_dts()}   [metrics] fleet KERNEL_PCS={_fleet_kpcs} "
+                  f"KERNEL_PCS_UNION={_union_pop} "
+                  f"RET_TOKEN_HITS={_fleet_rh} CMP_I2S_HITS={_fleet_ch} "
+                  f"(cumulative thru wave {bi+1}/{nbatches})", flush=True)
     finally:
         os.system("echo 0 > /sys/kernel/debug/failslab/probability 2>/dev/null")
     return crashes
@@ -2504,6 +2807,33 @@ def _parse_i2s_hits(tail):
         ch = max(ch, int(m.group(2)))
         rd = max(rd, int(m.group(3)))
     return rh, ch, rd
+
+
+def _parse_df_recs(tail):
+    """Pull the df_buf record census the lib harness prints (DF_CMP_RECS / DF_ENT_RECS /
+    DF_RET_RECS = # of 0xC / 0xE / 0xF records pfz_get_features() walked). This is the
+    decisive i2s diagnostic: DF_CMP_RECS separates "kernel never delivered a comparison
+    record" from "records arrived but the RedQueen splice never matched". Max across tail."""
+    import re
+    cmpr = entr = retr = 0
+    for m in re.finditer(r'DF_CMP_RECS=(\d+) DF_ENT_RECS=(\d+) DF_RET_RECS=(\d+)', tail or ''):
+        cmpr = max(cmpr, int(m.group(1)))
+        entr = max(entr, int(m.group(2)))
+        retr = max(retr, int(m.group(3)))
+    return cmpr, entr, retr
+
+
+def _parse_cmpdict(tail):
+    """Pull CMP_DICT (live size of the persistent trace_cmp operand ring). This is the
+    decisive split for `DF_CMP_RECS>0 but CMP_I2S_HITS=0`: CMP_DICT=0 ⇒ every delivered
+    operand was filtered out (kernel-pointer/trivial) so the ring STARVES → i2s is
+    structurally limited (like ret_hits), NOT a splice bug; CMP_DICT>0 with hits=0 ⇒ the
+    injection/gate genuinely fails. Max across the tail."""
+    import re
+    cd = 0
+    for m in re.finditer(r'CMP_DICT=(\d+)', tail or ''):
+        cd = max(cd, int(m.group(1)))
+    return cd
 
 
 

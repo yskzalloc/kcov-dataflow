@@ -28,9 +28,9 @@ code { color: #9f9; }
 in-kernel SMB server (ksmbd), targeting <b>write-side privilege escalation and
 non-crashing logic bugs</b>. Steered by <b>kcov-dataflow</b> — kernel function
 argument/return <i>values</i> plus <b>trace_cmp operand pairs</b>, not just edges.
-The grain fleet now covers the <b>whole SMB1/2/3 procedure surface (95 grains)</b>,
-grains are <b>combined on a shared object</b>, and a <b>second pc-only engine</b>
-lets the dataflow steering be measured head-to-head.</p>
+The grain fleet covers the <b>whole SMB1/2/3 procedure surface (99 grains)</b>,
+grains are <b>combined on a shared object</b>, and a <b>set of engine arms</b>
+lets the dataflow steering be measured head-to-head against a pc-only baseline.</p>
 
 <blockquote>
 <b>Not a syzkaller.</b> syzkaller fuzzes <i>syscalls</i> with edge coverage and finds
@@ -49,14 +49,14 @@ non-crashing access-control bugs. Different targets; not comparable.
 <li><span class="principle">Four-phase round loop.</span> P1 enumerate → P2 saturate → P3 combine → P4 save/feed-forward.</li>
 <li><span class="principle">Performance fuzzing in the C harness; Python only manages.</span> The mutation/execution/feedback loop is in the LibFuzzer program; Python enumerates, launches, aggregates.</li>
 <li><span class="principle">LibFuzzer must see kernel coverage.</span> Harness folds kernel KCOV into <code>__libfuzzer_extra_counters</code> so LibFuzzer's own engine is steered by kernel coverage.</li>
-<li><span class="principle">Alignment is the most important step.</span> An element is only as good as its prefix — keep ALIGNED (ft≥100), drop misaligned. Grains satisfy this by design.</li>
+<li><span class="principle">Alignment is the most important step.</span> A grain is only as good as its prefix — keep ALIGNED (<code>ft ≥ 100</code>, the <code>ALIGN_MIN_FT</code> gate in <code>grain/gen.py</code>), drop misaligned. Deep-by-construction grains satisfy this by design; a grain that free-runs in-process without ever reaching ksmbd is <span class="new">fast-bailed</span> instead of burning its whole budget.</li>
 <li><span class="principle">Anti-monkey selection.</span> Keep/combine only mutations that beat the grain's own baseline ft0 (PRODUCTIVE); mutations adding nothing over the bare scenario are dropped.</li>
 <li><span class="principle">Oracles are checks, not phases.</span> crash · stability (a normal grain that stops working = destabilization bug) · contract (write-side LPE that syzkaller is blind to).</li>
 <li><span class="principle">Scale via parallel map-reduce.</span> -procs=all CPUs; per-grain loopback IP = own coverage buffer; idle cores run mutation replicas sharing one corpus.</li>
 <li><span class="principle">Feed-forward across generations.</span> Persistent per-grain corpus + value pool replayed each round → starts deeper.</li>
 <li><span class="principle">Escape the legacy low-level fuzz smell.</span> Old 12/8-phase random tactics → clean deep-by-construction grain loop.</li>
-<li><span class="principle">Lightweight data-flow-guided input-to-state steering.</span> RedQueen driven by real <b>trace_cmp operand pairs</b>: input holds one operand → overwrite with the other → flip the branch (<code>mutate_i2s</code> pass 0). Eclipser/GREYONE boundary steering + arg/ret single-value substitution as fallbacks. No SMT, no symbolic, no byte-taint (infeasible in-kernel). cmp <i>operands</i> feed the mutator only — excluded from the coverage map (would explode it).</li>
-<li><span class="principle">Comparable, not just assertible.</span> A second pc-only engine (edge coverage + i2s-or-havoc) runs the same grains so the dataflow steering is <i>measured</i>, not claimed: <code>dataflow</code> vs <code>pc-i2s</code> = value-coverage payoff; <code>pc-i2s</code> vs <code>pc-havoc</code> = i2s payoff.</li>
+<li><span class="principle">Lightweight data-flow-guided input-to-state steering.</span> RedQueen driven by real <b>trace_cmp operand pairs</b>: input holds one operand → overwrite with the other → flip the branch (<code>mutate_i2s</code> pass 0). Because live grain inputs are often tiny (0–2 bytes), operands are harvested into a <span class="new">persistent ring</span> and injected into a grown input window, so the splice fires fleet-wide (not just when df_buf happens to hold a cmp record). Eclipser/GREYONE boundary steering + arg/ret single-value substitution as fallbacks. No SMT, no symbolic, no byte-taint (infeasible in-kernel). cmp <i>operands</i> feed the mutator only — excluded from the coverage map (would explode it).</li>
+<li><span class="principle">Comparable, not just assertible.</span> pc-only engine arms (edge coverage + i2s-or-havoc) run the same grains so the dataflow steering is <i>measured</i>, not claimed: <code>dataflow-vec</code> vs <code>pc-i2s</code> = value-coverage payoff; <code>pc-i2s</code> vs <code>pc-havoc</code> = i2s payoff. Same instrumentation, controlled ablation.</li>
 </ol>
 
 <h2>Architecture — the 4-phase grain loop (<code>gfuzz</code>)</h2>
@@ -64,22 +64,22 @@ non-crashing access-control bugs. Different targets; not comparable.
 ksmbdzzer.py — ORCHESTRATOR ONLY (enumerate, launch, aggregate; no per-input work)
     │
     │  P1 enumerate grains ── lib grains + raw-PDU grains + v2 HYBRID grains
-    │  P2 saturate each ────── one LibFuzzer element / grain, map-reduce parallel
-    │  P3 combine ──────────── ALL-PAIRS combination on a SHARED object (combo2)
+    │  P2 saturate each ────── one LibFuzzer grain, map-reduce parallel
+    │  P3 combine ──────────── ALL-PAIRS combination on a SHARED object (needs -procs≥2)
     │  P4 save ─────────────── persistent per-grain corpus + value pool → next round
     │
-    ├─ element/gen.py — LibFuzzer C harness engine  (was sniper/)
-    │     generate_grain_elements()   one harness per lib grain
+    ├─ grain/gen.py — LibFuzzer C harness engine
+    │     generate_grains()          one harness per lib grain
     │     generate_grain_combo_pool() ONE combo harness + per-pair symlinks
-    │     run_elements()  per-element loopback IP · replicas · compile cache
+    │     run_grains()  per-grain loopback IP · replicas · compile cache · fleet-union PC metric
     │
-    ├─ element/common.h — raw-grain harness: KCOV path + mutate_i2s (RedQueen
+    ├─ grain/common.h — raw-grain harness: KCOV path + mutate_i2s (RedQueen
     │     from trace_cmp pairs) + KSMBDZZER_ENGINE comparison switch
     │
     └─ ctypes ─► libksmbdzzer.so
                    libsmbclient (NTLMv2 auth)  ── valid deep prefixes
                    kcov-dataflow mmap          ── arg/ret VALUES + trace_cmp pairs + KCOV
-                   GRAINS[] (95 scenarios)     ── whole SMB1/2/3 surface (GRAIN.md)
+                   GRAINS[] (99 scenarios)     ── whole SMB1/2/3 surface (GRAIN.md)
                    raw authed PDU injection    ── fuzz only the last target PDU
                    pfz_grain_combo2()          ── grains A+B on a SHARED fid/handle
                    librdmacm + libibverbs      ── SMBDirect / RDMA transport
@@ -90,35 +90,36 @@ ksmbdzzer.py — ORCHESTRATOR ONLY (enumerate, launch, aggregate; no per-input w
 LLVMFuzzerTestOneInput(data):
     run the target PDU                       <span class="warn"># deep by construction (grain prefix valid)</span>
     fold kernel coverage -&gt; ctr[]             <span class="warn"># KCOV path + arg/ret VALUES; cmp = PC-only</span>
+    harvest trace_cmp operands -&gt; persistent ring
     if new path:  g_stuck = 0   else:  g_stuck++
 
 LLVMFuzzerCustomMutator(data):
-    <span class="new"># pass 0 (RedQueen / trace_cmp): for each cmp operand pair (a1,a2) in df_buf,</span>
-    <span class="new">#   if input holds a1 -&gt; overwrite with a2 (&amp; vice-versa) -&gt; flip the branch</span>
+    <span class="new"># pass 0 (RedQueen / trace_cmp): for each cmp operand pair (a1,a2),</span>
+    <span class="new">#   in-place replace a1&lt;-&gt;a2 if present; else INJECT ring operands into a</span>
+    <span class="new">#   grown input window so the magic value reaches the branch next iteration</span>
     then cheap KCOV-bulk havoc; at SATURATION drive an observed arg value to a boundary.
 </pre>
-<p><code>KSMBDZZER_ENGINE</code> selects coverage+mutator so one harness runs as
-<code>dataflow</code> (value coverage + i2s) / <code>pc-i2s</code> (pc-only + i2s) /
-<code>pc-havoc</code> (pc-only + havoc) for the engine comparison.</p>
+<p><code>KSMBDZZER_ENGINE</code> selects coverage+mutator so one harness runs as any of the
+five arms below for the engine comparison.</p>
 
 <h3>The grain (deep by construction)</h3>
 <p>Each grain runs negotiate → authenticate → tree-connect → CREATE as a <b>fixed
 valid prefix</b> (never fuzzed), then hands LibFuzzer the <b>raw target PDU</b>. Every
-input reaches deep ksmbd code on the first try. <b>95 grains</b> cover the whole
+input reaches deep ksmbd code on the first try. <b>99 grains</b> cover the whole
 upstream SMB surface: all 19 SMB2 commands, every FSCTL and SET_INFO/QUERY_INFO class,
 all CREATE contexts, SMB3 features (encryption/compression/multichannel/lease-v2/
 durable-v2/RDMA), SMB1 legacy opcodes (version-conflict surface), and the ksmbd blind
 spots (IPC netlink, signing crypto, deep DACL, RPC opnums). Canonical map: <code>GRAIN.md</code>.
 <b>P3 combines</b> grains pairwise on a <i>shared</i> handle/path — sequential,
 interleaved, or forked-concurrent (<code>pfz_grain_combo2</code>) — so interaction bugs
-(B abusing a lock/lease/handle A left) can surface.</p>
+(B abusing a lock/lease/handle A left) can surface. P3 needs <code>-procs ≥ 2</code>.</p>
 
 <h2>Phases</h2>
 <table>
 <tr><th>Phase</th><th>What it does</th><th>Principle</th></tr>
 <tr><td>P1 enumerate</td><td>Build the grain set (lib + raw + v2 hybrid); compile cache skips unchanged harnesses</td><td>4, 14</td></tr>
-<tr><td>P2 saturate</td><td>One LibFuzzer element per grain; KCOV bulk mutation, trace-args/ret at stuck; ALIGNED + PRODUCTIVE gate</td><td>3, 7, 8, 9, 10</td></tr>
-<tr><td>P3 combine</td><td>ALL-PAIRS combination of grains on a SHARED object (sequential / interleaved / forked-concurrent); one compiled harness + per-pair symlinks (final round)</td><td>10, 11</td></tr>
+<tr><td>P2 saturate</td><td>One LibFuzzer grain each; KCOV bulk mutation, trace-args/ret at stuck; ALIGNED + PRODUCTIVE gate; misaligned free-runners fast-bailed</td><td>3, 7, 8, 9, 10</td></tr>
+<tr><td>P3 combine</td><td>ALL-PAIRS combination of grains on a SHARED object (sequential / interleaved / forked-concurrent); one compiled harness + per-pair symlinks; needs -procs≥2 (final round; skipped by default in comparison)</td><td>10, 11</td></tr>
 <tr><td>P4 save</td><td>Persist per-grain corpus + value pool; carried into the next generation (ft0 starts higher)</td><td>13</td></tr>
 <tr><td>oracles</td><td>crash (KASAN/lockdep) · stability (grain re-run) · contract (dataflow deny→allow) — run <i>alongside</i>, not as a phase</td><td>11</td></tr>
 </table>
@@ -126,10 +127,12 @@ interleaved, or forked-concurrent (<code>pfz_grain_combo2</code>) — so interac
 <h2>Scalability engineering</h2>
 <table>
 <tr><th>Mechanism</th><th>Why</th></tr>
-<tr><td>Per-element loopback IP <code>127.0.0.&lt;slot&gt;</code></td><td>ksmbd derives the kcov handle from the dest IP → unique IP = own coverage buffer, no collision. Basis for parallel map-reduce.</td></tr>
+<tr><td>Per-grain loopback IP <code>127.0.0.&lt;slot&gt;</code></td><td>ksmbd derives the kcov handle from the dest IP → unique IP = own coverage buffer, no collision. Basis for parallel map-reduce.</td></tr>
 <tr><td>Map-reduce replicas</td><td>When grains &lt; cores, idle cores run extra mutation instances of the same grain sharing one corpus.</td></tr>
 <tr><td>Compile cache (source-hash + dep-mtime)</td><td>Unchanged harness ⇒ no <code>clang</code>. Multi-round runs compile once; later rounds go straight to fuzzing. Value pool rides the <code>.dict</code>, not the C source.</td></tr>
-<tr><td>Lightened ksmbd restart</td><td>Reset only before the first wave or after a wave with a 0-exec (session-setup death) element — not per wave. Removes restart latency and stops re-triggering the SMBDirect cleanup path each wave.</td></tr>
+<tr><td class="new">Fast-bail misaligned free-runners</td><td>A grain whose session never established free-runs in-process at a non-networked rate — killed as soon as the rate proves it isn't reaching ksmbd (was the dominant wasted wall-clock).</td></tr>
+<tr><td class="new">Session-drain between waves</td><td>A wave with many 0-exec grains means ksmbd hit its connection ceiling — settle proportionally before the next spawn so the auth pile-up doesn't spiral.</td></tr>
+<tr><td>Lightened ksmbd restart</td><td>Reset only before the first wave or after a wave with a 0-exec (session-setup death) grain — not per wave. Removes restart latency and stops re-triggering the SMBDirect cleanup path each wave.</td></tr>
 </table>
 
 <h2>Bug detection</h2>
@@ -150,35 +153,55 @@ grep -E "BUG:|KASAN:|UBSAN:|WARNING:|recursive locking|Oops"  &lt;kernel log&gt;
 </table>
 
 <h2>Engine comparison (measured, not claimed)</h2>
-<p>The same grains on the same kernel run under two engines / three arms
+<p>The same grains on the same kernel run under five arms
 (<code>KSMBDZZER_ENGINE</code> — a controlled ablation, identical instrumentation);
-<code>~/engine_compare_campagin.sh</code> prints a diff table.</p>
+<code>engine_compare_campagin.sh</code> prints a diff table.</p>
 <table>
-<tr><th>Arm</th><th>Engine</th><th>Coverage</th><th>Mutator</th></tr>
-<tr><td><code>dataflow</code></td><td>1st</td><td>value-sensitive (pc,val) + cmp</td><td class="new">i2s (RedQueen)</td></tr>
-<tr><td><code>pc-i2s</code></td><td>2nd</td><td>pc-only</td><td>i2s (RedQueen)</td></tr>
-<tr><td><code>pc-havoc</code></td><td>2nd</td><td>pc-only</td><td>pure havoc</td></tr>
+<tr><th>Arm</th><th>Coverage folded from df_buf</th><th>Mutator</th></tr>
+<tr><td><code>dataflow</code></td><td>baseline value fold (pc ^ arg0 raw) + cmp</td><td class="new">i2s (RedQueen)</td></tr>
+<tr><td><code>dataflow-vec</code></td><td>whole-arg vector fold, each field value-class-normalized (canonical value arm)</td><td class="new">i2s (RedQueen)</td></tr>
+<tr><td><code>dataflow-rel</code></td><td>dataflow-vec + within-record pairwise cmp3 (offset&lt;len? boundary bits)</td><td class="new">i2s (RedQueen)</td></tr>
+<tr><td><code>pc-i2s</code></td><td>pc-only (value dropped)</td><td>i2s (RedQueen)</td></tr>
+<tr><td><code>pc-havoc</code></td><td>pc-only (value dropped)</td><td>pure havoc</td></tr>
 </table>
-<p><code>dataflow</code> vs <code>pc-i2s</code> = the <b>value-coverage</b> payoff;
-<code>pc-i2s</code> vs <code>pc-havoc</code> = the <b>i2s</b> payoff.</p>
+<p><code>dataflow-vec</code> vs <code>pc-i2s</code> = the <b>value-coverage</b> payoff (the fair,
+same-per-exec-cost A/B); <code>pc-i2s</code> vs <code>pc-havoc</code> = the <b>i2s</b> payoff
+(readable only when <code>cmp_hits &gt; 0</code>).</p>
+<p><span class="metric">PRIMARY metric = kern_pcs∪</span>: the <b>deduplicated fleet-wide
+union</b> of distinct kernel PCs (each grain dumps its PC bitmap; gen.py ORs them). This
+replaces the old per-grain-popcount <i>sum</i>, which double-counted shared PCs and let the
+cheapest-per-exec engine win by cycling more grains rather than reaching more code. Secondary
+(engine-biased): corpus, max_ft. Proof of i2s: <code>cmp_hits</code> (trace_cmp splices).</p>
+<pre>
+# Fair coverage A/B — 1 round, P3 skipped, explicit tight cap, curated aligned subset:
+REDO=1 P3_MAX_COMBOS=0 KSMBDZZER_ALIGNED=1 ARMS_OVERRIDE="dataflow-vec pc-i2s" \
+  bash ksmbd/engine_compare_campagin.sh 1 40 75 3
+#   args: [ROUNDS] [GRAIN_MAX] [TIMEOUT_MIN_PER_ARM] [TRIALS]
+#   env:  PROCS(2) · P3_MAX_COMBOS(0=skip) · REDO · ARMS_OVERRIDE · INSTRUMENT_ALL · KSMBDZZER_ALIGNED
+</pre>
 
 <h2>Findings</h2>
 <pre>
-Kernel defects surfaced by the campaign (write-side / RDMA teardown):
-  1. <span class="new">ksmbd oplock lev-II break deadlock</span> — break sent under m_lock, inverting
-     srv_mutex→session_lock→m_lock→srv_mutex.  FIXED (collect-under-lock) — oplock.c
-  2. <span class="new">SMBDirect smbdirect_socket_destroy_sync recursive handler_mutex</span> —
-     listener held its cm_id handler lock while releasing children (which recurse into
-     the child's handler lock) → lockdep deadlock; the 3h round-6 hang.  FIXED
-     (defer child release past the handler unlock) — socket.c
-  3. SMBDirect recv_io / mem-pool teardown null-deref (BUG 1)     FIXED — accept.c
-  4. SMBDirect recursive &amp;sc-&gt;listen.lock on listener teardown   FIXED (splice-then-unlock)
-  5. <span class="warn">SMBDirect cm_id UAF in _cma_cancel_listens (BUG 2)</span>      OPEN — rare, hard RDMA-CM fix
+Kernel defects surfaced by the campaign (write-side / IPC / RDMA teardown):
+  1. <span class="new">ksmbd ipc_validate_msg slab-OOB read</span> — the daemon-sized IPC response is
+     cast to a fixed struct and its length fields read BEFORE the buffer is floored
+     against that struct.  FIXED (floor msg_sz per event type) — transport_ipc.c
+     (findings/ipc_msg_send_request_soob.md)
+  2. <span class="new">ksmbd_alloc_user hash_sz OOB read</span> — bound to sizeof(resp-&gt;hash).  FIXED
+     (findings/ksmbd_alloc_user_sob.md)
+  3. <span class="new">__close_file_table_ids cross-session fp UAF</span> — foreign fp closed to the
+     wrong table; new fp-&gt;ft owning-table ptr.  FIXED (findings/__close_file_table_ids_uaf.md)
+  4. <span class="new">SMBDirect ib_cq_poll_work slab-UAF</span> — ib_alloc_cq_any() CQs freed with
+     ib_destroy_cq() (skips cancel_work_sync) so a late RXE completion re-queues poll
+     work on a freed CQ.  FIXED (ib_free_cq) — connection.c
+     (findings/ib_cq_completion_workqueue_uaf.md)
+  5. ksmbd oplock lev-II break deadlock (srv_mutex→session_lock→m_lock→srv_mutex)
+     — FIXED UPSTREAM (findings/-upstream_fixed_smb_oplock_deadlock.md)
 
 Dataflow contract-oracle (MS-SMB2 access-control): lock-without-WRITE /
 DELETE_ON_CLOSE-without-DELETE / OVERWRITE_IF-without-WRITE are real missing SMB-layer
-checks but <b>Unix-gated</b> (ksmbd authorizes at the VFS/POSIX layer). The oracle now
-uses a cross-user (root-owned) victim so it can only flag a genuine LPE denial.
+checks but <b>Unix-gated</b> (ksmbd authorizes at the VFS/POSIX layer). The oracle uses a
+cross-user (root-owned) victim so it can only flag a genuine LPE denial.
 </pre>
 
 <h2>Quick start</h2>
@@ -189,15 +212,16 @@ vng --user root --memory 16G --rw --cpus 8 \
   --append "nokaslr hung_task_panic=1 hung_task_timeout_secs=60" \
   --exec 'mount -t debugfs none /sys/kernel/debug; sysctl -w kernel.kptr_restrict=0;
           python3 ../ksmbd/ksmbdzzer.py init &amp;&amp;
-          python3 ../ksmbd/ksmbdzzer.py <span class="new">gfuzz -r 30 --element-max 32</span>'
+          python3 ../ksmbd/ksmbdzzer.py <span class="new">gfuzz -r 30 --grain-max 40</span>'
 
   gfuzz -r N             generations (each carries strong grains + corpus forward)
-        -procs N         parallel workers (default: ALL CPUs)
-        --element-max S  ceiling (s) per grain element if it never saturates
-        --element-sat R  LibFuzzer saturation ratio per element (default 0.02)
+        -procs N         parallel workers (default: ALL CPUs; P3 needs ≥2)
+        --grain-max S    ceiling (s) per grain if it never saturates (default 60)
+        --grain-sat R    LibFuzzer saturation ratio per grain (default 0.02)
+        -t GRAIN...      restrict to a subset of grains (default: whole fleet)
 
-  runners:  ~/run_campaign.sh [ROUNDS] [ELEMENT_MAX]        full hunting campaign
-            ~/engine_compare_campagin.sh [ROUNDS] [ELEMENT_MAX]  2-engine comparison
+  runner:  engine_compare_campagin.sh [ROUNDS] [GRAIN_MAX] [TIMEOUT_MIN_PER_ARM] [TRIALS]
+           (env: PROCS P3_MAX_COMBOS REDO ARMS_OVERRIDE INSTRUMENT_ALL KSMBDZZER_ALIGNED)
 </pre>
 <p class="warn">The old <code>ksmbdzzer.py fuzz</code> (8-phase random-tactic worker +
 differential failslab) is <b>legacy</b> — retained for the failslab error-path

@@ -8,10 +8,138 @@ Sources cross-referenced:
 - **KSMBD impl**: `linux/fs/smb/server/smb2ops.c` dispatch table + `smb2pdu.c` handlers.
 - **Samba client verbs**: `samba/source3/libsmb/cli_smb2_fnum.c` (`cli_smb2_*`) and
   `libsmbclient.h` (`smbc_*`) — the reference for what a client can drive.
-- **Our grains**: `ksmbd/libksmbdzzer.c` GRAINS[] registry (24 active + 1 suppressed).
+- **Our grains**: `ksmbd/libksmbdzzer.c` GRAINS[] registry (**211 active**, `N_GRAINS`;
+  `secdesc` suppressed).
 
 Legend: ✅ grain exists · ⚠️ partial / only-as-preamble · ❌ no grain (TODO) ·
 KSMBD col: ✅ implemented · ➖ not implemented (grain still worth it for robustness).
+
+**How `grain/gen.py` runs these.** `generate_grains()` emits one LibFuzzer harness per
+GRAINS[] entry; `run_grains()` fuzzes each on its own loopback IP, applies the **ALIGNED
+gate** (`ALIGN_MIN_FT = 100` — a grain whose input never penetrates past the SMB parser
+is flagged misaligned) and the **anti-monkey** `Δ = ft − ft0` PRODUCTIVE gate, fast-bails
+grains that free-run without a session, and reports the deduplicated **fleet-union**
+kernel-PC metric. `KSMBDZZER_ALIGNED=1` scopes a campaign to `grain/ALIGNED_SUBSET.txt`
+(the grains here that reliably reach the kernel).
+
+---
+
+## 0. Verifying a grain works — `ksmbdzzer.py selftest` (via kcov-dataflow)
+
+The whole map above is only worth its coverage if each grain **actually reaches ksmbd
+kernel code**. A grain is a hand-built SMB PDU with a working auth→tree→open preamble; a
+subtle field-offset slip, a wrong StructureSize, an early-reject dialect, or a torn-down
+pool makes ksmbd drop the PDU *before* any handler runs — and it fuzzes nothing while
+still burning campaign budget. `selftest` is the **"a grain must work"** gate that proves
+each grain reaches the kernel, and it proves it by **measuring kcov-dataflow coverage**,
+not by trusting the SMB reply.
+
+### Why kcov-dataflow is what makes "does it reach ksmbd" measurable
+
+An SMB response only tells you ksmbd *answered* — not how deep the PDU went (an error
+reply is produced both by a rejected-at-dispatch PDU and by one that ran the full handler
+and failed a check). kcov-dataflow closes that gap: it instruments ksmbd's kernel code, so
+the count of coverage records a grain produces **is** the depth it reached. Zero records =
+the PDU never entered a handler.
+
+The bridge, per connection (see `[[ksmbd-remote-hooks-rebase-drop]]`):
+
+1. On init each grain opens `/sys/kernel/debug/kcov_dataflow`, mmaps a per-worker buffer
+   `g_df_buf`, and arms a **remote handle** `KSMBD_KCOV_DF_IP_HANDLE(octet)` keyed to its
+   own loopback octet (`127.0.0.<octet>`).
+2. ksmbd's `__handle_ksmbd_work()` wraps every request in
+   `kcov_df_remote_start(conn->kcov_handle)` … `kcov_df_remote_stop()`
+   (`fs/smb/server/server.c`), and `conn->kcov_handle` is set from the connection's dest
+   IP octet in `transport_tcp.c`. So all kernel PCs (and, with `CONFIG_KCOV_DATAFLOW_ARGS/
+   RET`, the folded trace-args/ret **values**) executed while servicing *that grain's*
+   connection are routed into *that grain's* `g_df_buf`.
+3. `pfz_grain_run(i, data, len)` resets coverage, self-bootstraps the pool, and runs
+   `GRAINS[i].fn(data, len)` — which drives the SMB PDU to ksmbd over loopback.
+4. `pfz_get_features(FEAT, N)` returns the number of distinct kernel-PC records now in the
+   buffer. **`pcs > 0` ⇒ the PDU reached a ksmbd handler under `__handle_ksmbd_work`**;
+   `pcs == 0` ⇒ it did not. The count doubles as the grain's **depth** (a ranking), which
+   is why `WORKING_SUBSET.txt` is written coverage-descending.
+
+### The four verdicts
+
+Each grain is run `--repeats` times (default **4**) with a deterministic-but-varied 64-byte
+seed per (grain, try); the MAX kernel-PC count over the tries is taken:
+
+| Verdict | Condition | Meaning |
+|---------|-----------|---------|
+| **WORKS** | best pcs ≥ `--min-pcs` (default 1) | reached ksmbd kernel code — a real grain; `pcs` = its depth |
+| **DEAD**  | ran (ret ≥ 0) but 0 kernel PCs | its PDU never reached a handler — cut or fix the grain |
+| **BAIL**  | ret < 0 on every try | bailed at a prerequisite (no authed pool/fid, connect/auth/config failed) — it never executed |
+| **EXCL**  | name ∈ `{ipc, rdma}` | *architectural* — cannot produce per-SMB-connection coverage here, but stays in the fleet for real gfuzz (see below) |
+
+### Three subtleties that make the count ACCURATE (not the grains' fault)
+
+`selftest` runs the whole fleet in ONE process (seconds-scale, no VM reboot, no LibFuzzer),
+which is *not* how gfuzz runs them (a fresh process per grain). Three shared-process
+artifacts once made honest grains look broken; all three are handled so the verdict
+reflects the grain, not the harness:
+
+1. **Async coverage-merge race → false DEAD.** ksmbd's `kcov_df_remote_stop()` merges into
+   `g_df_buf` *after* the SMB response is sent, so a **single-op** grain (one CREATE/IOCTL/
+   QUERY) can read the buffer *before* the merge lands and see 0. Fixed by `_cov()` in
+   `cmd_selftest`, which polls `pfz_get_features` up to 6× at 3 ms (the read is idempotent /
+   non-resetting) until non-zero. This is what made `create_ctx_dup`, `create_path_traversal`,
+   `offload_read`, `query_network_openinfo`, `filename_null_embed`, `lease_parent_key` flap
+   DEAD at low repeats — all reach ksmbd with pcs 2 000–8 000 once the merge is awaited.
+2. **Conn-disrupting grains close the shared pool → false BAIL.** Grains that tear a
+   connection down (`encrypt`, `session_setup`, `smb1_*`, `sign`, `logoff*`, `tdis*`) close
+   the raw pool socket but leave `g_pool[].has_fid=1`, so `pool_ensure_fid` reuses the dead
+   socket and every pool grain after them fails to write (-1). Per-grain re-auth is WRONG
+   (210 back-to-back handshakes = a mountd auth **storm** that itself drops WORKS to 78).
+   Fixed by an **on-bail heal**: only when a grain bails every repeat, `cmd_selftest` runs
+   ONE `pfz_pool_init(2)` (fresh raw socket+fid) **and** `pfz_reopen_smb_fd()` (reopens just
+   the libsmbclient scratch fd `g_smb_fd` that `rmxattr`/`setxattr`-family lib grains use —
+   without a full `pfz_reconnect`, which would drop the kcov handle), then retries. This
+   heals the pool for the FOLLOWING grains too, so re-auths ≈ #disruptors, not #grains.
+3. **`ipc` / `rdma` are unmeasurable HERE, not broken → EXCL.** `ipc` drives SMBD_GENL
+   *netlink* (`transport_ipc.c`), not an SMB connection, so the IP-handle remote hook never
+   fires; `rdma` needs the RXE/SMBDirect **data-plane** the loopback selftest can't drive.
+   Both still exercise ksmbd via those paths in a real gfuzz run, so they are reported EXCL,
+   left OUT of the WORKS/DEAD verdict, and **kept in the `GRAINS[]` registry** (removing them
+   would lose real coverage). This is deactivation from the *accounting*, not the map.
+
+### Result (2026-07-22, kernel #119, full 210-grain fleet)
+
+**208 WORKS / 0 DEAD / 0 BAIL / 2 EXCL** — 100 % of the measurable fleet reaches ksmbd.
+Zero grains were removed or commented out; every prior "failure" was one of the three
+artifacts above, proven by re-running the suspects at `--repeats 6/10` (all flipped to
+WORKS). See `[[grain-selftest-and-kconfig]]`.
+
+### Running it
+
+- **Wrapper (recommended):** `verify_useful_grain.sh [REPEATS] [MIN_PCS]` — builds the
+  `.so` (always; grain code lives there), boots ONE guest, runs `init` + `selftest`, and
+  prints the WORKS/DEAD/BAIL/EXCL summary. It reuses the current bzImage by default;
+  `REBUILD_KERNEL=1` forces a kernel rebuild (needed only after touching kernel/kcov code
+  or the ksmbd remote hooks). `GRAIN_SUBSET="a b c"` scopes to specific grains.
+  - Its KCONFIG **must match** `engine_compare_campagin.sh` (full SMB surface + RDMA/
+    SMBDirect + Kerberos + **`CONFIG_UNICODE=y`** for the `utf8_casefold` path), or a
+    feature-gated grain silently dead-ends and skews the verdict.
+- **In-guest, directly:** `ksmbdzzer.py init && ksmbdzzer.py selftest [--repeats N]
+  [--min-pcs P] [-t grain …]`.
+- **Coverage-bridge guard:** if EVERY grain reads 0 (`DONE … 0 WORKS`), the *kernel* is
+  coverage-blind — the ksmbd kcov remote hooks are missing (a rebase can leave them in an
+  unpopped stash) or `CONFIG_KCOV_DATAFLOW` was dropped — **not** a fleet of dead grains.
+  Both the script and `[[ksmbd-remote-hooks-rebase-drop]]` call this out; rebuild with the
+  hooks present and confirm `fs/smb/server/server.c` has `kcov_df_remote_start`.
+
+### Where selftest sits vs gen.py's ALIGNED gate vs engine_compare
+
+- **`selftest`** — a *validity* filter: "does this grain reach the kernel *at all*?"
+  Cheap (seconds), whole-fleet, run BEFORE a campaign. Writes `grain/WORKING_SUBSET.txt`.
+- **gen.py ALIGNED gate** (`ALIGN_MIN_FT=100`) — a *depth/alignment* filter applied DURING
+  a LibFuzzer campaign: fast-bails a grain whose input never penetrates past the SMB parser
+  so it doesn't free-run and pollute the fleet-union metric.
+- **`engine_compare_campagin.sh`** — the *coverage ablation* (dataflow-vec vs pc-i2s vs
+  pc-havoc). `KSMBDZZER_ALIGNED=1` scopes it to `grain/ALIGNED_SUBSET.txt`, the curated
+  subset that reaches the kernel *consistently across arms* so no grain biases one engine.
+  `selftest` answers "is it a real grain"; the comparison answers "which coverage signal
+  finds more with it".
 
 ---
 
@@ -42,8 +170,10 @@ KSMBD col: ✅ implemented · ➖ not implemented (grain still worth it for robu
 **KSMBD implements all 19 SMB2 commands.** Grain coverage:
 **19 of 19 commands have a DEDICATED grain** ✅ — CLOSE (`close`) and LOGOFF (`logoff`)
 got their own grains 2026-07-07 (batch 9), so no command is preamble/oracle-only anymore.
-98 grains total spanning all 19 commands, all 16 FSCTLs, 11 CREATE contexts, SMB3
-encryption/multichannel/durable-v2/lease-v2, and SMB1 legacy (generic + 5 per-opcode).
+**211 grains total** spanning all 19 commands, all 16 FSCTLs, 11 CREATE contexts, SMB3
+encryption/multichannel/durable-v2/lease-v2, SMB1 legacy (generic + 5 per-opcode), and
+(batches 10-15) 112 parser-depth/interaction/backlog grains that walk chain/array parsers the single-element
+grains left at iteration count 1 — see §7.
 
 ---
 
@@ -150,7 +280,85 @@ attack surface. TODO: split into per-opcode variants (see §8).
 
 ---
 
-## 7. Current grains (95 in source + 1 suppressed)
+## 7. Current grains (211 in source + 1 suppressed; selftest: 208 WORKS / 2 EXCL, see §0)
+
+Batch 15 (2026-07-22, the THIRD 32-grain backlog, groups M-R; N_GRAINS 179→211, source-only
+UNBUILT, `gcc -fsyntax-only` clean). M crypto/signing (5): encrypt_then_compound,
+sign_compound_mixed, encrypt_wrong_session, gss_mechlist_mic, negotiate_signing_ctx. N durable/
+lease/oplock (6): lease_upgrade_downgrade, durable_v1_v2_mix, oplock_level2_break,
+lease_parent_key, durable_timeout_zero, persistent_handle_ca. O vfs/path/xattr (6):
+xattr_name_max, filename_null_embed, filename_max_path, stream_delete, hardlink_cross_share,
+casefold_share_name. P data-path (5): copychunk_self, write_sparse_hole, read_compound_close,
+set_eof_shrink_race, append_past_max. Q info edges (5): query_full_ea_size, set_rename_stream,
+query_dir_short_buf, set_disposition_dir, query_attr_tag_reparse. R conn lifecycle (5):
+tcon_max_trees, session_max_opens, conn_negotiate_twice, session_setup_no_negotiate,
+interim_response_flood. FLEET_EST bumped 112→211 in engine_compare_campagin.sh.
+
+Batch 14 (2026-07-22, the SECOND 32-grain backlog; N_GRAINS 147→179, source-only UNBUILT,
+`gcc -fsyntax-only` clean). F create/ctx (6): create_ctx_dup, create_ctx_giant_data,
+create_twrp, create_alloc_vs_eof, create_disposition_matrix, create_impersonation. G rd/wr
+edge (5): write_compound_flush, read_padding_edge, write_zero_length, write_rdma_channel,
+read_beyond_eof. H lock (3): lock_unlock_mismatch, lock_shared_excl_conflict, lock_reflexive.
+I session/auth (4): session_reauth_switch, guest_anon_auth, logoff_reuse_sid, tcon_ipc_vs_disk.
+J info-class (5): query_all_info, set_basic_time_edge, query_stream_info, set_pipe_info,
+query_network_openinfo. K transport (4): pipelined_requests, oversize_pdu, partial_pdu_dribble,
+compound_padding. L more FSCTLs (5): fsctl_set_object_id, fsctl_lmr_set_link,
+fsctl_query_file_regions, fsctl_duplicate_extents_v2, fsctl_offload_read_token.
+
+Batch 13 (2026-07-22, the 32-grain backlog; N_GRAINS 115→147, source-only UNBUILT, all
+`gcc -fsyntax-only` clean). A chain/array (7): create_dh2q_internals, notify_output_walk,
+query_dir_resume, set_ea_private, ioctl_inout_overlap, sd_owner_group, sd_sacl. B state/
+concurrency (9, SINGLE-THREADED directed sequences — reach teardown/lifetime paths, don't
+truly interleave; socket-raw grains restore via pool_reconnect): durable_reconnect_race,
+lease_break_ack_mismatch, oplock_break_race, logoff_inflight, tdis_open_fid,
+close_durable_scavenger, cancel_async_target, credit_exhaust, compound_unrelated_session.
+C crypto (5): transform_nested, compress_bomb, sign_downgrade, preauth_hash_mismatch,
+multichannel_bind_replay. D path/name (4): create_path_traversal, stream_name_edge,
+unicode_surrogate, rename_target_edge. E fsctl/info (7): pipe_transceive_bind,
+set_integrity_deep, query_fs_info, smb1_dialects, fsctl_reparse_get_chain,
+query_info_ea_list, set_link_root.
+
+Batch 12 (2026-07-22, interaction + protocol-parse depth; N_GRAINS 110→115, source-only
+UNBUILT): `compound_related_fid` (RELATED compound CREATE→WRITE→CLOSE on the inherited fid —
+cross-op state resolution, deeper than compound_chain's ECHOs), `reparse_symlink`
+(FSCTL_SET_REPARSE_POINT symlink buffer SubstituteName/PrintName off+len), `dfs_referral_ex`
+(FSCTL_DFS_GET_REFERRALS_EX structured request), `negotiate_dialects` (DialectCount 2-31 fuzzed
+dialect array — negotiate_ctx_multi pins DialectCount=1), `spnego_asn1` (SESSION_SETUP
+SPNEGO/DER blob with fuzzed TLV lengths → ASN.1/GSS-API parse). All `gcc -fsyntax-only` clean.
+
+Batch 11 (2026-07-22, parser-DEPTH cont. — five more chain/array-walk grains; N_GRAINS
+105→110, source-only UNBUILT):
+- `lock_array` — SMB2 LOCK with LockCount 2-8 + independently-fuzzed element array →
+  `smb2_lock()` `for (i<lock_count)` walk (smb2pdu.c:8249; find.md #1 surface). grain_lock=1.
+- `create_ctx_chain` — CREATE with 2-4 Next-linked create contexts (fuzzed Next) →
+  `smb2_open` context array walk (smb2_find_context_vals). pool_create_with_ctx sends Next=0.
+- `copychunk_multi` — FSCTL_SRV_COPYCHUNK (0x1440F2, correct code) with ChunkCount 2-8 +
+  independently-fuzzed per-chunk Source/TargetOffset/Length → fsctl_copychunk chunk-array
+  walk. pfz_copychunk used linear chunks + a WRONG ctl code (0x1480044).
+- `quota_chain` — QUERY_INFO QUOTA with a chained FILE_GET_QUOTA_INFORMATION SID list
+  (NextEntryOffset) → the multi-entry SID-list walk get_quota's flat blob misses.
+- `rdma_channel_desc` — SMB2 READ with Channel=RDMA_V1 + fuzzed buffer_descriptor_v1 array →
+  channel-info parse/validation. NOTE over loopback TCP ksmbd rejects RDMA channels before
+  deep descriptor consume (full path needs the RDMA transport / `rdma` grain).
+
+Batch 10 (2026-07-22, parser-DEPTH — six grains that exercise chain/array parser LOOPS the
+existing single-element grains left at iteration count 1; each verified against both the
+KSMBD parser and the grain that was supposed to hit it). Source-only until next `.so` build.
+Registry = 105.
+- `set_ea_chain` — multi-entry FILE_FULL_EA list with fuzzed `NextEntryOffset` → the
+  `smb2_set_ea()` do/while chain-walk (set_full_ea/create_ea hardcode NextEntryOffset=0).
+- `negotiate_ctx_multi` — NEGOTIATE with `NegotiateContextCount` 2-6 + N fuzzed contexts →
+  `deassemble_neg_contexts()` array walk + the 2nd..Nth sub-decoders (preauth SaltLength/
+  HashAlgorithmCount, compress/encrypt counts); throwaway conn (pfz_negotiate_contexts pinned count=1).
+- `compound_chain` — structured 2-4 command compound linked by fuzzed `NextCommand` +
+  mid-chain SessionId/TreeId (RELATED_OPERATIONS) → `__handle_ksmbd_work()` is_chained loop +
+  credit/tcon accounting (pfz_compound only sprayed raw bytes).
+- `ndr_xattr` — SET fuzzed SD then QUERY it back → `ndr_decode_v4_ntacl()` on the stored
+  security.NTACL blob (indirect control, but the decode size-math executes).
+- `dir_pattern` — QUERY_DIRECTORY on a directory handle with a wildcard-dense search pattern →
+  misc.c `match_pattern()` backtracker (pfz_query_dir lists a subpath, never sends a pattern).
+- `transport_frame` — fuzz the RFC1001/NetBIOS 4-byte length prefix (type byte + length that
+  mismatches the payload) → connection read-assembly / length validation; throwaway conn.
 
 Batch 9 (2026-07-07, LAST-command completion — the 2 SMB2 commands that had only a
 preamble/oracle grain now have DEDICATED grains): `close` (SMB2 CLOSE 0x06 — Flags/
@@ -262,6 +470,115 @@ the ACL write-side surface that `secdesc`/#42 (aclshare) could not.
 **More write-side depth (storage-server focus) — candidates:**
 - interleaved write+set-EOF+set-alloc chains (via `compound`); stream rename/delete;
   large chunked-upload via `copychunk`+`append`; `write_flags` × sparse combos.
+
+### First 32-candidate backlog — IMPLEMENTED as batch 13 (2026-07-22)
+
+The 32 candidates below (groups A-E) were all implemented in batch 13. Kept for reference.
+
+*Chain/array/nested parse (7):* `create_dh2q_internals` (DH2Q durable-v2 ctx +DH2C match),
+`notify_output_walk` (FILE_NOTIFY_INFORMATION out-walk + filter/OutputBufferLength),
+`query_dir_resume` (INDEX_SPECIFIED+FileIndex+resume name), `set_ea_private`
+(smb2_is_private_ea names: security.*/DOSATTRIB/streams), `ioctl_inout_overlap`
+(Input/Output offset overlap → buffer_check_err), `sd_owner_group` (parse_sec_desc
+Owner/Group SID), `sd_sacl` (SACL_SECURITY_INFORMATION audit ACL).
+
+*State/lifetime/concurrency (9):* `durable_reconnect_race` (DH2C reclaim/scavenger),
+`lease_break_ack_mismatch` (mismatched LeaseKey/state), `oplock_break_race` (directed
+oplock-deadlock repro), `logoff_inflight` (LOGOFF vs inflight LOCK/notify),
+`tdis_open_fid` (TREE_DISCONNECT w/ live fids), `close_durable_scavenger`,
+`cancel_async_target` (CANCEL inflight async by MID), `credit_exhaust` (CreditRequest=0/
+large CreditCharge), `compound_unrelated_session` (per-cmd SessionId/TreeId).
+
+*Crypto/transform/signing (5):* `transform_nested` (OriginalMessageSize mismatch +
+double-wrap decrypt), `compress_bomb` (chained-decompress loop), `sign_downgrade`
+(signing-algo/context mismatch → check_sign_req), `preauth_hash_mismatch` (SMB3.1.1
+preauth integrity), `multichannel_bind_replay` (channel-bind replayed session key).
+
+*Path/name/unicode (4):* `create_path_traversal` (`..\`/`\\`/`:`/long UTF-16 →
+validate_filename), `stream_name_edge` (parse_stream_name `::$DATA`/multi-colon),
+`unicode_surrogate` (utf8_casefold non-BMP/invalid surrogate), `rename_target_edge`
+(RootDirectory fid + traversal + ReplaceIfExists).
+
+*FSCTL/info-class/legacy breadth (7):* `pipe_transceive_bind` (DCE/RPC bind ctx-list +
+opnum), `set_integrity_deep` (FSCTL_SET_INTEGRITY ChecksumAlgorithm/Flags),
+`query_fs_info` (FILESYSTEM class sweep), `smb1_dialects` (SMB1 NEGOTIATE DialectsArray),
+`fsctl_reparse_get_chain` (GET_REPARSE_POINT output bounds), `query_info_ea_list`
+(chained FILE_GET_EA_INFORMATION query walk), `set_link_root` (FILE_LINK/RENAME w/
+RootDirectory fid relative-path resolution).
+
+### Second 32-candidate backlog — IMPLEMENTED as batch 14 (2026-07-22)
+
+The 32 candidates below (groups F-L) were all implemented in batch 14. Kept for reference.
+
+*F. CREATE / context combinations (6):* `create_ctx_dup` (duplicate same-type contexts →
+dedup/last-wins), `create_ctx_giant_data` (context DataLength ≫ buffer), `create_twrp`
+(TWrp @GMT timewarp token parse), `create_alloc_vs_eof` (AllocationSize ctx + immediate
+set-EOF conflict), `create_disposition_matrix` (all Disposition × Options combos),
+`create_impersonation` (SecurityFlags/ImpersonationLevel + oplock-level matrix).
+
+*G. Read/Write edge & channel (5):* `write_compound_flush` (WRITE→FLUSH→WRITE ordering),
+`read_padding_edge` (Padding/MinimumCount vs Length), `write_zero_length` (Length=0 +
+non-zero DataOffset), `write_rdma_channel` (WRITE Channel=RDMA_V1 WriteChannelInfo — write
+side of rdma_channel_desc), `read_beyond_eof` (Offset+Length past EOF / overflow).
+
+*H. Lock semantics (3):* `lock_unlock_mismatch` (UNLOCK never-locked range /
+LockSequenceNumber mismatch), `lock_shared_excl_conflict` (overlapping SHARED then EXCL
+across 2 conns), `lock_reflexive` (re-LOCK identical range).
+
+*I. Session/auth state (4):* `session_reauth_switch` (re-auth existing session as different
+user), `guest_anon_auth` (empty NTLMSSP guest/anon path), `logoff_reuse_sid` (reuse stale
+SessionId post-LOGOFF), `tcon_ipc_vs_disk` (disk op on an IPC$ tid — tree-type confusion).
+
+*J. Info-class depth (5):* `query_all_info` (FILE_ALL_INFORMATION aggregate → many
+sub-encoders), `set_basic_time_edge` (extreme/negative NT times → ksmbd_NTtimeToUnix
+overflow), `query_stream_info` (FILE_STREAM_INFORMATION enumeration walk), `set_pipe_info`
+(SET_INFO on an IPC pipe fid), `query_network_openinfo` (FILE_NETWORK_OPEN/INTERNAL edge).
+
+*K. Transport/framing/compound edge (4):* `pipelined_requests` (many requests, no reads →
+queue depth), `oversize_pdu` (PDU near/over max_read/write/trans), `partial_pdu_dribble`
+(one byte at a time → read-loop assembly), `compound_padding` (NextCommand > sub-cmd length).
+
+*L. FSCTL breadth not yet grained (5):* `fsctl_set_object_id` (SET_OBJECT_ID),
+`fsctl_lmr_set_link` (LMR_SET_LINK_TRACKING_INFORMATION), `fsctl_query_file_regions`
+(QUERY_FILE_REGIONS), `fsctl_duplicate_extents_v2` (DUPLICATE_EXTENTS_TO_FILE_EX v2),
+`fsctl_offload_read_token` (OFFLOAD_READ → token → OFFLOAD_WRITE token round-trip).
+
+### Third 32-candidate backlog — IMPLEMENTED as batch 15 (2026-07-22, groups M-R)
+
+Identified after batch 14 (179 grains). Deeper sequences / ksmbd-subsystem edges. Not yet
+implemented. Diminishing returns beyond here — prioritize N (durable/lease/oplock state) and
+R (lifecycle exhaustion), historically the bug-rich areas.
+
+*M. Encryption/signing deep (5):* `encrypt_then_compound` (decrypt→compound parse),
+`sign_compound_mixed` (per-cmd signed/unsigned in one chain), `encrypt_wrong_session`
+(transform SessionId ≠ key), `gss_mechlist_mic` (SPNEGO mechListMIC), `negotiate_signing_ctx`
+(SIGNING_CAPABILITIES SigningAlgorithmCount array).
+
+*N. Durable/lease/oplock state machine (6):* `lease_upgrade_downgrade` (RWH→R transition),
+`durable_v1_v2_mix` (DHnQ create + DH2C reconnect), `oplock_level2_break` (lev-II break
+sequence — the deadlock class path), `lease_parent_key` (lease-v2 ParentLeaseKey to
+nonexistent parent), `durable_timeout_zero` (Timeout=0 default path + reconnect),
+`persistent_handle_ca` (PERSISTENT flag on a non-CA share → reject).
+
+*O. VFS/path/xattr edges (6):* `xattr_name_max` (EA name at XATTR_NAME_MAX boundary),
+`filename_null_embed` (embedded UTF-16 NUL), `filename_max_path` (PATH_MAX/component-max),
+`stream_delete` (open stream → delete-on-close streams_xattr), `hardlink_cross_share`
+(FILE_LINK target escaping the share), `casefold_share_name` (ksmbd_casefold_sharename edges).
+
+*P. Read/write/copy data-path (5):* `copychunk_self` (src==tgt overlapping ranges),
+`write_sparse_hole` (write across sparse holes), `read_compound_close` (READ→CLOSE chain on
+one fid), `set_eof_shrink_race` (truncate vs pending read), `append_past_max` (append past
+smb2_max_write).
+
+*Q. Info-class/query edges (5):* `query_full_ea_size` (tiny OutputBufferLength EA truncation),
+`set_rename_stream` (FILE_RENAME on a stream), `query_dir_short_buf` (OutputBufferLength < one
+entry), `set_disposition_dir` (delete-on-close on non-empty dir), `query_attr_tag_reparse`
+(FILE_ATTRIBUTE_TAG on a reparse point).
+
+*R. Session/tree/conn lifecycle (5):* `tcon_max_trees` (tree-table exhaustion),
+`session_max_opens` (open-file-table exhaustion), `conn_negotiate_twice` (re-NEGOTIATE state),
+`session_setup_no_negotiate` (out-of-order state), `interim_response_flood` (async
+interim-response allocation churn).
 
 Grain-authoring principle (memory `ksmbdzzer-architecture-principles`): each grain =
 a **working** preamble (auth → tree → open → real fid) with only the **last** endpoint

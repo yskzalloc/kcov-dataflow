@@ -15,6 +15,7 @@
 #include "libksmbdzzer.h"
 
 #define _GNU_SOURCE
+#include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -29,11 +30,22 @@
 #include <unistd.h>
 #include <time.h>
 
+/*
+ * kcov-dataflow ioctls — MUST match kernel/kcov_dataflow.c exactly.  Use the
+ * _IO* macros (not hardcoded hex) so they can never drift from the kernel again:
+ *   KCOV_DF_INIT_TRACK   _IOR('d', 1,   unsigned long)  == 0x80086401
+ *   KCOV_DF_REMOTE_ENABLE _IOW('d', 102, unsigned long) == 0x40086466
+ * The old hardcoded KCOV_DF_REMOTE_ENABLE (0x00006466) dropped the _IOW
+ * direction+size bits, so ioctl() never matched the kernel case: the remote
+ * handle was NEVER registered, the kernel routed NO dataflow records to the raw
+ * grains, and df_buf stayed empty (KERNEL_PCS always 0).  This is why the whole
+ * raw-grain fleet ran on libFuzzer harness self-coverage only.
+ */
 #ifndef KCOV_DF_INIT
-#define KCOV_DF_INIT 0x80086401
+#define KCOV_DF_INIT _IOR('d', 1, unsigned long)
 #endif
 #ifndef KCOV_DF_REMOTE_ENABLE
-#define KCOV_DF_REMOTE_ENABLE 0x00006466
+#define KCOV_DF_REMOTE_ENABLE _IOW('d', 102, unsigned long)
 #endif
 #ifndef BUF_WORDS
 #define BUF_WORDS (1<<18)   /* headroom for high-volume trace_cmp records (assumed on) */
@@ -120,15 +132,31 @@ static inline void ret_dict_add(uint64_t v) {
  * (pc-only = hash the reached PCs only, exactly what an edge/pc fuzzer sees.) */
 static int g_eng_blind = -1;   /* 1 = pc-only (drop the value region) */
 static int g_eng_i2s   = -1;   /* 1 = i2s-directed mutation, 0 = pure havoc */
+static int g_eng_vec   =  0;   /* 1 = dataflow-vec: value-class-normalize each folded field */
+static int g_eng_rel   =  0;   /* 1 = dataflow-rel: dataflow-vec + within-record pairwise cmp3 */
 static void grain_engine(void) {
     if (g_eng_blind >= 0) return;
     const char *e = getenv("KSMBDZZER_ENGINE"); if (!e || !e[0]) e = "dataflow";
     if      (!__builtin_strcmp(e, "pc-havoc")) { g_eng_blind = 1; g_eng_i2s = 0; }
     else if (!__builtin_strcmp(e, "pc-i2s"))   { g_eng_blind = 1; g_eng_i2s = 1; }
     else                                        { g_eng_blind = 0; g_eng_i2s = 1; }
+    g_eng_rel = (!__builtin_strcmp(e, "dataflow-rel")) ? 1 : 0;
+    g_eng_vec = (!__builtin_strcmp(e, "dataflow-vec") || g_eng_rel) ? 1 : 0;
+}
+
+/* Value-class normalize a folded field (dataflow-vec): collapse kernel POINTERS to a
+ * small class token (NULL-ness + a few align bits) and quantize scalars to a log2
+ * magnitude bucket, so pointer args stop minting per-address noise features and adjacent
+ * lengths share a bucket. Parity with libksmbdzzer.c:pfz_valclass. */
+static inline uint64_t valclass(uint64_t v) {
+    if (v == 0) return 0;
+    if (v >= 0xffff000000000000ULL) return 0x1000ULL | (v & 0x38ULL);   /* kernel pointer */
+    if (v >  0x00007fffffffffffULL) return 0x2000ULL;                   /* other high/non-canonical */
+    return (uint64_t)(63u - __builtin_clzll(v));                        /* scalar → magnitude bucket */
 }
 
 static void grain_atexit(void);   /* clean teardown (#1) + PC report (#5) */
+static void grain_emit_metrics(void);   /* KERNEL_PCS/RET_TOKEN_HITS/CMP_I2S_HITS — periodic + atexit */
 
 /* Coverage mode for the libFuzzer feedback counter ctr[]. ctr[] is split into a
  * PATH region and a bounded VALUE region (fixes #1/#5/#6 together):
@@ -199,7 +227,10 @@ static void fb(void) {
             for (uint32_t k = 0; k < nf; k++) {
                 uint64_t fv = df_buf[pos + 3 + k];
                 if (fv == 0 || fv == 0xBADADD85ULL) continue;
-                uint64_t vh = ((pc ^ fv) + (uint64_t)k * 0x9E3779B9ULL)
+                /* dataflow-vec: fold the value CLASS, not the raw value — kills pointer
+                 * address noise + adjacent-scalar feature spray. Baseline folds fv raw. */
+                uint64_t cv = g_eng_vec ? valclass(fv) : fv;
+                uint64_t vh = ((pc ^ cv) + (uint64_t)k * 0x9E3779B9ULL)
                               * 0x9E3779B97F4A7C15ULL;          /* bounded first-seen (#6) */
                 uint32_t vb = (uint32_t)(vh >> 48);             /* 16-bit dedup index */
                 if (!(val_seen[vb >> 3] & (uint8_t)(1u << (vb & 7)))) {
@@ -207,9 +238,33 @@ static void fb(void) {
                     ctr[path_n + (vb % val_n)]++;               /* reward: never-before-seen (pc,field) */
                 }
             }
+            /* dataflow-rel: within-record pairwise cmp3 (<,==,>) on RAW fields — splits the
+             * OOB gate (offset vs length at the same magnitude) that value buckets collapse.
+             * Skip null/unread sentinels so a missing field can't fabricate an ordering. */
+            if (!g_eng_blind && rt != 0xC && g_eng_rel)
+            for (uint32_t a = 0; a < nf; a++)
+              for (uint32_t b = a + 1; b < nf; b++) {
+                uint64_t x = df_buf[pos + 3 + a], y = df_buf[pos + 3 + b];
+                if (x == 0 || x == 0xBADADD85ULL || y == 0 || y == 0xBADADD85ULL) continue;
+                uint64_t rr = (x < y) ? 0 : (x == y) ? 1 : 2;
+                uint64_t rh = (pc ^ (rr + (uint64_t)(a * 7 + b) * 0x9E37ULL))
+                              * 0x9E3779B97F4A7C15ULL;
+                uint32_t rb = (uint32_t)(rh >> 48);
+                if (!(val_seen[rb >> 3] & (uint8_t)(1u << (rb & 7)))) {
+                    val_seen[rb >> 3] |= (uint8_t)(1u << (rb & 7));
+                    ctr[path_n + (rb % val_n)]++;               /* reward: never-before-seen (pc,rel) */
+                }
+              }
         }
         pos += 3 + nf;
     }
+    /* Periodic metric emission: grain_atexit() is bypassed by the saturation SIGKILL
+     * teardown, so KERNEL_PCS/RET_TOKEN_HITS/CMP_I2S_HITS were always 0 in the engine
+     * table. Re-emit on the first fb() call and every 64 thereafter so gen.py's reader
+     * captures the latest value however the grain dies; the table takes the max. */
+    static unsigned long _emit_ctr;
+    if (++_emit_ctr == 1 || (_emit_ctr & 63u) == 0)
+        grain_emit_metrics();
 }
 
 /* ─── mutate_i2s: shared dataflow-directed (RedQueen/I2S) mutator ──────────────
@@ -269,6 +324,14 @@ static size_t mutate_i2s(uint8_t *data, size_t size, size_t maxsize, unsigned se
         pos += 3 + nf;
     }
     int hits = 0;
+    /* Grow a too-small input so the splices below have room to land (mirror of
+     * libksmbdzzer.c pfz_mutate_i2s): a size<w input skips every `size>=w` splice, which
+     * kept CMP_I2S_HITS at 0 for grains driven by tiny inputs. Bounded by maxsize,
+     * zero-filled; libFuzzer keeps the enlarged input only if it improves coverage. */
+    if (size < 16 && maxsize > size) {
+        size_t grow = maxsize < 16 ? maxsize : 16;
+        if (grow > size) { memset(data + size, 0, grow - size); size = grow; }
+    }
     /* pass 0 (trace_cmp / RedQueen — the strongest i2s): each 0xC record carries
      * the TWO operands of a kernel comparison. If the input holds one operand,
      * overwrite it with the other so the comparison flips — clears a magic-value
@@ -362,7 +425,8 @@ static size_t mutate_i2s(uint8_t *data, size_t size, size_t maxsize, unsigned se
  * into df_buf. Then paste GRAIN_I2S_MUTATOR() once. */
 #define GRAIN_I2S_MUTATOR() \
 size_t LLVMFuzzerCustomMutator(uint8_t *d, size_t s, size_t m, unsigned seed) { \
-    if (g_stuck < 64) return LLVMFuzzerMutate(d, s, m); \
+    grain_engine();             /* resolve the arm's g_eng_i2s */ \
+    if (!g_eng_i2s || g_stuck < 64) return LLVMFuzzerMutate(d, s, m); \
     run_target(d, s);           /* refresh df_buf for THIS input at the stuck point */ \
     g_stuck = 0; \
     return mutate_i2s(d, s, m, seed); \
@@ -403,6 +467,8 @@ static unsigned long grain_handle(void) {
 }
 
 static void df_init(void) {
+    setvbuf(stderr, NULL, _IOLBF, 0);   /* line-buffer: metric emits survive the
+                                         * saturation SIGKILL (pipe = block-buffered). */
     df_fd = open("/sys/kernel/debug/kcov_dataflow", O_RDWR);
     if (df_fd < 0) _exit(1);
     ioctl(df_fd, KCOV_DF_INIT, (unsigned long)BUF_WORDS);
@@ -462,7 +528,7 @@ static int smb_connect(void) {
     struct sockaddr_in addr = {.sin_family=AF_INET, .sin_port=htons(445)};
     inet_pton(AF_INET, grain_ip(), &addr.sin_addr);   /* per-grain loopback IP */
     if (connect(raw_sock, (void*)&addr, sizeof(addr)) < 0) return -1;
-    struct timeval tv = {.tv_sec=2};
+    struct timeval tv = {.tv_sec=1};   /* 2s→1s: fail a slow op fast so the grain cycles */
     setsockopt(raw_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     return 0;
 }
@@ -656,13 +722,31 @@ static int smb_reconnect(const char *share) {
  * fault injection) a single connect/auth round can transiently fail; retrying
  * keeps the grain alive instead of exiting at init with 0 executions. */
 static int smb_setup(const char *share) {
-    for (int _t = 0; _t < 8; _t++) {
+    int last_step = 0, last_errno = 0;   /* step: 1=connect, 2=auth */
+    for (int _t = 0; _t < 6; _t++) {
         if (raw_sock >= 0) { close(raw_sock); raw_sock = -1; }
         sid = 0; tid = 0; mid = 0; has_file = 0;
-        if (smb_connect() == 0 && smb_auth(share) == 0)
-            return 0;
-        usleep(40000 * (_t + 1));   /* linear backoff: 40ms, 80ms, ... */
+        errno = 0;
+        if (smb_connect() != 0) { last_step = 1; last_errno = errno; }
+        else if (smb_auth(share) != 0) { last_step = 2; last_errno = errno; }
+        else return 0;
+        /* EAGAIN (Resource temporarily unavailable) is ksmbd transiently at its
+         * connection/session limit — the late-wave GRAIN_SETUP_FAIL storm under -procs
+         * concurrency, where earlier grains' sessions haven't been reaped yet. Back off
+         * HARD on it (200ms..1.2s) so the limit clears, instead of burning quick retries
+         * and dying at 0-exec; other errors keep the light 40ms linear backoff. */
+        unsigned base = (last_errno == EAGAIN || last_errno == EWOULDBLOCK)
+                        ? 200000u : 40000u;
+        usleep(base * (unsigned)(_t + 1));
     }
+    /* CONNECTION-LAYER death diagnostic: name WHICH step exhausted its retries so the
+     * "0 executions — exited at init" grains stop being a black box. step=1 CONNECT
+     * (ksmbd not accepting / reset at accept — transport/conn-limit) vs step=2 AUTH
+     * (negotiate/session-setup/mountd-IPC). errno pins connect-side failures
+     * (ECONNREFUSED/ECONNRESET/ETIMEDOUT). Emitted once per dead grain; gen.py captures it. */
+    pfz_err("GRAIN_SETUP_FAIL step=%s errno=%d(%s) ip=%s share=%s\n",
+            last_step == 1 ? "CONNECT" : last_step == 2 ? "AUTH" : "?",
+            last_errno, last_errno ? strerror(last_errno) : "none", grain_ip(), share);
     return -1;
 }
 
@@ -670,6 +754,36 @@ static int smb_setup(const char *share) {
  * session — TREE_DISCONNECT + LOGOFF — so ksmbd reaps it immediately instead of
  * leaving it for a timeout; lingering wave-1 sessions are the leading suspect for
  * the wave-2 session-setup failures. (#5) Reports the distinct kernel PCs reached. */
+/* Emit the three engine-comparison metrics (all monotonic counters). Called
+ * periodically from fb() so the saturation SIGKILL teardown can't lose them, and once
+ * from grain_atexit() on a clean exit. gen.py / the engine table take the high-water mark. */
+static void grain_emit_metrics(void) {
+    unsigned c = pc_count();
+    pfz_err("KERNEL_PCS=%u RET_TOKEN_HITS=%lu CMP_I2S_HITS=%lu RET_DICT=%u\n",
+            c, g_ret_hits, g_cmp_hits,
+            g_retdict_n < RETDICT_N ? g_retdict_n : RETDICT_N);
+    fflush(stderr);   /* stderr is a PIPE under gen.py → block-buffered; flush so the
+                       * saturation SIGKILL can't drop the emit (else metrics read 0). */
+
+    /* Fleet-UNION dump — twin of libksmbdzzer.c pfz_report_metrics(). Same 2^17-bit
+     * layout + hash as the lib grains, so gen.py ORs all bitmaps into one deduplicated
+     * fleet union (the throughput-fair primary metric). Dump only when the popcount grew
+     * so a saturated grain stops writing (bounds churn to distinct-PC increases). */
+    const char *bmp = getenv("GRAIN_PCBMP");
+    if (bmp) {
+        static unsigned last_dumped;
+        if (c > last_dumped) {
+            int fd = open(bmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (fd >= 0) {
+                ssize_t w = write(fd, pc_bitmap, sizeof(pc_bitmap));
+                (void)w;
+                close(fd);
+            }
+            last_dumped = c;
+        }
+    }
+}
+
 static void grain_atexit(void) {
     if (raw_sock >= 0 && sid) {
         uint8_t pdu[128], resp[256];
@@ -682,14 +796,10 @@ static void grain_atexit(void) {
         *(uint16_t *)(pdu + 64) = 4;          /* StructureSize */
         xact(pdu, 64 + 4, resp, sizeof(resp));
     }
-    /* Reverse-flow proof: how many inputs this grain steered with a kernel RETURN
-     * token (RET_TOKEN_HITS) or a trace_cmp operand (CMP_I2S_HITS), and how large the
-     * persistent return dictionary grew (RET_DICT). Non-zero RET_TOKEN_HITS is the
-     * direct evidence that the bi-directional RedQueen loop actually fired; the
-     * engine comparison parses these to separate a real i2s win from pc-havoc noise. */
-    pfz_err("KERNEL_PCS=%u RET_TOKEN_HITS=%lu CMP_I2S_HITS=%lu RET_DICT=%u\n",
-            pc_count(), g_ret_hits, g_cmp_hits,
-            g_retdict_n < RETDICT_N ? g_retdict_n : RETDICT_N);
+    /* Reverse-flow proof (RET_TOKEN_HITS / CMP_I2S_HITS): direct evidence the
+     * bi-directional RedQueen loop fired. Emitted through the shared helper (also called
+     * periodically from fb()) so a SIGKILLed grain still reports its high-water counters. */
+    grain_emit_metrics();
 }
 
 static int smb_create_file(const char *fname) {
