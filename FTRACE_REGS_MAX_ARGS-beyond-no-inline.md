@@ -1,33 +1,37 @@
-# Functions Beyond FTRACE_REGS_MAX_ARGS (>6 parameters) -- Non-Inlined Only
+# Functions Beyond FTRACE_REGS_MAX_ARGS (>6 parameters) -- Compiled (Non-Inlined) In This vmlinux
 
-Generated from Linux kernel source (semcode) cross-referenced with vmlinux symbols.
-Only functions that appear as symbols in vmlinux are listed (i.e., NOT inlined).
+Distinct HEAD-tree functions with >6 parameters that appear as a text
+symbol in the target vmlinux -- the real ftrace targets whose 7th+ arg is
+truncated at FTRACE_REGS_MAX_ARGS = 6.
 
-## Method
+> **Config-dependent.** Functions absent from this vmlinux may be inlined
+> OR simply not built by this config. See the generating script's caveats.
 
-1. semcode indexes all function definitions from source
-2. `nm vmlinux` extracts text symbols (actual compiled, non-inlined functions)
-3. Cross-reference: only functions present in BOTH are real callable targets
-4. These are functions ftrace CAN trace but CANNOT fully capture args for
+## Kernel version
+
+- Version: `7.2.0-rc4`
+- Upstream mainline base (master): `v7.2-rc4` (`1590cf0329716306e948a8fc29f1d3ee87d3989f`)
+- Analyzed commit (HEAD): `dad19d2548fe7e2adce320ef85e115fa51bd2506` (`v7.2-rc4-8222-gdad19d2548fe`)
+- Tree: `next-20260721-13-gdad19d2548fe`
+- vmlinux build: `ksmbd/virtme config, clang 24.0.0git LLVM fork (Jul 23 build)`
 
 ## Summary
 
-- Total source functions indexed: 969,517
-- Functions with >6 params (source): 8,958
-- Inlined (not in vmlinux, excluded): 8,210
-- **Non-inlined with >6 params: 748**
+- Distinct HEAD functions with >6 params: 6,880
+- **Non-inlined (text symbol in this vmlinux): 668**
+- Absent from this vmlinux (inlined or not built): 6,212
 
 ## Distribution by parameter count
 
-| Args | Functions | ftrace misses |
-|------|-----------|---------------|
-| 7 | 404 | 1 |
-| 8 | 191 | 2 |
-| 9 | 75 | 3 |
-| 10 | 43 | 4 |
-| 11 | 18 | 5 |
-| 12 | 13 | 6 |
-| 13 | 1 | 7 |
+| Args | Functions | ftrace truncates |
+|------|-----------|------------------|
+| 7 | 343 | 1 |
+| 8 | 173 | 2 |
+| 9 | 67 | 3 |
+| 10 | 40 | 4 |
+| 11 | 25 | 5 |
+| 12 | 15 | 6 |
+| 13 | 2 | 7 |
 | 14 | 2 | 8 |
 | 16 | 1 | 10 |
 
@@ -35,36 +39,36 @@ Only functions that appear as symbols in vmlinux are listed (i.e., NOT inlined).
 
 | Subsystem | Count |
 |-----------|-------|
-| `include/linux` | 108 |
-| `drivers/gpu` | 93 |
-| `net/ipv4` | 46 |
-| `kernel/bpf` | 34 |
-| `lib/zstd` | 32 |
+| `fs/smb` | 84 |
+| `drivers/gpu` | 77 |
+| `net/ipv4` | 48 |
+| `kernel/bpf` | 38 |
 | `net/sched` | 28 |
-| `include/net` | 27 |
-| `net/core` | 23 |
-| `drivers/acpi` | 16 |
-| `include/drm` | 15 |
-| `kernel/trace` | 14 |
-| `arch/x86` | 14 |
+| `drivers/infiniband` | 28 |
+| `lib/zstd` | 24 |
+| `net/core` | 24 |
+| `kernel/trace` | 16 |
 | `drivers/virtio` | 14 |
-| `sound/hda` | 14 |
-| `crypto/krb5` | 11 |
-| `net/ethtool` | 10 |
-| `drivers/base` | 9 |
-| `drivers/iommu` | 9 |
-| `drivers/md` | 6 |
+| `arch/x86` | 11 |
+| `drivers/acpi` | 11 |
+| `include/linux` | 9 |
+| `sound/hda` | 9 |
+| `drivers/base` | 8 |
+| `crypto/krb5` | 8 |
+| `drivers/iommu` | 7 |
+| `net/ethtool` | 6 |
+| `drivers/net` | 6 |
 | `security/keys` | 6 |
 | `drivers/video` | 6 |
+| `fs/fuse` | 6 |
+| `drivers/md` | 5 |
 | `fs/kernfs` | 5 |
-| `drivers/net` | 5 |
 | `lib/maple_tree.c` | 5 |
 | `kernel/events` | 5 |
 | `drivers/android` | 5 |
-| `fs/fuse` | 5 |
-| `kernel/futex` | 5 |
 | `kernel/irq` | 5 |
 | `fs/overlayfs` | 5 |
+| `kernel/sysctl.c` | 5 |
 
 ## Full list
 
@@ -74,83 +78,93 @@ Only functions that appear as symbols in vmlinux are listed (i.e., NOT inlined).
 | 14 | `rtnl_fill_ifinfo` | `net/core/rtnetlink.c` |
 | 14 | `tcf_fill_node` | `net/sched/cls_api.c` |
 | 13 | `bpf_trace_run12` | `include/linux/trace_events.h` |
+| 13 | `udp_tunnel_xmit_skb` | `net/ipv4/udp_tunnel_core.c` |
+| 12 | `__lock_acquire` | `kernel/locking/lockdep.c` |
 | 12 | `__setplane_atomic` | `drivers/gpu/drm/drm_plane.c` |
 | 12 | `__setplane_internal` | `drivers/gpu/drm/drm_plane.c` |
 | 12 | `bpf_trace_run11` | `include/linux/trace_events.h` |
 | 12 | `dm_stats_create` | `drivers/md/dm-stats.c` |
-| 12 | `drm_atomic_helper_update_plane` | `include/drm/drm_atomic_helper.h` |
 | 12 | `drm_atomic_helper_update_plane` | `drivers/gpu/drm/drm_atomic_helper.c` |
-| 12 | `drm_plane_helper_update_primary` | `include/drm/drm_plane_helper.h` |
 | 12 | `drm_plane_helper_update_primary` | `drivers/gpu/drm/drm_plane_helper.c` |
 | 12 | `intel_legacy_cursor_update` | `drivers/gpu/drm/i915/display/intel_cursor.c` |
+| 12 | `record_blktrace_event` | `kernel/trace/blktrace.c` |
+| 12 | `record_blktrace_event2` | `kernel/trace/blktrace.c` |
 | 12 | `relay_blktrace_event` | `kernel/trace/blktrace.c` |
+| 12 | `smb2_compound_op` | `fs/smb/client/smb2inode.c` |
 | 12 | `tcp_v4_send_ack` | `net/ipv4/tcp_ipv4.c` |
 | 12 | `tfilter_notify` | `net/sched/cls_api.c` |
 | 12 | `tfilter_notify_prep` | `net/sched/cls_api.c` |
+| 11 | `CIFSSMBLock` | `fs/smb/client/cifssmb.c` |
+| 11 | `SMB2_query_info_init` | `fs/smb/client/smb2pdu.c` |
+| 11 | `SMB2_set_info_init` | `fs/smb/client/smb2pdu.c` |
+| 11 | `SMBLegacyOpen` | `fs/smb/client/cifssmb.c` |
 | 11 | `__setplane_check` | `drivers/gpu/drm/drm_plane.c` |
 | 11 | `bpf_trace_run10` | `include/linux/trace_events.h` |
 | 11 | `btf_find_field_one` | `kernel/bpf/btf.c` |
+| 11 | `build_sec_desc` | `fs/smb/client/cifsacl.c` |
 | 11 | `compute_hdmi_tmds_pll` | `drivers/gpu/drm/i915/display/intel_snps_hdmi_pll.c` |
 | 11 | `ethtool_cmis_cdb_compose_args` | `net/ethtool/cmis_cdb.c` |
-| 11 | `ethtool_cmis_cdb_compose_args` | `net/ethtool/cmis.h` |
+| 11 | `ib_sa_guid_info_rec_query` | `drivers/infiniband/core/sa_query.c` |
+| 11 | `ib_sa_mcmember_rec_query` | `drivers/infiniband/core/sa_query.c` |
 | 11 | `invoke_bpf` | `arch/x86/net/bpf_jit_comp.c` |
 | 11 | `iptunnel_xmit` | `net/ipv4/ip_tunnel_core.c` |
-| 11 | `iptunnel_xmit` | `include/net/ip_tunnels.h` |
 | 11 | `make_spte` | `arch/x86/kvm/mmu/spte.c` |
-| 11 | `make_spte` | `arch/x86/kvm/mmu/spte.h` |
+| 11 | `query_info` | `fs/smb/client/smb2pdu.c` |
+| 11 | `rdma_rw_ctx_signature_init` | `drivers/infiniband/core/rw.c` |
 | 11 | `rt_fill_info` | `net/ipv4/route.c` |
 | 11 | `rtnl_fill_statsinfo` | `net/core/rtnetlink.c` |
+| 11 | `send_set_info` | `fs/smb/client/smb2pdu.c` |
 | 11 | `skl_update_scaler` | `drivers/gpu/drm/i915/display/skl_scaler.c` |
 | 11 | `tc_chain_fill_node` | `net/sched/cls_api.c` |
 | 11 | `tfilter_del_notify` | `net/sched/cls_api.c` |
 | 11 | `vring_create_virtqueue_map` | `drivers/virtio/virtio_ring.c` |
 | 11 | `vring_create_virtqueue_split` | `drivers/virtio/virtio_ring.c` |
+| 10 | `CIFSPOSIXCreate` | `fs/smb/client/cifssmb.c` |
 | 10 | `HUF_readStats_wksp` | `lib/zstd/common/entropy_common.c` |
-| 10 | `HUF_readStats_wksp` | `lib/zstd/common/huf.h` |
+| 10 | `SMB2_ioctl` | `fs/smb/client/smb2pdu.c` |
 | 10 | `__drm_universal_plane_alloc` | `drivers/gpu/drm/drm_plane.c` |
 | 10 | `__drm_universal_plane_init` | `drivers/gpu/drm/drm_plane.c` |
 | 10 | `__drmm_universal_plane_alloc` | `drivers/gpu/drm/drm_plane.c` |
 | 10 | `__ip_append_data` | `net/ipv4/ip_output.c` |
-| 10 | `__kernfs_create_file` | `include/linux/kernfs.h` |
 | 10 | `__kernfs_create_file` | `fs/kernfs/file.c` |
 | 10 | `bpf_trace_run9` | `include/linux/trace_events.h` |
 | 10 | `check_mem_access` | `kernel/bpf/verifier.c` |
+| 10 | `cifs_do_create` | `fs/smb/client/dir.c` |
 | 10 | `drm_gtf_mode_complex` | `drivers/gpu/drm/drm_modes.c` |
-| 10 | `drmm_connector_hdmi_init` | `include/drm/drm_connector.h` |
 | 10 | `drmm_connector_hdmi_init` | `drivers/gpu/drm/drm_connector.c` |
 | 10 | `flow_indr_block_cb_alloc` | `net/core/flow_offload.c` |
+| 10 | `ib_sa_path_rec_get` | `drivers/infiniband/core/sa_query.c` |
+| 10 | `ib_sa_service_rec_get` | `drivers/infiniband/core/sa_query.c` |
 | 10 | `icmp_route_lookup` | `net/ipv4/icmp.c` |
 | 10 | `inet_lhash2_lookup` | `net/ipv4/inet_hashtables.c` |
 | 10 | `inet_lookup_run_sk_lookup` | `net/ipv4/inet_hashtables.c` |
 | 10 | `intel_migrate_copy` | `drivers/gpu/drm/i915/gt/intel_migrate.c` |
-| 10 | `intel_migrate_copy` | `drivers/gpu/drm/i915/gt/intel_migrate.h` |
-| 10 | `intel_nhlt_get_endpoint_blob` | `include/sound/intel-nhlt.h` |
 | 10 | `intel_nhlt_get_endpoint_blob` | `sound/hda/core/intel-nhlt.c` |
 | 10 | `ip_make_skb` | `net/ipv4/ip_output.c` |
 | 10 | `ip_send_unicast_reply` | `net/ipv4/ip_output.c` |
-| 10 | `ip_send_unicast_reply` | `include/net/ip.h` |
 | 10 | `migrate_pages_batch` | `mm/migrate.c` |
 | 10 | `ndo_dflt_bridge_getlink` | `net/core/rtnetlink.c` |
-| 10 | `ndo_dflt_bridge_getlink` | `include/linux/rtnetlink.h` |
 | 10 | `nlmsg_populate_fdb_fill` | `net/core/rtnetlink.c` |
 | 10 | `receive_small_xdp` | `drivers/net/virtio_net.c` |
 | 10 | `rtnl_newlink_create` | `net/core/rtnetlink.c` |
 | 10 | `scsi_mode_sense` | `drivers/scsi/scsi_lib.c` |
-| 10 | `scsi_mode_sense` | `include/scsi/scsi_device.h` |
+| 10 | `smb2_query_info_compound` | `fs/smb/client/smb2ops.c` |
+| 10 | `smb2_set_path_attr` | `fs/smb/client/smb2inode.c` |
 | 10 | `tc_setup_cb_replace` | `net/sched/cls_api.c` |
-| 10 | `tc_setup_cb_replace` | `include/net/pkt_cls.h` |
 | 10 | `tcf_action_init` | `net/sched/act_api.c` |
-| 10 | `tcf_action_init` | `include/net/act_api.h` |
+| 10 | `udp_tunnel_dst_lookup` | `net/ipv4/udp_tunnel_core.c` |
 | 10 | `virtqueue_add` | `drivers/virtio/virtio_ring.c` |
 | 10 | `virtqueue_add_indirect_packed` | `drivers/virtio/virtio_ring.c` |
 | 10 | `virtqueue_add_split` | `drivers/virtio/virtio_ring.c` |
 | 10 | `vmware_hypercall_slow` | `arch/x86/kernel/cpu/vmware.c` |
-| 10 | `vmware_hypercall_slow` | `arch/x86/include/asm/vmware.h` |
 | 10 | `vring_create_virtqueue` | `drivers/virtio/virtio_ring.c` |
 | 10 | `vring_new_virtqueue` | `drivers/virtio/virtio_ring.c` |
+| 9 | `CIFSSMBPosixLock` | `fs/smb/client/cifssmb.c` |
 | 9 | `HUF_readStats_body_bmi2` | `lib/zstd/common/entropy_common.c` |
+| 9 | `SMB2_change_notify` | `fs/smb/client/smb2pdu.c` |
+| 9 | `SMB2_ioctl_init` | `fs/smb/client/smb2pdu.c` |
+| 9 | `SMB2_lock` | `fs/smb/client/smb2pdu.c` |
 | 9 | `ZSTD_buildFSETable` | `lib/zstd/decompress/zstd_decompress_block.c` |
-| 9 | `ZSTD_buildFSETable` | `lib/zstd/decompress/zstd_decompress_block.h` |
 | 9 | `ZSTD_execSequenceEndSplitLitBuffer` | `lib/zstd/decompress/zstd_decompress_block.c` |
 | 9 | `__blk_add_trace` | `kernel/trace/blktrace.c` |
 | 9 | `__bpf_sk_lookup` | `net/core/filter.c` |
@@ -158,115 +172,100 @@ Only functions that appear as symbols in vmlinux are listed (i.e., NOT inlined).
 | 9 | `__get_vm_area_node` | `mm/vmalloc.c` |
 | 9 | `__inet_lookup_listener` | `net/ipv4/inet_hashtables.c` |
 | 9 | `__skb_flow_dissect` | `net/core/flow_dissector.c` |
-| 9 | `__skb_flow_dissect` | `include/linux/skbuff.h` |
 | 9 | `__trace_define_field` | `kernel/trace/trace_events.c` |
-| 9 | `__vmalloc_node_range_noprof` | `mm/vmalloc.c` |
 | 9 | `__vmalloc_node_range_noprof` | `mm/nommu.c` |
 | 9 | `__vring_new_virtqueue_packed` | `drivers/virtio/virtio_ring.c` |
 | 9 | `__vring_new_virtqueue_split` | `drivers/virtio/virtio_ring.c` |
-| 9 | `acpi_nhlt_tb_find_fmtcfg` | `include/acpi/nhlt.h` |
 | 9 | `acpi_nhlt_tb_find_fmtcfg` | `drivers/acpi/nhlt.c` |
+| 9 | `aes_ccm_decrypt` | `lib/crypto/aes.c` |
+| 9 | `aes_ccm_encrypt` | `lib/crypto/aes.c` |
 | 9 | `alloc_htab_elem` | `kernel/bpf/hashtab.c` |
 | 9 | `alloc_large_system_hash` | `mm/mm_init.c` |
 | 9 | `arp_send_dst` | `net/ipv4/arp.c` |
-| 9 | `blk_rq_map_user_io` | `include/linux/blk-mq.h` |
 | 9 | `blk_rq_map_user_io` | `block/blk-map.c` |
+| 9 | `bpf_log_attr_init` | `kernel/bpf/log.c` |
 | 9 | `bpf_trace_run8` | `include/linux/trace_events.h` |
+| 9 | `btf_struct_walk` | `kernel/bpf/btf.c` |
 | 9 | `cls_cgroup_change` | `net/sched/cls_cgroup.c` |
 | 9 | `dm_region_hash_create` | `drivers/md/dm-region-hash.c` |
-| 9 | `do_mmap` | `include/linux/mm.h` |
 | 9 | `do_mmap` | `mm/mmap.c` |
-| 9 | `do_mmap` | `mm/nommu.c` |
 | 9 | `drm_fb_xfrm` | `drivers/gpu/drm/drm_format_helper.c` |
-| 9 | `drm_universal_plane_init` | `include/drm/drm_plane.h` |
 | 9 | `drm_universal_plane_init` | `drivers/gpu/drm/drm_plane.c` |
 | 9 | `ftrace_set_hash` | `kernel/trace/ftrace.c` |
 | 9 | `i915_gem_gtt_insert` | `drivers/gpu/drm/i915/i915_gem_gtt.c` |
-| 9 | `i915_gem_gtt_insert` | `drivers/gpu/drm/i915/i915_gem_gtt.h` |
+| 9 | `ib_register_mad_agent` | `drivers/infiniband/core/mad.c` |
+| 9 | `ib_ud_header_init` | `drivers/infiniband/core/ud_header.c` |
 | 9 | `inet_lookup_reuseport` | `net/ipv4/inet_hashtables.c` |
 | 9 | `intel_context_migrate_copy` | `drivers/gpu/drm/i915/gt/intel_migrate.c` |
-| 9 | `intel_context_migrate_copy` | `drivers/gpu/drm/i915/gt/intel_migrate.h` |
 | 9 | `intel_dp_mode_valid_with_dsc` | `drivers/gpu/drm/i915/display/intel_dp.c` |
-| 9 | `intel_dp_mode_valid_with_dsc` | `drivers/gpu/drm/i915/display/intel_dp.h` |
 | 9 | `intel_memory_region_create` | `drivers/gpu/drm/i915/intel_memory_region.c` |
-| 9 | `invoke_bpf` | `arch/loongarch/net/bpf_jit.c` |
-| 9 | `invoke_bpf` | `arch/riscv/net/bpf_jit_comp64.c` |
+| 9 | `iocg_handle_over_budget` | `block/blk-iocost.c` |
 | 9 | `ip_append_data` | `net/ipv4/ip_output.c` |
-| 9 | `ip_append_data` | `include/net/ip.h` |
 | 9 | `map_range` | `arch/arm64/kernel/pi/map_range.c` |
-| 9 | `map_range` | `arch/arm64/kernel/pi/pi.h` |
-| 9 | `memmap_init_range` | `mm/internal.h` |
 | 9 | `memmap_init_range` | `mm/mm_init.c` |
 | 9 | `nh_fill_res_bucket` | `net/ipv4/nexthop.c` |
 | 9 | `node_copy` | `lib/maple_tree.c` |
 | 9 | `pci_bus_alloc_from_region` | `drivers/pci/bus.c` |
+| 9 | `rdma_rw_ctx_init` | `drivers/infiniband/core/rw.c` |
+| 9 | `rdma_rw_ctx_init_bvec` | `drivers/infiniband/core/rw.c` |
+| 9 | `rdma_rw_init_mr_wrs_bvec` | `drivers/infiniband/core/rw.c` |
 | 9 | `receive_mergeable_xdp` | `drivers/net/virtio_net.c` |
 | 9 | `rtmsg_ifinfo_build_skb` | `net/core/rtnetlink.c` |
+| 9 | `rxe_process_mad` | `drivers/infiniband/sw/rxe/rxe_mad.c` |
 | 9 | `scsi_mode_select` | `drivers/scsi/scsi_lib.c` |
-| 9 | `scsi_mode_select` | `include/scsi/scsi_device.h` |
 | 9 | `skl_compute_wm_params` | `drivers/gpu/drm/i915/display/skl_watermark.c` |
 | 9 | `tc_setup_cb_reoffload` | `net/sched/cls_api.c` |
-| 9 | `tc_setup_cb_reoffload` | `include/net/pkt_cls.h` |
 | 9 | `tca_get_fill` | `net/sched/act_api.c` |
 | 9 | `tcp_sacktag_one` | `net/ipv4/tcp_input.c` |
 | 9 | `tcp_zerocopy_vm_insert_batch_error` | `net/ipv4/tcp.c` |
 | 9 | `tfilter_notify_chain` | `net/sched/cls_api.c` |
-| 9 | `ttm_bo_init_reserved` | `include/drm/ttm/ttm_bo.h` |
 | 9 | `ttm_bo_init_reserved` | `drivers/gpu/drm/ttm/ttm_bo.c` |
-| 9 | `ttm_bo_init_validate` | `include/drm/ttm/ttm_bo.h` |
 | 9 | `ttm_bo_init_validate` | `drivers/gpu/drm/ttm/ttm_bo.c` |
 | 9 | `udp4_lib_lookup2` | `net/ipv4/udp.c` |
-| 9 | `uprobe_write` | `include/linux/uprobes.h` |
 | 9 | `uprobe_write` | `kernel/events/uprobes.c` |
-| 9 | `virtio_gpu_cmd_transfer_from_host_3d` | `drivers/gpu/drm/virtio/virtgpu_drv.h` |
 | 9 | `virtio_gpu_cmd_transfer_from_host_3d` | `drivers/gpu/drm/virtio/virtgpu_vq.c` |
-| 9 | `virtio_gpu_cmd_transfer_to_host_3d` | `drivers/gpu/drm/virtio/virtgpu_drv.h` |
 | 9 | `virtio_gpu_cmd_transfer_to_host_3d` | `drivers/gpu/drm/virtio/virtgpu_vq.c` |
 | 9 | `vp_find_one_vq_msix` | `drivers/virtio/virtio_pci_common.c` |
+| 8 | `CIFSFindFirst` | `fs/smb/client/cifssmb.c` |
+| 8 | `CIFSSMBSetEA` | `fs/smb/client/cifssmb.c` |
 | 8 | `FSE_decompress_wksp_bmi2` | `lib/zstd/common/fse_decompress.c` |
-| 8 | `FSE_decompress_wksp_bmi2` | `lib/zstd/common/fse.h` |
-| 8 | `HUF_decompress1X1_DCtx_wksp` | `lib/zstd/common/huf.h` |
 | 8 | `HUF_decompress1X1_DCtx_wksp` | `lib/zstd/decompress/huf_decompress.c` |
-| 8 | `HUF_decompress1X2_DCtx_wksp` | `lib/zstd/common/huf.h` |
 | 8 | `HUF_decompress1X2_DCtx_wksp` | `lib/zstd/decompress/huf_decompress.c` |
-| 8 | `HUF_decompress1X_DCtx_wksp` | `lib/zstd/common/huf.h` |
 | 8 | `HUF_decompress1X_DCtx_wksp` | `lib/zstd/decompress/huf_decompress.c` |
-| 8 | `HUF_decompress4X_hufOnly_wksp` | `lib/zstd/common/huf.h` |
 | 8 | `HUF_decompress4X_hufOnly_wksp` | `lib/zstd/decompress/huf_decompress.c` |
 | 8 | `NF_HOOK` | `include/linux/netfilter.h` |
+| 8 | `SMB2_open` | `fs/smb/client/smb2pdu.c` |
+| 8 | `SMB2_query_directory_init` | `fs/smb/client/smb2pdu.c` |
 | 8 | `ZSTD_buildFSETable_body_bmi2` | `lib/zstd/decompress/zstd_decompress_block.c` |
 | 8 | `ZSTD_decompressMultiFrame` | `lib/zstd/decompress/zstd_decompress.c` |
 | 8 | `ZSTD_execSequenceEnd` | `lib/zstd/decompress/zstd_decompress_block.c` |
 | 8 | `__arch_prepare_bpf_trampoline` | `arch/powerpc/net/bpf_jit_comp.c` |
-| 8 | `__arch_prepare_bpf_trampoline` | `arch/x86/net/bpf_jit_comp.c` |
+| 8 | `__cifs_sfu_make_node` | `fs/smb/client/smb2ops.c` |
 | 8 | `__gunzip` | `lib/decompress_inflate.c` |
 | 8 | `__hw_addr_add_ex` | `net/core/dev_addr_lists.c` |
 | 8 | `__i915_ttm_move` | `drivers/gpu/drm/i915/gem/i915_gem_ttm_move.c` |
 | 8 | `__key_create_or_update` | `security/keys/key.c` |
-| 8 | `__next_mem_range` | `include/linux/memblock.h` |
 | 8 | `__next_mem_range` | `mm/memblock.c` |
-| 8 | `__next_mem_range_rev` | `include/linux/memblock.h` |
 | 8 | `__next_mem_range_rev` | `mm/memblock.c` |
 | 8 | `__nla_validate_parse` | `lib/nlattr.c` |
+| 8 | `__platform_create_bundle` | `drivers/base/platform.c` |
 | 8 | `__snd_hda_add_vmaster` | `sound/hda/common/codec.c` |
-| 8 | `__snd_hda_add_vmaster` | `sound/hda/common/hda_local.h` |
 | 8 | `__splice_segment` | `net/core/skbuff.c` |
 | 8 | `__udp4_lib_lookup` | `net/ipv4/udp.c` |
 | 8 | `__unzstd` | `lib/decompress_unzstd.c` |
 | 8 | `_request_firmware_nowait` | `drivers/base/firmware_loader/main.c` |
-| 8 | `acpi_nhlt_find_fmtcfg` | `include/acpi/nhlt.h` |
 | 8 | `acpi_nhlt_find_fmtcfg` | `drivers/acpi/nhlt.c` |
 | 8 | `acpi_ns_walk_namespace` | `drivers/acpi/acpica/nswalk.c` |
-| 8 | `acpi_ns_walk_namespace` | `drivers/acpi/acpica/acnamesp.h` |
+| 8 | `aes_gcm_decrypt` | `lib/crypto/aes.c` |
+| 8 | `aes_gcm_encrypt` | `lib/crypto/aes.c` |
+| 8 | `agent_send_response` | `drivers/infiniband/core/agent.c` |
 | 8 | `alloc_buffer` | `kernel/trace/ring_buffer.c` |
 | 8 | `alloc_trace_kprobe` | `kernel/trace/trace_kprobe.c` |
 | 8 | `alloc_vmap_area` | `mm/vmalloc.c` |
-| 8 | `allocate_resource` | `include/linux/ioport.h` |
 | 8 | `allocate_resource` | `kernel/resource.c` |
 | 8 | `arp_create` | `net/ipv4/arp.c` |
 | 8 | `arp_is_garp` | `net/ipv4/arp.c` |
 | 8 | `arp_send` | `net/ipv4/arp.c` |
-| 8 | `arp_send` | `include/net/arp.h` |
 | 8 | `async_io` | `drivers/md/dm-io.c` |
 | 8 | `binder_fixup_parent` | `drivers/android/binder.c` |
 | 8 | `binder_put_node_cmd` | `drivers/android/binder.c` |
@@ -274,14 +273,13 @@ Only functions that appear as symbols in vmlinux are listed (i.e., NOT inlined).
 | 8 | `bit_bmove` | `drivers/video/fbdev/core/bitblit.c` |
 | 8 | `bit_clear` | `drivers/video/fbdev/core/bitblit.c` |
 | 8 | `bit_putcs` | `drivers/video/fbdev/core/bitblit.c` |
+| 8 | `bpf_fs_xattr_set` | `kernel/bpf/inode.c` |
 | 8 | `bpf_mprog_attach` | `kernel/bpf/mprog.c` |
-| 8 | `bpf_mprog_attach` | `include/linux/bpf_mprog.h` |
 | 8 | `bpf_test_finish` | `net/bpf/test_run.c` |
 | 8 | `bpf_trace_run7` | `include/linux/trace_events.h` |
 | 8 | `btf_find_graph_root` | `kernel/bpf/btf.c` |
 | 8 | `btf_struct_access` | `kernel/bpf/btf.c` |
-| 8 | `btf_struct_access` | `include/linux/bpf.h` |
-| 8 | `btf_struct_walk` | `kernel/bpf/btf.c` |
+| 8 | `btf_struct_ids_match` | `kernel/bpf/btf.c` |
 | 8 | `calc_plane_remap_info` | `drivers/gpu/drm/i915/display/intel_fb.c` |
 | 8 | `cgroup_bpf_attach` | `kernel/bpf/cgroup.c` |
 | 8 | `check_bytes_and_report` | `mm/slub.c` |
@@ -290,145 +288,137 @@ Only functions that appear as symbols in vmlinux are listed (i.e., NOT inlined).
 | 8 | `check_ptr_to_btf_access` | `kernel/bpf/verifier.c` |
 | 8 | `check_ptr_to_map_access` | `kernel/bpf/verifier.c` |
 | 8 | `check_stack_range_initialized` | `kernel/bpf/verifier.c` |
-| 8 | `cont_write_begin` | `include/linux/buffer_head.h` |
+| 8 | `cifs_call_async` | `fs/smb/client/transport.c` |
+| 8 | `cifs_create_reparse_inode` | `fs/smb/client/cifssmb.c` |
+| 8 | `cifs_mand_lock` | `fs/smb/client/smb1ops.c` |
+| 8 | `cifs_posix_open` | `fs/smb/client/file.c` |
+| 8 | `cifs_setlk` | `fs/smb/client/file.c` |
+| 8 | `cifs_xattr_set` | `fs/smb/client/xattr.c` |
+| 8 | `cm_format_rej` | `drivers/infiniband/core/cm.c` |
+| 8 | `compound_send_recv` | `fs/smb/client/transport.c` |
 | 8 | `cont_write_begin` | `fs/buffer.c` |
-| 8 | `crypto_krb5_encrypt` | `include/crypto/krb5.h` |
 | 8 | `crypto_krb5_encrypt` | `crypto/krb5/krb5_api.c` |
-| 8 | `crypto_krb5_get_mic` | `include/crypto/krb5.h` |
 | 8 | `crypto_krb5_get_mic` | `crypto/krb5/krb5_api.c` |
 | 8 | `dns_query` | `net/dns_resolver/dns_query.c` |
-| 8 | `dns_query` | `include/linux/dns_resolver.h` |
 | 8 | `do_compat_pselect` | `fs/select.c` |
 | 8 | `do_jit` | `arch/x86/net/bpf_jit_comp.c` |
 | 8 | `drm_client_get_tile_offsets` | `drivers/gpu/drm/drm_client_modeset.c` |
 | 8 | `drm_client_pick_crtcs` | `drivers/gpu/drm/drm_client_modeset.c` |
-| 8 | `drm_edp_backlight_init` | `include/drm/display/drm_dp_helper.h` |
 | 8 | `drm_edp_backlight_init` | `drivers/gpu/drm/display/drm_dp_helper.c` |
-| 8 | `drm_mm_insert_node_in_range` | `include/drm/drm_mm.h` |
 | 8 | `drm_mm_insert_node_in_range` | `drivers/gpu/drm/drm_mm.c` |
-| 8 | `drm_mm_scan_init_with_range` | `include/drm/drm_mm.h` |
 | 8 | `drm_mm_scan_init_with_range` | `drivers/gpu/drm/drm_mm.c` |
 | 8 | `emit_pte` | `drivers/gpu/drm/xe/xe_migrate.c` |
-| 8 | `ethtool_cmis_wait_for_cond` | `net/ethtool/cmis.h` |
 | 8 | `ethtool_cmis_wait_for_cond` | `net/ethtool/cmis_cdb.c` |
 | 8 | `evdev_handle_get_val` | `drivers/input/evdev.c` |
-| 8 | `fb_pad_unaligned_buffer` | `include/linux/fb.h` |
 | 8 | `fb_pad_unaligned_buffer` | `drivers/video/fbdev/core/fbmem.c` |
 | 8 | `fib_validate_source` | `net/ipv4/fib_frontend.c` |
-| 8 | `fib_validate_source` | `include/net/ip_fib.h` |
 | 8 | `fsnotify_handle_inode_event` | `fs/notify/fsnotify.c` |
 | 8 | `fuse_rename_common` | `fs/fuse/dir.c` |
 | 8 | `fuse_xattr_set` | `fs/fuse/xattr.c` |
-| 8 | `futex_requeue` | `kernel/futex/futex.h` |
 | 8 | `futex_requeue` | `kernel/futex/requeue.c` |
 | 8 | `i915_gem_evict_something` | `drivers/gpu/drm/i915/i915_gem_evict.c` |
-| 8 | `i915_gem_evict_something` | `drivers/gpu/drm/i915/i915_gem_evict.h` |
+| 8 | `ib_create_send_mad` | `drivers/infiniband/core/mad.c` |
+| 8 | `ib_map_mr_sg_pi` | `drivers/infiniband/core/verbs.c` |
+| 8 | `ib_sa_join_multicast` | `drivers/infiniband/core/multicast.c` |
 | 8 | `ilk_compute_wm_level` | `drivers/gpu/drm/i915/display/i9xx_wm.c` |
 | 8 | `inet_netconf_fill_devconf` | `net/ipv4/devinet.c` |
 | 8 | `intel_adjust_aligned_offset` | `drivers/gpu/drm/i915/display/intel_fb.c` |
 | 8 | `intel_adjust_tile_offset` | `drivers/gpu/drm/i915/display/intel_fb.c` |
 | 8 | `intel_atomic_setup_scaler` | `drivers/gpu/drm/i915/display/skl_scaler.c` |
 | 8 | `intel_compute_aligned_offset` | `drivers/gpu/drm/i915/display/intel_fb.c` |
+| 8 | `intel_de_wait_for_register` | `drivers/gpu/drm/i915/display/intel_de.c` |
 | 8 | `intel_migrate_clear` | `drivers/gpu/drm/i915/gt/intel_migrate.c` |
-| 8 | `intel_migrate_clear` | `drivers/gpu/drm/i915/gt/intel_migrate.h` |
-| 8 | `invoke_bpf_prog` | `arch/powerpc/net/bpf_jit_comp.c` |
 | 8 | `invoke_bpf_prog` | `arch/x86/net/bpf_jit_comp.c` |
-| 8 | `irq_domain_set_info` | `include/linux/irqdomain.h` |
 | 8 | `irq_domain_set_info` | `kernel/irq/irqdomain.c` |
 | 8 | `kernfs_vfs_user_xattr_set` | `fs/kernfs/inode.c` |
 | 8 | `kernfs_vfs_xattr_set` | `fs/kernfs/inode.c` |
 | 8 | `key_alloc` | `security/keys/key.c` |
 | 8 | `keyring_alloc` | `security/keys/keyring.c` |
-| 8 | `krb5_aead_encrypt` | `crypto/krb5/internal.h` |
 | 8 | `krb5_aead_encrypt` | `crypto/krb5/rfc3961_simplified.c` |
-| 8 | `kvm_stats_read` | `include/linux/kvm_host.h` |
+| 8 | `ksmbd_vfs_copy_file_ranges` | `fs/smb/server/vfs.c` |
 | 8 | `kvm_stats_read` | `virt/kvm/binary_stats.c` |
+| 8 | `mknod_nfs` | `fs/smb/client/reparse.c` |
+| 8 | `mknod_wsl` | `fs/smb/client/reparse.c` |
 | 8 | `ovl_lookup_single` | `fs/overlayfs/namei.c` |
 | 8 | `ovl_other_xattr_set` | `fs/overlayfs/xattrs.c` |
 | 8 | `ovl_own_xattr_set` | `fs/overlayfs/xattrs.c` |
 | 8 | `p9_client_zc_rpc` | `net/9p/client.c` |
 | 8 | `parse_args` | `kernel/params.c` |
+| 8 | `parse_dfs_referrals` | `fs/smb/client/misc.c` |
 | 8 | `pci_add_dynid` | `drivers/pci/pci-driver.c` |
-| 8 | `pci_add_dynid` | `include/linux/pci.h` |
 | 8 | `pci_bus_alloc_resource` | `drivers/pci/bus.c` |
-| 8 | `pci_bus_alloc_resource` | `include/linux/pci.h` |
 | 8 | `perf_event_alloc` | `kernel/events/core.c` |
-| 8 | `perf_tp_event` | `include/linux/perf_event.h` |
 | 8 | `perf_tp_event` | `kernel/events/core.c` |
-| 8 | `perf_trace_run_bpf_submit` | `include/linux/trace_events.h` |
 | 8 | `perf_trace_run_bpf_submit` | `kernel/events/core.c` |
 | 8 | `pidfs_xattr_set` | `fs/pidfs.c` |
-| 8 | `print_hex_dump` | `include/linux/printk.h` |
+| 8 | `populate_new_aces` | `fs/smb/client/cifsacl.c` |
 | 8 | `print_hex_dump` | `lib/hexdump.c` |
-| 8 | `print_hex_dump` | `arch/um/include/shared/user.h` |
-| 8 | `proc_int_conv` | `include/linux/sysctl.h` |
 | 8 | `proc_int_conv` | `kernel/sysctl.c` |
 | 8 | `process_bit0` | `lib/decompress_unlzma.c` |
 | 8 | `qdisc_graft` | `net/sched/sch_api.c` |
 | 8 | `qi_batch_add_pasid_dev_iotlb` | `drivers/iommu/intel/cache.c` |
+| 8 | `rdma_rw_ctx_destroy_signature` | `drivers/infiniband/core/rw.c` |
 | 8 | `request_key_and_link` | `security/keys/request_key.c` |
-| 8 | `rfc3961_get_mic` | `crypto/krb5/internal.h` |
 | 8 | `rfc3961_get_mic` | `crypto/krb5/rfc3961_simplified.c` |
 | 8 | `rfc8009_encrypt` | `crypto/krb5/rfc8009_aes2.c` |
 | 8 | `rt_set_nexthop` | `net/ipv4/route.c` |
+| 8 | `rxe_rereg_user_mr` | `drivers/infiniband/sw/rxe/rxe_verbs.c` |
 | 8 | `scsi_execute_cmd` | `drivers/scsi/scsi_lib.c` |
-| 8 | `scsi_execute_cmd` | `include/scsi/scsi_device.h` |
 | 8 | `seq_buf_hex_dump` | `lib/seq_buf.c` |
-| 8 | `seq_hex_dump` | `include/linux/seq_file.h` |
 | 8 | `seq_hex_dump` | `fs/seq_file.c` |
-| 8 | `sg_alloc_append_table_from_pages` | `include/linux/scatterlist.h` |
 | 8 | `sg_alloc_append_table_from_pages` | `lib/scatterlist.c` |
 | 8 | `sg_new_write` | `drivers/scsi/sg.c` |
 | 8 | `shmem_get_folio_gfp` | `mm/shmem.c` |
 | 8 | `shmem_xattr_handler_set` | `mm/shmem.c` |
+| 8 | `smb2_create_reparse_inode` | `fs/smb/client/smb2inode.c` |
+| 8 | `smb2_mand_lock` | `fs/smb/client/smb2ops.c` |
+| 8 | `smb2_set_ea` | `fs/smb/client/smb2ops.c` |
 | 8 | `sockfs_security_xattr_set` | `net/socket.c` |
 | 8 | `sockfs_user_xattr_set` | `net/socket.c` |
 | 8 | `tc_fill_qdisc` | `net/sched/sch_api.c` |
 | 8 | `tc_fill_tclass` | `net/sched/sch_api.c` |
 | 8 | `tc_setup_cb_add` | `net/sched/cls_api.c` |
-| 8 | `tc_setup_cb_add` | `include/net/pkt_cls.h` |
 | 8 | `tc_setup_cb_destroy` | `net/sched/cls_api.c` |
-| 8 | `tc_setup_cb_destroy` | `include/net/pkt_cls.h` |
 | 8 | `tcf_action_init_1` | `net/sched/act_api.c` |
 | 8 | `tcf_exts_validate_ex` | `net/sched/cls_api.c` |
-| 8 | `tcf_exts_validate_ex` | `include/net/pkt_cls.h` |
 | 8 | `tcf_idr_create` | `net/sched/act_api.c` |
-| 8 | `tcf_idr_create` | `include/net/act_api.h` |
 | 8 | `tcp_inbound_hash` | `net/ipv4/tcp.c` |
-| 8 | `tcp_inbound_hash` | `include/net/tcp.h` |
 | 8 | `tcp_select_initial_window` | `net/ipv4/tcp_output.c` |
-| 8 | `tcp_select_initial_window` | `include/net/tcp.h` |
 | 8 | `tcp_shifted_skb` | `net/ipv4/tcp_input.c` |
 | 8 | `tcp_zerocopy_vm_insert_batch` | `net/ipv4/tcp.c` |
 | 8 | `thermal_zone_device_register_with_trips` | `drivers/thermal/thermal_core.c` |
-| 8 | `thermal_zone_device_register_with_trips` | `include/linux/thermal.h` |
+| 8 | `tnl_update_pmtu` | `net/ipv4/ip_tunnel.c` |
 | 8 | `trace_print_hex_dump_seq` | `kernel/trace/trace_output.c` |
 | 8 | `trace_seq_hex_dump` | `kernel/trace/trace_seq.c` |
+| 8 | `ttm_backup_backup_folio` | `drivers/gpu/drm/ttm/ttm_backup.c` |
 | 8 | `v9fs_xattr_handler_set` | `fs/9p/xattr.c` |
 | 8 | `viommu_map_pages` | `drivers/iommu/virtio-iommu.c` |
-| 8 | `virtio_gpu_cmd_resource_flush` | `drivers/gpu/drm/virtio/virtgpu_drv.h` |
 | 8 | `virtio_gpu_cmd_resource_flush` | `drivers/gpu/drm/virtio/virtgpu_vq.c` |
 | 8 | `virtio_gpu_cmd_set_scanout_blob` | `drivers/gpu/drm/virtio/virtgpu_vq.c` |
-| 8 | `virtio_gpu_cmd_set_scanout_blob` | `drivers/gpu/drm/virtio/virtgpu_drv.h` |
 | 8 | `virtio_gpu_cmd_transfer_to_host_2d` | `drivers/gpu/drm/virtio/virtgpu_vq.c` |
-| 8 | `virtio_gpu_cmd_transfer_to_host_2d` | `drivers/gpu/drm/virtio/virtgpu_drv.h` |
+| 8 | `virtio_transport_alloc_skb` | `net/vmw_vsock/virtio_transport_common.c` |
 | 8 | `vma_modify_flags_uffd` | `mm/vma.c` |
 | 8 | `vp_modern_map_capability` | `drivers/virtio/virtio_pci_modern_dev.c` |
+| 7 | `CIFSGetDFSRefer` | `fs/smb/client/cifssmb.c` |
+| 7 | `CIFSSMBQAllEAs` | `fs/smb/client/cifssmb.c` |
+| 7 | `CIFSSMBQPathInfo` | `fs/smb/client/cifssmb.c` |
+| 7 | `CIFSSMBSetEOF` | `fs/smb/client/cifssmb.c` |
 | 7 | `FSE_decompress_wksp_body_bmi2` | `lib/zstd/common/fse_decompress.c` |
 | 7 | `HUF_fillDTableX2ForWeight` | `lib/zstd/decompress/huf_decompress.c` |
 | 7 | `HUF_readStats` | `lib/zstd/common/entropy_common.c` |
-| 7 | `HUF_readStats` | `lib/zstd/common/huf.h` |
+| 7 | `SMB2_query_acl` | `fs/smb/client/smb2pdu.c` |
+| 7 | `SMB2_set_acl` | `fs/smb/client/smb2pdu.c` |
+| 7 | `SMBSetInformation` | `fs/smb/client/cifssmb.c` |
+| 7 | `SendReceive` | `fs/smb/client/smb1transport.c` |
+| 7 | `SendReceive2` | `fs/smb/client/smb1transport.c` |
 | 7 | `ZSTD_decompressSequences` | `lib/zstd/decompress/zstd_decompress_block.c` |
 | 7 | `ZSTD_decompressSequencesLong` | `lib/zstd/decompress/zstd_decompress_block.c` |
 | 7 | `ZSTD_decompressSequencesLong_bmi2` | `lib/zstd/decompress/zstd_decompress_block.c` |
 | 7 | `ZSTD_decompressSequencesSplitLitBuffer` | `lib/zstd/decompress/zstd_decompress_block.c` |
 | 7 | `ZSTD_decompressSequencesSplitLitBuffer_bmi2` | `lib/zstd/decompress/zstd_decompress_block.c` |
 | 7 | `ZSTD_decompressSequences_bmi2` | `lib/zstd/decompress/zstd_decompress_block.c` |
-| 7 | `ZSTD_decompressStream_simpleArgs` | `include/linux/zstd_lib.h` |
 | 7 | `ZSTD_decompressStream_simpleArgs` | `lib/zstd/decompress/zstd_decompress.c` |
-| 7 | `ZSTD_decompress_usingDict` | `include/linux/zstd_lib.h` |
 | 7 | `ZSTD_decompress_usingDict` | `lib/zstd/decompress/zstd_decompress.c` |
-| 7 | `__alloc_bucket_spinlocks` | `include/linux/spinlock.h` |
 | 7 | `__alloc_bucket_spinlocks` | `lib/bucket_locks.c` |
 | 7 | `__bad_area` | `arch/x86/mm/fault.c` |
 | 7 | `__blkdev_issue_write_zeroes` | `block/blk-lib.c` |
@@ -436,106 +426,74 @@ Only functions that appear as symbols in vmlinux are listed (i.e., NOT inlined).
 | 7 | `__btf_resolve_size` | `kernel/bpf/btf.c` |
 | 7 | `__call_nexthop_res_bucket_notifiers` | `net/ipv4/nexthop.c` |
 | 7 | `__cgroup_bpf_run_filter_getsockopt` | `kernel/bpf/cgroup.c` |
-| 7 | `__cgroup_bpf_run_filter_getsockopt` | `include/linux/bpf-cgroup.h` |
 | 7 | `__cgroup_bpf_run_filter_sysctl` | `kernel/bpf/cgroup.c` |
-| 7 | `__cgroup_bpf_run_filter_sysctl` | `include/linux/bpf-cgroup.h` |
+| 7 | `__check_buffer_access` | `kernel/bpf/verifier.c` |
 | 7 | `__check_mem_access` | `kernel/bpf/verifier.c` |
 | 7 | `__debugfs_create_file` | `fs/debugfs/inode.c` |
-| 7 | `__devm_irq_alloc_descs` | `include/linux/irq.h` |
 | 7 | `__devm_irq_alloc_descs` | `kernel/irq/devres.c` |
 | 7 | `__domain_setup_first_level` | `drivers/iommu/intel/iommu.c` |
-| 7 | `__domain_setup_first_level` | `drivers/iommu/intel/iommu.h` |
 | 7 | `__drm_crtc_init_with_planes` | `drivers/gpu/drm/drm_crtc.c` |
 | 7 | `__drmm_crtc_alloc_with_planes` | `drivers/gpu/drm/drm_crtc.c` |
 | 7 | `__drmm_crtc_init_with_planes` | `drivers/gpu/drm/drm_crtc.c` |
 | 7 | `__filename_parentat` | `fs/namei.c` |
 | 7 | `__gen8_ppgtt_foreach` | `drivers/gpu/drm/i915/gt/gen8_ppgtt.c` |
-| 7 | `__generic_remap_file_range_prep` | `include/linux/fs.h` |
 | 7 | `__generic_remap_file_range_prep` | `fs/remap_range.c` |
 | 7 | `__gpu_buddy_alloc_blocks` | `drivers/gpu/buddy.c` |
+| 7 | `__handle_changed_spte` | `arch/x86/kvm/mmu/tdp_mmu.c` |
 | 7 | `__i2c_smbus_xfer` | `drivers/i2c/i2c-core-smbus.c` |
-| 7 | `__i2c_smbus_xfer` | `include/linux/i2c.h` |
-| 7 | `__import_iovec` | `include/linux/uio.h` |
 | 7 | `__import_iovec` | `lib/iov_iter.c` |
 | 7 | `__inet_lookup_established` | `net/ipv4/inet_hashtables.c` |
 | 7 | `__intel_wait_for_register` | `drivers/gpu/drm/i915/intel_uncore.c` |
-| 7 | `__intel_wait_for_register` | `drivers/gpu/drm/i915/intel_uncore.h` |
-| 7 | `__intel_wait_for_register_fw` | `drivers/gpu/drm/i915/intel_uncore.h` |
 | 7 | `__intel_wait_for_register_fw` | `drivers/gpu/drm/i915/intel_uncore.c` |
 | 7 | `__iomap_dio_rw` | `fs/iomap/direct-io.c` |
-| 7 | `__iommu_dma_iova_unlink` | `drivers/iommu/dma-iommu.c` |
-| 7 | `__irq_domain_alloc_irqs` | `include/linux/irqdomain.h` |
 | 7 | `__irq_domain_alloc_irqs` | `kernel/irq/irqdomain.c` |
 | 7 | `__kernfs_new_node` | `fs/kernfs/dir.c` |
 | 7 | `__list_lru_walk_one` | `mm/list_lru.c` |
 | 7 | `__netdev_upper_dev_link` | `net/core/dev.c` |
-| 7 | `__nla_parse` | `include/net/netlink.h` |
 | 7 | `__nla_parse` | `lib/nlattr.c` |
-| 7 | `__platform_create_bundle` | `drivers/base/platform.c` |
 | 7 | `__process_kf_arg_ptr_to_graph_node` | `kernel/bpf/verifier.c` |
 | 7 | `__refill_objects_node` | `mm/slub.c` |
 | 7 | `__ring_buffer_alloc_range` | `kernel/trace/ring_buffer.c` |
-| 7 | `__sg_alloc_table` | `include/linux/scatterlist.h` |
 | 7 | `__sg_alloc_table` | `lib/scatterlist.c` |
 | 7 | `__skb_datagram_iter` | `net/core/datagram.c` |
+| 7 | `__smbdirect_log_vaprintf` | `fs/smb/smbdirect/socket.h` |
+| 7 | `__smbdirect_socket_schedule_cleanup` | `fs/smb/smbdirect/socket.c` |
 | 7 | `__snb_pcode_rw` | `drivers/gpu/drm/i915/intel_pcode.c` |
 | 7 | `__sort_r` | `lib/sort.c` |
-| 7 | `__vfs_setxattr` | `include/linux/xattr.h` |
+| 7 | `__start` | `arch/powerpc/kernel/prom_init.c` |
 | 7 | `__vfs_setxattr` | `fs/xattr.c` |
-| 7 | `__vfs_setxattr_locked` | `include/linux/xattr.h` |
 | 7 | `__vfs_setxattr_locked` | `fs/xattr.c` |
 | 7 | `__vsock_net_mode_string` | `net/vmw_vsock/af_vsock.c` |
 | 7 | `_ipmr_fill_mroute` | `net/ipv4/ipmr.c` |
 | 7 | `_request_firmware` | `drivers/base/firmware_loader/main.c` |
 | 7 | `_snd_pcm_new` | `sound/core/pcm.c` |
 | 7 | `acpi_dev_get_irqresource` | `drivers/acpi/resource.c` |
-| 7 | `acpi_ds_init_aml_walk` | `drivers/acpi/acpica/acdispat.h` |
 | 7 | `acpi_ds_init_aml_walk` | `drivers/acpi/acpica/dswstate.c` |
 | 7 | `acpi_ev_create_gpe_block` | `drivers/acpi/acpica/evgpeblk.c` |
-| 7 | `acpi_ev_create_gpe_block` | `drivers/acpi/acpica/acevents.h` |
 | 7 | `acpi_ns_check_package_elements` | `drivers/acpi/acpica/nsprepkg.c` |
 | 7 | `acpi_ns_check_sorted_list` | `drivers/acpi/acpica/nsrepair2.c` |
 | 7 | `acpi_ns_lookup` | `drivers/acpi/acpica/nsaccess.c` |
-| 7 | `acpi_ns_lookup` | `drivers/acpi/acpica/acnamesp.h` |
 | 7 | `acpi_ns_search_and_enter` | `drivers/acpi/acpica/nssearch.c` |
-| 7 | `acpi_ns_search_and_enter` | `drivers/acpi/acpica/acnamesp.h` |
-| 7 | `acpi_parse_entries_array` | `include/linux/fw_table.h` |
 | 7 | `acpi_parse_entries_array` | `lib/fw_table.c` |
 | 7 | `acpi_walk_namespace` | `drivers/acpi/acpica/nsxfeval.c` |
-| 7 | `alloc_lookup_fw_priv` | `drivers/base/firmware_loader/firmware.h` |
 | 7 | `alloc_lookup_fw_priv` | `drivers/base/firmware_loader/main.c` |
-| 7 | `arch_prepare_bpf_trampoline` | `arch/arm64/net/bpf_jit_comp.c` |
-| 7 | `arch_prepare_bpf_trampoline` | `arch/powerpc/net/bpf_jit_comp.c` |
-| 7 | `arch_prepare_bpf_trampoline` | `arch/loongarch/net/bpf_jit.c` |
-| 7 | `arch_prepare_bpf_trampoline` | `arch/s390/net/bpf_jit_comp.c` |
 | 7 | `arch_prepare_bpf_trampoline` | `arch/riscv/net/bpf_jit_comp64.c` |
-| 7 | `arch_prepare_bpf_trampoline` | `kernel/bpf/trampoline.c` |
-| 7 | `arch_prepare_bpf_trampoline` | `include/linux/bpf.h` |
-| 7 | `arch_prepare_bpf_trampoline` | `arch/x86/net/bpf_jit_comp.c` |
-| 7 | `ata_exec_internal` | `drivers/ata/libata.h` |
 | 7 | `ata_exec_internal` | `drivers/ata/libata-core.c` |
 | 7 | `binder_validate_fixup` | `drivers/android/binder.c` |
 | 7 | `binder_validate_ptr` | `drivers/android/binder.c` |
-| 7 | `bpf_event_output` | `kernel/trace/bpf_trace.c` |
 | 7 | `bpf_event_output` | `kernel/bpf/core.c` |
-| 7 | `bpf_event_output` | `include/linux/bpf.h` |
 | 7 | `bpf_get_kprobe_info` | `kernel/trace/trace_kprobe.c` |
-| 7 | `bpf_get_kprobe_info` | `include/linux/trace_events.h` |
 | 7 | `bpf_get_perf_event_info` | `kernel/trace/bpf_trace.c` |
-| 7 | `bpf_get_perf_event_info` | `include/linux/trace_events.h` |
+| 7 | `bpf_jit_binary_pack_alloc` | `kernel/bpf/core.c` |
 | 7 | `bpf_modify_return_test2` | `net/bpf/test_run.c` |
 | 7 | `bpf_mprog_detach` | `kernel/bpf/mprog.c` |
-| 7 | `bpf_mprog_detach` | `include/linux/bpf_mprog.h` |
 | 7 | `bpf_perf_link_fill_common` | `kernel/bpf/syscall.c` |
 | 7 | `bpf_skops_hdr_opt_len` | `net/ipv4/tcp_output.c` |
 | 7 | `bpf_struct_ops_prepare_trampoline` | `kernel/bpf/bpf_struct_ops.c` |
-| 7 | `bpf_struct_ops_prepare_trampoline` | `include/linux/bpf.h` |
 | 7 | `bpf_task_fd_query_copy` | `kernel/bpf/syscall.c` |
 | 7 | `bpf_trace_run6` | `include/linux/trace_events.h` |
-| 7 | `btf_struct_ids_match` | `kernel/bpf/btf.c` |
-| 7 | `btf_struct_ids_match` | `include/linux/bpf.h` |
+| 7 | `build_qfs_info_req` | `fs/smb/client/smb2pdu.c` |
 | 7 | `bunzip2` | `lib/decompress_bunzip2.c` |
-| 7 | `bunzip2` | `include/linux/decompress/bunzip2.h` |
 | 7 | `call_usermodehelper_setup` | `kernel/umh.c` |
 | 7 | `cap_show` | `drivers/thunderbolt/debugfs.c` |
 | 7 | `change_page_attr_set_clr` | `arch/x86/mm/pat/set_memory.c` |
@@ -544,284 +502,243 @@ Only functions that appear as symbols in vmlinux are listed (i.e., NOT inlined).
 | 7 | `check_map_access` | `kernel/bpf/verifier.c` |
 | 7 | `check_mem_region_access` | `kernel/bpf/verifier.c` |
 | 7 | `check_sock_access` | `kernel/bpf/verifier.c` |
-| 7 | `cn_netlink_send_mult` | `include/linux/connector.h` |
+| 7 | `cifs_do_get_acl` | `fs/smb/client/cifssmb.c` |
+| 7 | `cifs_do_set_acl` | `fs/smb/client/cifssmb.c` |
+| 7 | `cifs_file_copychunk_range` | `fs/smb/client/cifsfs.c` |
+| 7 | `cifs_find_lock_conflict` | `fs/smb/client/file.c` |
+| 7 | `cifs_get_fattr` | `fs/smb/client/inode.c` |
+| 7 | `cifs_lockv` | `fs/smb/client/cifssmb.c` |
+| 7 | `cifs_make_node` | `fs/smb/client/smb1ops.c` |
+| 7 | `cifs_query_dir_first` | `fs/smb/client/smb1ops.c` |
+| 7 | `cifs_query_reparse_point` | `fs/smb/client/cifssmb.c` |
+| 7 | `cifs_send_recv` | `fs/smb/client/transport.c` |
+| 7 | `cifs_sfu_make_node` | `fs/smb/client/smb2ops.c` |
 | 7 | `cn_netlink_send_mult` | `drivers/connector/connector.c` |
 | 7 | `compute_max_compressed_bpp_x16` | `drivers/gpu/drm/i915/display/intel_dp.c` |
-| 7 | `crypto_krb5_verify_mic` | `include/crypto/krb5.h` |
+| 7 | `copy_sec_desc` | `fs/smb/client/cifsacl.c` |
+| 7 | `create_qp` | `drivers/infiniband/hw/cxgb4/qp.c` |
 | 7 | `crypto_krb5_verify_mic` | `crypto/krb5/krb5_api.c` |
-| 7 | `dax_dedupe_file_range_compare` | `include/linux/dax.h` |
 | 7 | `dax_dedupe_file_range_compare` | `fs/dax.c` |
-| 7 | `dax_remap_file_range_prep` | `include/linux/dax.h` |
 | 7 | `dax_remap_file_range_prep` | `fs/dax.c` |
 | 7 | `dbgp_control_msg` | `drivers/usb/early/ehci-dbgp.c` |
-| 7 | `devm_request_threaded_irq` | `include/linux/interrupt.h` |
 | 7 | `devm_request_threaded_irq` | `kernel/irq/devres.c` |
+| 7 | `dfs_cache_find` | `fs/smb/client/dfs_cache.c` |
 | 7 | `display_pipe_crc_irq_handler` | `drivers/gpu/drm/i915/display/intel_display_irq.c` |
 | 7 | `dm_kcopyd_copy` | `drivers/md/dm-kcopyd.c` |
-| 7 | `dm_kcopyd_copy` | `include/linux/dm-kcopyd.h` |
 | 7 | `dm_stats_account_io` | `drivers/md/dm-stats.c` |
-| 7 | `dm_stats_account_io` | `drivers/md/dm-stats.h` |
 | 7 | `dma_iova_link` | `drivers/iommu/dma-iommu.c` |
-| 7 | `dma_iova_link` | `include/linux/dma-mapping.h` |
 | 7 | `do_error_trap` | `arch/x86/kernel/traps.c` |
-| 7 | `do_futex` | `include/linux/futex.h` |
 | 7 | `do_futex` | `kernel/futex/syscalls.c` |
+| 7 | `do_proc_vec` | `kernel/sysctl.c` |
 | 7 | `do_setlink` | `net/core/rtnetlink.c` |
 | 7 | `do_trap` | `arch/x86/kernel/traps.c` |
-| 7 | `do_vmi_align_munmap` | `include/linux/mm.h` |
-| 7 | `do_vmi_align_munmap` | `mm/vma.h` |
 | 7 | `do_vmi_align_munmap` | `mm/vma.c` |
 | 7 | `drm_cvt_mode` | `drivers/gpu/drm/drm_modes.c` |
-| 7 | `drm_fb_swab` | `include/drm/drm_format_helper.h` |
 | 7 | `drm_fb_swab` | `drivers/gpu/drm/drm_format_helper.c` |
-| 7 | `drm_plane_colorop_3dlut_init` | `include/drm/drm_colorop.h` |
 | 7 | `drm_plane_colorop_3dlut_init` | `drivers/gpu/drm/drm_colorop.c` |
-| 7 | `drm_plane_colorop_curve_1d_lut_init` | `include/drm/drm_colorop.h` |
 | 7 | `drm_plane_colorop_curve_1d_lut_init` | `drivers/gpu/drm/drm_colorop.c` |
-| 7 | `drm_property_replace_blob_from_id` | `include/drm/drm_property.h` |
 | 7 | `drm_property_replace_blob_from_id` | `drivers/gpu/drm/drm_property.c` |
-| 7 | `drm_simple_display_pipe_init` | `include/drm/drm_simple_kms_helper.h` |
 | 7 | `drm_simple_display_pipe_init` | `drivers/gpu/drm/drm_simple_kms_helper.c` |
 | 7 | `drm_syncobj_array_wait_timeout` | `drivers/gpu/drm/drm_syncobj.c` |
-| 7 | `drm_writeback_connector_init` | `include/drm/drm_writeback.h` |
 | 7 | `drm_writeback_connector_init` | `drivers/gpu/drm/drm_writeback.c` |
 | 7 | `elf_load` | `arch/parisc/kernel/kexec_file.c` |
 | 7 | `emit_copy_ccs` | `drivers/gpu/drm/xe/xe_migrate.c` |
 | 7 | `ethnl_module_fw_flash_ntf` | `net/ethtool/module.c` |
 | 7 | `ethnl_parse_bit` | `net/ethtool/bitset.c` |
 | 7 | `ethnl_put_bitset` | `net/ethtool/bitset.c` |
-| 7 | `ethnl_put_bitset` | `net/ethtool/bitset.h` |
 | 7 | `ethnl_put_bitset32` | `net/ethtool/bitset.c` |
-| 7 | `ethnl_put_bitset32` | `net/ethtool/bitset.h` |
 | 7 | `exportfs_decode_fh_raw` | `fs/exportfs/expfs.c` |
-| 7 | `fb_find_mode` | `include/linux/fb.h` |
 | 7 | `fb_find_mode` | `drivers/video/fbdev/core/modedb.c` |
 | 7 | `fib_dump_info_fnhe` | `net/ipv4/route.c` |
-| 7 | `fib_dump_info_fnhe` | `include/net/route.h` |
 | 7 | `fib_nh_common_init` | `net/ipv4/fib_semantics.c` |
-| 7 | `fib_nh_common_init` | `include/net/ip_fib.h` |
 | 7 | `fib_nl2rule` | `net/core/fib_rules.c` |
 | 7 | `fib_nl_fill_rule` | `net/core/fib_rules.c` |
 | 7 | `fill_audio_out_name` | `sound/hda/common/auto_parser.c` |
-| 7 | `fserror_report` | `include/linux/fserror.h` |
+| 7 | `find_entry` | `drivers/net/ethernet/mellanox/mlx4/mcg.c` |
+| 7 | `fsctl_copychunk` | `fs/smb/server/smb2pdu.c` |
 | 7 | `fserror_report` | `fs/fserror.c` |
-| 7 | `fsnotify` | `include/linux/fsnotify_backend.h` |
 | 7 | `fsnotify` | `fs/notify/fsnotify.c` |
+| 7 | `ftrace_trace_probe_callback` | `kernel/trace/trace_functions.c` |
 | 7 | `fuse_create_open` | `fs/fuse/dir.c` |
 | 7 | `fuse_iget` | `fs/fuse/inode.c` |
-| 7 | `futex_lock_pi_atomic` | `kernel/futex/futex.h` |
+| 7 | `fuse_lk_fill` | `fs/fuse/file.c` |
 | 7 | `futex_lock_pi_atomic` | `kernel/futex/pi.c` |
-| 7 | `gen_pool_best_fit` | `include/linux/genalloc.h` |
 | 7 | `gen_pool_best_fit` | `lib/genalloc.c` |
-| 7 | `gen_pool_first_fit` | `include/linux/genalloc.h` |
 | 7 | `gen_pool_first_fit` | `lib/genalloc.c` |
-| 7 | `gen_pool_first_fit_align` | `include/linux/genalloc.h` |
 | 7 | `gen_pool_first_fit_align` | `lib/genalloc.c` |
-| 7 | `gen_pool_first_fit_order_align` | `include/linux/genalloc.h` |
 | 7 | `gen_pool_first_fit_order_align` | `lib/genalloc.c` |
-| 7 | `gen_pool_fixed_alloc` | `include/linux/genalloc.h` |
 | 7 | `gen_pool_fixed_alloc` | `lib/genalloc.c` |
-| 7 | `generic_write_end` | `include/linux/buffer_head.h` |
 | 7 | `generic_write_end` | `fs/buffer.c` |
 | 7 | `genl_family_rcv_msg_doit` | `net/netlink/genetlink.c` |
 | 7 | `genl_family_rcv_msg_dumpit` | `net/netlink/genetlink.c` |
 | 7 | `get_perf_callchain` | `kernel/events/callchain.c` |
 | 7 | `gnet_stats_start_copy_compat` | `net/core/gen_stats.c` |
-| 7 | `gnet_stats_start_copy_compat` | `include/net/gen_stats.h` |
 | 7 | `gpu_buddy_alloc_blocks` | `drivers/gpu/buddy.c` |
-| 7 | `gpu_buddy_alloc_blocks` | `include/linux/gpu_buddy.h` |
 | 7 | `gunzip` | `lib/decompress_inflate.c` |
-| 7 | `gunzip` | `include/linux/decompress/inflate.h` |
-| 7 | `gup_fast_pmd_leaf` | `mm/gup.c` |
 | 7 | `gup_fast_pud_leaf` | `mm/gup.c` |
-| 7 | `hda_component_manager_init` | `sound/hda/codecs/side-codecs/hda_component.h` |
+| 7 | `handle_read_data` | `fs/smb/client/smb2ops.c` |
 | 7 | `hda_component_manager_init` | `sound/hda/codecs/side-codecs/hda_component.c` |
-| 7 | `hex_dump_to_buffer` | `include/linux/printk.h` |
 | 7 | `hex_dump_to_buffer` | `lib/hexdump.c` |
 | 7 | `hugetlb_resv_map_add` | `mm/hugetlb.c` |
 | 7 | `hugetlbfs_write_end` | `fs/hugetlbfs/inode.c` |
 | 7 | `i2c_smbus_xfer` | `drivers/i2c/i2c-core-smbus.c` |
-| 7 | `i2c_smbus_xfer` | `include/linux/i2c.h` |
 | 7 | `i801_access` | `drivers/i2c/busses/i2c-i801.c` |
 | 7 | `i915_gem_gtt_reserve` | `drivers/gpu/drm/i915/i915_gem_gtt.c` |
-| 7 | `i915_gem_gtt_reserve` | `drivers/gpu/drm/i915/i915_gem_gtt.h` |
 | 7 | `i915_get_crtc_scanoutpos` | `drivers/gpu/drm/i915/display/intel_vblank.c` |
-| 7 | `i915_ttm_buddy_man_init` | `drivers/gpu/drm/i915/i915_ttm_buddy_manager.h` |
 | 7 | `i915_ttm_buddy_man_init` | `drivers/gpu/drm/i915/i915_ttm_buddy_manager.c` |
+| 7 | `ib_umem_dmabuf_get_pinned_and_lock` | `drivers/infiniband/core/umem_dmabuf.c` |
+| 7 | `ib_umem_dmabuf_get_with_dma_device` | `drivers/infiniband/core/umem_dmabuf.c` |
+| 7 | `ibnl_put_msg` | `drivers/infiniband/core/netlink.c` |
 | 7 | `intel_context_migrate_clear` | `drivers/gpu/drm/i915/gt/intel_migrate.c` |
-| 7 | `intel_context_migrate_clear` | `drivers/gpu/drm/i915/gt/intel_migrate.h` |
 | 7 | `intel_dp_mtp_tu_compute_config` | `drivers/gpu/drm/i915/display/intel_dp_mst.c` |
-| 7 | `intel_dp_mtp_tu_compute_config` | `drivers/gpu/drm/i915/display/intel_dp_mst.h` |
+| 7 | `intel_parent_fb_pin_dpt_pin` | `drivers/gpu/drm/i915/display/intel_parent.c` |
+| 7 | `intel_parent_fb_pin_reuse_vma` | `drivers/gpu/drm/i915/display/intel_parent.c` |
 | 7 | `intel_pxp_tee_stream_message` | `drivers/gpu/drm/i915/pxp/intel_pxp_tee.c` |
-| 7 | `intel_pxp_tee_stream_message` | `drivers/gpu/drm/i915/pxp/intel_pxp_tee.h` |
 | 7 | `interleaved_copy` | `sound/core/pcm_lib.c` |
-| 7 | `iomap_dio_rw` | `include/linux/iomap.h` |
 | 7 | `iomap_dio_rw` | `fs/iomap/direct-io.c` |
-| 7 | `iomap_zero_range` | `include/linux/iomap.h` |
 | 7 | `iomap_zero_range` | `fs/iomap/buffered-io.c` |
 | 7 | `iommu_dma_iova_bounce_and_link` | `drivers/iommu/dma-iommu.c` |
 | 7 | `ip_mc_validate_source` | `net/ipv4/route.c` |
-| 7 | `ip_mc_validate_source` | `include/net/route.h` |
 | 7 | `ip_mkroute_input` | `net/ipv4/route.c` |
 | 7 | `ip_route_newports` | `include/net/route.h` |
 | 7 | `ipmr_fill_mroute` | `net/ipv4/ipmr.c` |
 | 7 | `irq_domain_alloc_irqs_locked` | `kernel/irq/irqdomain.c` |
-| 7 | `kernfs_create_dir_ns` | `include/linux/kernfs.h` |
 | 7 | `kernfs_create_dir_ns` | `fs/kernfs/dir.c` |
-| 7 | `key_create` | `include/linux/key.h` |
 | 7 | `key_create` | `security/keys/key.c` |
-| 7 | `key_create_or_update` | `include/linux/key.h` |
 | 7 | `key_create_or_update` | `security/keys/key.c` |
-| 7 | `kobj_map` | `include/linux/kobj_map.h` |
 | 7 | `kobj_map` | `drivers/base/map.c` |
+| 7 | `ksmbd_auth_ntlmv2` | `fs/smb/server/auth.c` |
+| 7 | `ksmbd_vfs_setxattr` | `fs/smb/server/vfs.c` |
+| 7 | `ksmbd_vfs_write` | `fs/smb/server/vfs.c` |
+| 7 | `lock_acquire` | `kernel/locking/lockdep.c` |
+| 7 | `lockdep_init_map_type` | `kernel/locking/lockdep.c` |
 | 7 | `mark_btf_ld_reg` | `kernel/bpf/verifier.c` |
-| 7 | `mas_alloc_cyclic` | `include/linux/maple_tree.h` |
 | 7 | `mas_alloc_cyclic` | `lib/maple_tree.c` |
-| 7 | `mempool_init_node` | `include/linux/mempool.h` |
 | 7 | `mempool_init_node` | `mm/mempool.c` |
-| 7 | `migrate_pages` | `include/linux/migrate.h` |
 | 7 | `migrate_pages` | `mm/migrate.c` |
+| 7 | `mknod_reparse` | `fs/smb/client/reparse.c` |
 | 7 | `mmu_set_spte` | `arch/x86/kvm/mmu/mmu.c` |
-| 7 | `mprotect_fixup` | `include/linux/mm.h` |
 | 7 | `mprotect_fixup` | `mm/mprotect.c` |
-| 7 | `mtree_alloc_cyclic` | `include/linux/maple_tree.h` |
 | 7 | `mtree_alloc_cyclic` | `lib/maple_tree.c` |
-| 7 | `mtree_alloc_range` | `include/linux/maple_tree.h` |
 | 7 | `mtree_alloc_range` | `lib/maple_tree.c` |
-| 7 | `mtree_alloc_rrange` | `include/linux/maple_tree.h` |
 | 7 | `mtree_alloc_rrange` | `lib/maple_tree.c` |
+| 7 | `net_devmem_bind_dmabuf` | `net/core/devmem.c` |
 | 7 | `net_dim_init_irq_moder` | `lib/dim/net_dim.c` |
-| 7 | `net_dim_init_irq_moder` | `include/linux/dim.h` |
 | 7 | `netdev_stat_queue_sum` | `net/core/netdev-genl.c` |
-| 7 | `netdev_stat_queue_sum` | `include/net/netdev_queues.h` |
-| 7 | `netfs_write_begin` | `include/linux/netfs.h` |
 | 7 | `netfs_write_begin` | `fs/netfs/buffered_read.c` |
 | 7 | `netlink_broadcast_filtered` | `net/netlink/af_netlink.c` |
-| 7 | `netlink_broadcast_filtered` | `include/linux/netlink.h` |
 | 7 | `nh_fill_node` | `net/ipv4/nexthop.c` |
+| 7 | `nla_validate_array` | `lib/nlattr.c` |
 | 7 | `noninterleaved_copy` | `sound/core/pcm_lib.c` |
-| 7 | `objpool_init` | `include/linux/objpool.h` |
 | 7 | `objpool_init` | `lib/objpool.c` |
 | 7 | `ovl_cache_entry_new` | `fs/overlayfs/readdir.c` |
 | 7 | `ovl_copyfile` | `fs/overlayfs/file.c` |
 | 7 | `p9_virtio_zc_request` | `net/9p/trans_virtio.c` |
 | 7 | `pack_sg_list_p` | `net/9p/trans_virtio.c` |
 | 7 | `page_to_skb` | `drivers/net/virtio_net.c` |
-| 7 | `parse_crashkernel` | `include/linux/crash_reserve.h` |
 | 7 | `parse_crashkernel` | `kernel/crash_reserve.c` |
 | 7 | `path_setxattrat` | `fs/xattr.c` |
+| 7 | `pci_resource_io` | `drivers/pci/pci-sysfs.c` |
 | 7 | `pneigh_create` | `net/core/neighbour.c` |
-| 7 | `pneigh_create` | `include/net/neighbour.h` |
 | 7 | `pneigh_fill_info` | `net/core/neighbour.c` |
-| 7 | `pnp_register_mem_resource` | `drivers/pnp/base.h` |
 | 7 | `pnp_register_mem_resource` | `drivers/pnp/resource.c` |
-| 7 | `pnp_register_port_resource` | `drivers/pnp/base.h` |
 | 7 | `pnp_register_port_resource` | `drivers/pnp/resource.c` |
+| 7 | `prepare_alloc_pages` | `mm/page_alloc.c` |
 | 7 | `proc_create_net_data_write` | `fs/proc/proc_net.c` |
-| 7 | `proc_doulongvec_minmax_conv` | `include/linux/sysctl.h` |
-| 7 | `proc_doulongvec_minmax_conv` | `kernel/sysctl.c` |
-| 7 | `proc_fill_cache` | `fs/proc/internal.h` |
 | 7 | `proc_fill_cache` | `fs/proc/base.c` |
 | 7 | `proc_get_long` | `kernel/sysctl.c` |
-| 7 | `proc_uint_conv` | `include/linux/sysctl.h` |
 | 7 | `proc_uint_conv` | `kernel/sysctl.c` |
+| 7 | `proc_ulong_conv` | `kernel/sysctl.c` |
+| 7 | `process_dynptr_func` | `kernel/bpf/verifier.c` |
 | 7 | `process_vm_rw` | `mm/process_vm_access.c` |
 | 7 | `qdisc_create` | `net/sched/sch_api.c` |
 | 7 | `qdisc_notify` | `net/sched/sch_api.c` |
 | 7 | `qdisc_offload_graft_helper` | `net/sched/sch_api.c` |
-| 7 | `qdisc_offload_graft_helper` | `include/net/sch_generic.h` |
+| 7 | `qi_batch_add_dev_iotlb` | `drivers/iommu/intel/cache.c` |
 | 7 | `qi_flush_dev_iotlb_pasid` | `drivers/iommu/intel/dmar.c` |
-| 7 | `qi_flush_dev_iotlb_pasid` | `drivers/iommu/intel/iommu.h` |
 | 7 | `radix_tree_node_alloc` | `lib/radix-tree.c` |
 | 7 | `raw_send_hdrinc` | `net/ipv4/raw.c` |
 | 7 | `raw_v4_match` | `net/ipv4/raw.c` |
-| 7 | `raw_v4_match` | `include/net/raw.h` |
+| 7 | `rdma_init_netdev` | `drivers/infiniband/core/verbs.c` |
+| 7 | `rdma_resolve_ip` | `drivers/infiniband/core/addr.c` |
 | 7 | `receive_buf` | `drivers/net/virtio_net.c` |
-| 7 | `regmap_fields_update_bits_base` | `include/linux/regmap.h` |
 | 7 | `regmap_fields_update_bits_base` | `drivers/base/regmap/regmap.c` |
-| 7 | `regmap_update_bits_base` | `include/linux/regmap.h` |
 | 7 | `regmap_update_bits_base` | `drivers/base/regmap/regmap.c` |
-| 7 | `request_firmware_nowait` | `include/linux/firmware.h` |
+| 7 | `replace_sids_and_copy_aces` | `fs/smb/client/cifsacl.c` |
 | 7 | `request_firmware_nowait` | `drivers/base/firmware_loader/main.c` |
 | 7 | `rfc3961_verify_mic` | `crypto/krb5/rfc3961_simplified.c` |
-| 7 | `rfc3961_verify_mic` | `crypto/krb5/internal.h` |
 | 7 | `rfc8009_calc_KDF_HMAC_SHA2` | `crypto/krb5/rfc8009_aes2.c` |
-| 7 | `rtmsg_fib` | `net/ipv4/fib_lookup.h` |
 | 7 | `rtmsg_fib` | `net/ipv4/fib_semantics.c` |
+| 7 | `rxe_qp_from_init` | `drivers/infiniband/sw/rxe/rxe_qp.c` |
+| 7 | `rxe_queue_resize` | `drivers/infiniband/sw/rxe/rxe_queue.c` |
+| 7 | `rxe_reg_user_mr` | `drivers/infiniband/sw/rxe/rxe_verbs.c` |
 | 7 | `sanitize_ptr_alu` | `kernel/bpf/verifier.c` |
-| 7 | `sbitmap_init_node` | `include/linux/sbitmap.h` |
 | 7 | `sbitmap_init_node` | `lib/sbitmap.c` |
 | 7 | `seq_print_delegate_opts` | `kernel/bpf/inode.c` |
+| 7 | `serial_base_device_init` | `drivers/tty/serial/serial_base_bus.c` |
+| 7 | `set_chmod_dacl` | `fs/smb/client/cifsacl.c` |
+| 7 | `set_info_sec` | `fs/smb/server/smbacl.c` |
+| 7 | `set_ntacl_dacl` | `fs/smb/server/smbacl.c` |
+| 7 | `set_posix_acl_entries_dacl` | `fs/smb/server/smbacl.c` |
 | 7 | `setup_vq` | `drivers/virtio/virtio_pci_legacy.c` |
-| 7 | `setup_vq` | `drivers/virtio/virtio_pci_modern.c` |
-| 7 | `sg_alloc_table_from_pages_segment` | `include/linux/scatterlist.h` |
 | 7 | `sg_alloc_table_from_pages_segment` | `lib/scatterlist.c` |
 | 7 | `sg_init_fuse_args` | `fs/fuse/virtio_fs.c` |
 | 7 | `shmem_swapin_folio` | `mm/shmem.c` |
 | 7 | `shmem_write_end` | `mm/shmem.c` |
+| 7 | `should_compact_retry` | `mm/page_alloc.c` |
 | 7 | `show_vma_header_prefix` | `fs/proc/task_mmu.c` |
 | 7 | `simple_write_end` | `fs/libfs.c` |
+| 7 | `simple_xattr_set_limited` | `fs/xattr.c` |
+| 7 | `siw_reg_user_mr` | `drivers/infiniband/sw/siw/siw_verbs.c` |
 | 7 | `sk_psock_skb_ingress_enqueue` | `net/core/skmsg.c` |
 | 7 | `skb_flow_dissect_ct` | `net/core/flow_dissector.c` |
-| 7 | `skb_flow_dissect_ct` | `include/linux/skbuff.h` |
 | 7 | `skl_compute_plane_wm` | `drivers/gpu/drm/i915/display/skl_watermark.c` |
 | 7 | `skl_ddb_get_hw_plane_state` | `drivers/gpu/drm/i915/display/skl_watermark.c` |
-| 7 | `snd_hda_codec_amp_init` | `sound/hda/common/hda_local.h` |
+| 7 | `smb2_get_dfs_refer` | `fs/smb/client/smb2ops.c` |
+| 7 | `smb2_lockv` | `fs/smb/client/smb2pdu.c` |
+| 7 | `smb2_make_node` | `fs/smb/client/smb2ops.c` |
+| 7 | `smb2_parse_contexts` | `fs/smb/client/smb2pdu.c` |
+| 7 | `smb2_query_dir_first` | `fs/smb/client/smb2ops.c` |
+| 7 | `smb2_query_eas` | `fs/smb/client/smb2ops.c` |
+| 7 | `smb2_query_reparse_point` | `fs/smb/client/smb2inode.c` |
+| 7 | `smb2_set_path_size` | `fs/smb/client/smb2inode.c` |
+| 7 | `smb_append_inherited_ace` | `fs/smb/server/smbacl.c` |
+| 7 | `smb_direct_logging_vaprintf` | `fs/smb/server/transport_rdma.c` |
+| 7 | `smb_grant_oplock` | `fs/smb/server/oplock.c` |
 | 7 | `snd_hda_codec_amp_init` | `sound/hda/common/codec.c` |
 | 7 | `snd_hda_codec_amp_update` | `sound/hda/common/codec.c` |
-| 7 | `snd_hda_codec_amp_update` | `sound/hda/common/hda_local.h` |
-| 7 | `snd_hda_jack_add_kctl_mst` | `sound/hda/common/hda_jack.h` |
 | 7 | `snd_hda_jack_add_kctl_mst` | `sound/hda/common/jack.c` |
-| 7 | `snd_hdac_setup_channel_mapping` | `include/sound/hda_chmap.h` |
 | 7 | `snd_hdac_setup_channel_mapping` | `sound/hda/core/hdmi_chmap.c` |
 | 7 | `snd_seq_client_enqueue_event` | `sound/core/seq/seq_clientmgr.c` |
-| 7 | `snd_seq_event_port_attach` | `include/sound/seq_kernel.h` |
 | 7 | `snd_seq_event_port_attach` | `sound/core/seq/seq_ports.c` |
 | 7 | `syscall_get_data` | `kernel/trace/trace_syscalls.c` |
 | 7 | `sysfs_add_bin_file_mode_ns` | `fs/sysfs/file.c` |
-| 7 | `sysfs_add_bin_file_mode_ns` | `fs/sysfs/sysfs.h` |
 | 7 | `tc_chain_notify` | `net/sched/cls_api.c` |
 | 7 | `tc_dump_qdisc_root` | `net/sched/sch_api.c` |
 | 7 | `tcf_exts_init_ex` | `net/sched/cls_api.c` |
-| 7 | `tcf_exts_init_ex` | `include/net/pkt_cls.h` |
 | 7 | `tcf_exts_validate` | `net/sched/cls_api.c` |
-| 7 | `tcf_exts_validate` | `include/net/pkt_cls.h` |
 | 7 | `tcf_idr_create_from_flags` | `net/sched/act_api.c` |
-| 7 | `tcf_idr_create_from_flags` | `include/net/act_api.h` |
 | 7 | `tclass_notify` | `net/sched/sch_api.c` |
 | 7 | `tcp_collapse` | `net/ipv4/tcp_input.c` |
 | 7 | `tcp_sacktag_walk` | `net/ipv4/tcp_input.c` |
 | 7 | `tcp_v4_send_synack` | `net/ipv4/tcp_ipv4.c` |
 | 7 | `tcp_v4_syn_recv_sock` | `net/ipv4/tcp_ipv4.c` |
 | 7 | `trace_define_field` | `kernel/trace/trace_events.c` |
-| 7 | `trace_define_field` | `include/linux/trace_events.h` |
 | 7 | `try_to_claim_block` | `mm/page_alloc.c` |
 | 7 | `tty_port_register_device_attr_serdev` | `drivers/tty/tty_port.c` |
 | 7 | `unlz4` | `lib/decompress_unlz4.c` |
-| 7 | `unlz4` | `include/linux/decompress/unlz4.h` |
 | 7 | `unlzma` | `lib/decompress_unlzma.c` |
-| 7 | `unlzma` | `include/linux/decompress/unlzma.h` |
 | 7 | `unlzo` | `lib/decompress_unlzo.c` |
-| 7 | `unlzo` | `include/linux/decompress/unlzo.h` |
 | 7 | `unxz` | `lib/decompress_unxz.c` |
-| 7 | `unxz` | `include/linux/decompress/unxz.h` |
 | 7 | `unzstd` | `lib/decompress_unzstd.c` |
-| 7 | `unzstd` | `include/linux/decompress/unzstd.h` |
 | 7 | `update_amp_value` | `sound/hda/common/codec.c` |
+| 7 | `user_regset_copyin` | `include/linux/regset.h` |
 | 7 | `va_alloc` | `mm/vmalloc.c` |
+| 7 | `vc_uniscr_copy_area` | `drivers/tty/vt/vt.c` |
 | 7 | `vgacon_build_attr` | `drivers/video/console/vgacon.c` |
-| 7 | `virtio_gpu_cmd_set_scanout` | `drivers/gpu/drm/virtio/virtgpu_drv.h` |
 | 7 | `virtio_gpu_cmd_set_scanout` | `drivers/gpu/drm/virtio/virtgpu_vq.c` |
-| 7 | `virtio_gpu_panic_cmd_transfer_to_host_2d` | `drivers/gpu/drm/virtio/virtgpu_drv.h` |
 | 7 | `virtio_gpu_panic_cmd_transfer_to_host_2d` | `drivers/gpu/drm/virtio/virtgpu_vq.c` |
-| 7 | `virtio_transport_alloc_skb` | `net/vmw_vsock/virtio_transport_common.c` |
 | 7 | `vp_setup_vq` | `drivers/virtio/virtio_pci_common.c` |
+| 7 | `vring_map_one_sg` | `drivers/virtio/virtio_ring.c` |
 | 7 | `walk_res_desc` | `kernel/resource.c` |
 | 7 | `xdp_linearize_page` | `drivers/net/virtio_net.c` |
-
-## Notes
-
-- Functions marked `static inline` in headers are excluded (not in vmlinux)
-- Functions the compiler chose to inline (LTO, -O2 heuristics) are also excluded
-- Remaining functions are real call targets: ftrace CAN hook them but MISSES args 7+
-- kcov_dataflow captures ALL args for these functions at the LLVM IR level

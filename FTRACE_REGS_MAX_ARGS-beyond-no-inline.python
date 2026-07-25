@@ -1,103 +1,169 @@
 #!/usr/bin/env python3
 """
-Find kernel functions with >6 args that are NOT inlined (verified via vmlinux symbols).
+Kernel functions with >6 args that are actually COMPILED as callable symbols in
+a given vmlinux (i.e. not inlined away) -- the real ftrace targets whose 7th+
+argument the function-args feature truncates at FTRACE_REGS_MAX_ARGS = 6.
 
-Inlined functions don't exist as callable symbols -- ftrace can't trace them either.
-Only non-inlined functions matter for the ftrace vs kcov_dataflow comparison.
+Inlined functions have no callable symbol, so ftrace cannot hook them at all;
+only out-of-line symbols matter for the ftrace-vs-kcov_dataflow comparison.
+
+--------------------------------------------------------------------------------
+METHODOLOGY NOTES / CAVEATS:
+
+1. Dedup by name + filter to HEAD.  See FTRACE_REGS_MAX_ARGS-beyond.python; the
+   raw semcode dump has one row per (function, git blob) across all indexed
+   history, so we dedup by name and keep only blobs in `git ls-tree -r HEAD`.
+
+2. **The result is CONFIG-DEPENDENT.**  "Non-inlined" means "present as a text
+   symbol in the vmlinux you point this at."  A minimal/virtme config compiles a
+   small slice of the tree, so most >6-arg functions (drm/gpu/amd, many drivers)
+   are simply not built and are reported as absent -- NOT because they were
+   inlined.  An allmodconfig vmlinux would list far more.  The count answers
+   "for THIS build, how many >6-arg functions are real trace targets", not an
+   absolute kernel-wide figure.
+
+3. Compiler clones.  gcc emits `foo.isra.N`, `foo.constprop.N`, `foo.part.N`,
+   `foo.cold`; clang may emit `foo.llvm.HASH`.  An exact-name match would miss
+   these and under-count.  We strip those suffixes before matching.  (Note a
+   .constprop/.isra clone can have FEWER effective args than the source, since
+   constant args were propagated away -- a caveat, not corrected here.)
+
+4. ">6 params" is C-source parameter count, ~= ABI argument-register count.
+   Exact for scalar/pointer args; differs for by-value structs, sret returns,
+   __int128, variadics.
 
 Usage:
-    # 1. Dump functions from semcode
     cd /path/to/linux
     semcode -q "dump-functions /tmp/funcs.json"
-
-    # 2. Extract symbols from vmlinux
-    nm vmlinux | awk '$2 ~ /[tT]/ {print $3}' > /tmp/vmlinux_syms.txt
-    # Or from /proc/kallsyms:
-    # awk '$2 ~ /[tT]/ {print $3}' /proc/kallsyms > /tmp/vmlinux_syms.txt
-
-    # 3. Run this script
-    python3 FTRACE_REGS_MAX_ARGS-beyond-no-inline.python /tmp/funcs.json /tmp/vmlinux_syms.txt
+    git ls-tree -r HEAD | awk '$2=="blob"{print $3}' > /tmp/head_blobs.txt
+    nm vmlinux | awk '$2 ~ /^[tT]$/ {print $3}' > /tmp/vmlinux_syms.txt
+    python3 FTRACE_REGS_MAX_ARGS-beyond-no-inline.python \
+            /tmp/funcs.json /tmp/head_blobs.txt /tmp/vmlinux_syms.txt
 """
 import json
+import os
+import re
+import subprocess
 import sys
 from collections import Counter
 
 FTRACE_MAX = 6
+OUT = "/home/debian-sid/kcov-dataflow/FTRACE_REGS_MAX_ARGS-beyond-no-inline.md"
+LINUX_DIR = os.environ.get("LINUX_DIR", "/home/debian-sid/kcov-dataflow/linux")
+CLONE_SUFFIX = re.compile(r"\.(isra|constprop|part|cold|llvm)\b.*$")
+
+def excluded(fp):
+    return fp.startswith(("tools/", "samples/"))
+
+def _git(*args):
+    try:
+        return subprocess.run(["git", "-C", LINUX_DIR, *args],
+                              capture_output=True, text=True).stdout.strip()
+    except Exception:
+        return ""
+
+def kernel_version_block():
+    """Exact kernel version + SHA, anchored to the upstream mainline (master) tag."""
+    mk = {}
+    try:
+        with open(os.path.join(LINUX_DIR, "Makefile")) as f:
+            for line in f:
+                m = re.match(r"(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)\s*=\s*(.*)", line)
+                if m:
+                    mk[m.group(1)] = m.group(2).strip()
+                if len(mk) == 4:
+                    break
+    except OSError:
+        pass
+    ver = "{}.{}.{}{}".format(mk.get("VERSION", "?"), mk.get("PATCHLEVEL", "?"),
+                              mk.get("SUBLEVEL", "?"), mk.get("EXTRAVERSION", ""))
+    head = _git("rev-parse", "HEAD")
+    describe = _git("describe", "--tags")
+    mainline_desc = _git("describe", "--tags", "--match", "v[0-9]*", "--abbrev=12", "HEAD")
+    base_tag = re.sub(r"-\d+-g[0-9a-f]+$", "", mainline_desc) if mainline_desc else ""
+    base_sha = _git("rev-list", "-n1", base_tag) if base_tag else ""
+    lines = ["## Kernel version\n",
+             f"- Version: `{ver}`",
+             f"- Upstream mainline base (master): `{base_tag}` (`{base_sha}`)" if base_tag else "",
+             f"- Analyzed commit (HEAD): `{head}`" + (f" (`{mainline_desc}`)" if mainline_desc else ""),
+             f"- Tree: `{describe}`" if describe else "",
+             f"- vmlinux build: `{os.environ.get('VMLINUX_LABEL', 'config-specific (see caveats)')}`"]
+    return "\n".join(l for l in lines if l) + "\n\n"
 
 def main():
     funcs_path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/funcs.json"
-    syms_path = sys.argv[2] if len(sys.argv) > 2 else "/tmp/vmlinux_syms.txt"
+    blobs_path = sys.argv[2] if len(sys.argv) > 2 else "/tmp/head_blobs.txt"
+    syms_path  = sys.argv[3] if len(sys.argv) > 3 else "/tmp/vmlinux_syms.txt"
 
-    # Load vmlinux symbols (text section = actual compiled functions)
-    with open(syms_path) as f:
-        vmlinux_syms = set(line.strip() for line in f if line.strip())
-    print(f"Loaded {len(vmlinux_syms):,} symbols from vmlinux")
+    head_blobs = set(l.strip() for l in open(blobs_path) if l.strip())
+
+    raw_syms = set(l.strip() for l in open(syms_path) if l.strip())
+    vmlinux = set(raw_syms)
+    for s in raw_syms:                       # (3) map clones back to base name
+        vmlinux.add(CLONE_SUFFIX.sub("", s))
+    print(f"vmlinux text symbols: {len(raw_syms):,}")
 
     with open(funcs_path) as f:
         funcs = json.load(f)
 
-    over6 = []
-    inlined = 0
+    # dedup by name, HEAD-only, prefer .c over header
+    best = {}
     for func in funcs:
-        params = func.get("parameters", [])
+        if func.get("git_file_hash") not in head_blobs:
+            continue
         fp = func.get("file_path", "")
+        if excluded(fp):
+            continue
         name = func["name"]
-        if len(params) > FTRACE_MAX and not fp.startswith(("tools/", "samples/")):
-            if name in vmlinux_syms:
-                over6.append((name, len(params), fp))
-            else:
-                inlined += 1
+        p = len(func.get("parameters", []))
+        cur = best.get(name)
+        if (cur is None or p > cur[0]
+                or (p == cur[0] and cur[1].endswith(".h") and not fp.endswith(".h"))):
+            best[name] = (p, fp)
 
-    over6.sort(key=lambda x: (-x[1], x[0]))
-    total_syms = sum(1 for f in funcs if not f.get("file_path", "").startswith(("tools/", "samples/")))
+    over = {n: (p, fp) for n, (p, fp) in best.items() if p > FTRACE_MAX}
+    noinline = [(n, p, fp) for n, (p, fp) in over.items() if n in vmlinux]
+    absent = len(over) - len(noinline)
+    noinline.sort(key=lambda x: (-x[1], x[0]))
 
+    param_counts = Counter(p for _, p, _ in noinline)
     subsystems = Counter()
-    for _, _, fp in over6:
+    for _, _, fp in noinline:
         parts = fp.split("/")
         subsystems["/".join(parts[:2]) if len(parts) >= 2 else fp] += 1
 
-    param_counts = Counter(c for _, c, _ in over6)
+    with open(OUT, "w") as o:
+        o.write("# Functions Beyond FTRACE_REGS_MAX_ARGS (>6 parameters) "
+                "-- Compiled (Non-Inlined) In This vmlinux\n\n")
+        o.write("Distinct HEAD-tree functions with >6 parameters that appear as "
+                "a text\nsymbol in the target vmlinux -- the real ftrace targets "
+                f"whose 7th+ arg is\ntruncated at FTRACE_REGS_MAX_ARGS = {FTRACE_MAX}.\n\n")
+        o.write("> **Config-dependent.** Functions absent from this vmlinux may "
+                "be inlined\n> OR simply not built by this config. See the "
+                "generating script's caveats.\n\n")
+        o.write(kernel_version_block())
+        o.write("## Summary\n\n")
+        o.write(f"- Distinct HEAD functions with >{FTRACE_MAX} params: {len(over):,}\n")
+        o.write(f"- **Non-inlined (text symbol in this vmlinux): {len(noinline):,}**\n")
+        o.write(f"- Absent from this vmlinux (inlined or not built): {absent:,}\n\n")
+        o.write("## Distribution by parameter count\n\n")
+        o.write("| Args | Functions | ftrace truncates |\n")
+        o.write("|------|-----------|------------------|\n")
+        for n in sorted(param_counts):
+            o.write(f"| {n} | {param_counts[n]:,} | {n - FTRACE_MAX} |\n")
+        o.write("\n## By subsystem (top 30)\n\n")
+        o.write("| Subsystem | Count |\n|-----------|-------|\n")
+        for sub, cnt in subsystems.most_common(30):
+            o.write(f"| `{sub}` | {cnt} |\n")
+        o.write("\n## Full list\n\n")
+        o.write("| Args | Function | File |\n|------|----------|------|\n")
+        for name, cnt, fp in noinline:
+            o.write(f"| {cnt} | `{name}` | `{fp}` |\n")
 
-    # Write output
-    out_path = "/home/debian-sid/kcov-dataflow/FTRACE_REGS_MAX_ARGS-beyond-no-inline.md"
-    with open(out_path, "w") as out:
-        out.write("# Functions Beyond FTRACE_REGS_MAX_ARGS (>6 parameters) -- Non-Inlined Only\n\n")
-        out.write("Generated from Linux kernel source (semcode) cross-referenced with vmlinux symbols.\n")
-        out.write("Only functions that appear as symbols in vmlinux are listed (i.e., NOT inlined).\n\n")
-        out.write("## Method\n\n")
-        out.write("1. semcode indexes all function definitions from source\n")
-        out.write("2. `nm vmlinux` extracts text symbols (actual compiled, non-inlined functions)\n")
-        out.write("3. Cross-reference: only functions present in BOTH are real callable targets\n")
-        out.write("4. These are functions ftrace CAN trace but CANNOT fully capture args for\n\n")
-        out.write("## Summary\n\n")
-        out.write(f"- Total source functions indexed: {total_syms:,}\n")
-        out.write(f"- Functions with >6 params (source): {len(over6) + inlined:,}\n")
-        out.write(f"- Inlined (not in vmlinux, excluded): {inlined:,}\n")
-        out.write(f"- **Non-inlined with >6 params: {len(over6):,}**\n\n")
-        out.write("## Distribution by parameter count\n\n")
-        out.write("| Args | Functions | ftrace misses |\n")
-        out.write("|------|-----------|---------------|\n")
-        for n in sorted(param_counts.keys()):
-            out.write(f"| {n} | {param_counts[n]:,} | {n - FTRACE_MAX} |\n")
-        out.write("\n## By subsystem (top 30)\n\n")
-        out.write("| Subsystem | Count |\n")
-        out.write("|-----------|-------|\n")
-        for subsys, cnt in subsystems.most_common(30):
-            out.write(f"| `{subsys}` | {cnt} |\n")
-        out.write("\n## Full list\n\n")
-        out.write("| Args | Function | File |\n")
-        out.write("|------|----------|------|\n")
-        for name, cnt, fp in over6:
-            out.write(f"| {cnt} | `{name}` | `{fp}` |\n")
-        out.write("\n## Notes\n\n")
-        out.write("- Functions marked `static inline` in headers are excluded (not in vmlinux)\n")
-        out.write("- Functions the compiler chose to inline (LTO, -O2 heuristics) are also excluded\n")
-        out.write("- Remaining functions are real call targets: ftrace CAN hook them but MISSES args 7+\n")
-        out.write("- kcov_dataflow captures ALL args for these functions at the LLVM IR level\n")
-
-    print(f"Non-inlined functions with >6 args: {len(over6):,}")
-    print(f"Inlined (excluded): {inlined:,}")
-    print(f"Output: {out_path}")
+    print(f"Distinct HEAD >{FTRACE_MAX}-param functions: {len(over):,}")
+    print(f"Non-inlined in this vmlinux: {len(noinline):,}")
+    print(f"Absent (inlined or not built): {absent:,}")
+    print(f"Output: {OUT}")
 
 if __name__ == "__main__":
     main()
