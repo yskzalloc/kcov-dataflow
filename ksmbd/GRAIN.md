@@ -8,8 +8,11 @@ Sources cross-referenced:
 - **KSMBD impl**: `linux/fs/smb/server/smb2ops.c` dispatch table + `smb2pdu.c` handlers.
 - **Samba client verbs**: `samba/source3/libsmb/cli_smb2_fnum.c` (`cli_smb2_*`) and
   `libsmbclient.h` (`smbc_*`) — the reference for what a client can drive.
-- **Our grains**: `ksmbd/libksmbdzzer.c` GRAINS[] registry (**211 active**, `N_GRAINS`;
-  `secdesc` suppressed).
+- **Our grains**: `ksmbd/libksmbdzzer.c` GRAINS[] registry (**210 active**, `N_GRAINS`;
+  `secdesc` suppressed → 211 grain functions defined). Registry order = **kernel
+  data-path depth** (file/VFS I/O first, session/auth last); `#N` in this doc equals
+  `GRAINS[N-1]` = `pfz_grain_name(N-1)` = gen.py's compile index, so the numbering is a
+  single source of truth across source, generator, and docs.
 
 Legend: ✅ grain exists · ⚠️ partial / only-as-preamble · ❌ no grain (TODO) ·
 KSMBD col: ✅ implemented · ➖ not implemented (grain still worth it for robustness).
@@ -177,172 +180,141 @@ grains left at iteration count 1 — see §7.
 
 ### 1.1 Per-grain diagrams (by command)
 
-Every command-level grain, grouped by the SMB2 command it drives. See §9 for the
-shared archetypes and reading guide.
+Every command-level grain, grouped by the SMB2 command it drives. Commands are ordered
+by **kernel data-path depth, not opcode** — the file/VFS I/O commands that reach deepest
+into ksmbd come first (WRITE → READ → CREATE → LOCK → FLUSH), then file
+metadata/query/dir, and the shallow connection/session/auth commands
+(TREE_CONNECT → SESSION_SETUP → LOGOFF → NEGOTIATE) come last. Within each command the
+grains stay in ascending registry index (`#N` = `GRAINS[N-1]`, i.e. gen.py's compile
+order), so the `#N` label always cross-references gen.py directly. See §9 for the shared
+archetypes and reading guide.
 
-#### 0x00 NEGOTIATE
+#### 0x09 WRITE
 
-#### 10. `negotiate`
-_Fires a raw SMB2 NEGOTIATE (dialect 0x0311) with fuzzed negotiate contexts, no session; context-parsing bug class._
+#### 1. `write`
+_Fuzzes SMB2 WRITE payload + 24-bit offset on the authed scratch fd (smbc_write); write-side bounds bug class._
 
 ```mermaid
 sequenceDiagram
     participant G as grain
     participant S as ksmbd
-    G->>S: TCP connect :445
-    G->>S: NEGOTIATE (0x00) dialect 0x0311 + fuzzed contexts
-    Note over G: reads response, discarded
+    G->>S: WRITE (0x09) — fuzzed 24-bit offset + data (≤512B)
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 101. `negotiate_ctx_multi`
-
-_Throwaway-socket NEGOTIATE with NegotiateContextCount 2-6 and N fuzzed contexts — deassemble_neg_contexts() array-walk + 2nd..Nth sub-decoders (preauth/compress/encrypt)._
+#### 2. `write_ext`
+_Fuzzes SMB2 WRITE with a FULL 64-bit offset (holes / &gt;4GB / ~2^63) on the authed fd (smbc_write); sparse/boundary write bug class._
 
 ```mermaid
 sequenceDiagram
     participant G as grain
     participant S as ksmbd
-    Note over G: throwaway socket connect :445 (does NOT touch pool)
-    Note over G: NEGOTIATE dialect 3.1.1, NegotiateContextCount 2-6
-    loop 2-6 contexts (NegotiateContextCount)
-        Note over G: ContextType from preauth/enc/compress/netname/signing/posix<br/>fuzzed DataLength + counts/salts/algs
-    end
-    G->>S: NEGOTIATE (0x00) multi-context (send + read, throwaway conn)
-    S-->>G: response (read into df_buf)
+    G->>S: WRITE (0x09) — fuzzed 64-bit offset + data (≤512B)
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 114. `negotiate_dialects`
-
-_Fuzzes NEGOTIATE DialectCount 2-31 plus a mixed real/fuzzed dialect array to exercise smb2_handle_negotiate's dialect-selection loop; throwaway socket._
+#### 3. `stream_write`
+_Alternate-data-stream write: opens "sfile:&lt;fuzzed-stream-name&gt;:$DATA" and writes fuzzed data → ksmbd streams_xattr stream-name parse + xattr-backed store._
 
 ```mermaid
 sequenceDiagram
     participant G as grain
     participant S as ksmbd
-    Note over G: fresh TCP socket to :445, DialectCount 2-31, mixed real/fuzzed dialects
-    G->>S: NEGOTIATE (0x00) (raw write, read reply)
-    S-->>G: reply (discarded)
+    G->>S: CREATE (smbc_open sfile:‹fuzzed name›:$DATA, O_RDWR|O_CREAT)
+    S-->>G: fd
+    G->>S: WRITE (smbc_write fuzzed data, ≤256)
+    S-->>G: bytes written
+    G->>S: CLOSE (smbc_close)
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 184. `negotiate_signing_ctx`
-_Fresh-socket NEGOTIATE with an SMB2_SIGNING_CAPABILITIES context whose SigningAlgorithmCount + algorithm array are fuzzed (count vs. array length mismatch) — negotiate context parser._
+#### 4. `write_flags`
+_Raw SMB2 WRITE with fuzzed WriteFlags (WRITETHROUGH/UNBUFFERED) and a bounded Offset → write-through / direct-IO paths._
 
 ```mermaid
 sequenceDiagram
     participant G as grain
     participant S as ksmbd
-    Note over G,S: raw connect :445 (own socket, no pool)
-    G->>S: NEGOTIATE (SMB2_SIGNING_CAPABILITIES ctx, SigningAlgorithmCount + fuzzed algo[] loop)
-    S-->>G: NEGOTIATE resp (read into resp)
-    Note over G,S: walk df_buf → fb() (coverage feed)
-```
-
-#### 209. `conn_negotiate_twice`
-_Raw socket sends NEGOTIATE twice (2nd dialect fuzzed) on one connection — double-negotiate state-machine bug class._
-
-```mermaid
-sequenceDiagram
-    participant G as grain
-    participant S as ksmbd
-    Note over G,S: raw TCP connect :445
-    loop 2× (1st dialect 0x0311, 2nd fuzzed)
-        G->>S: NEGOTIATE(0x00) re-negotiate on same conn
-        S-->>G: reply (read)
-    end
-    Note over G,S: socket closed (conn dropped)
-    Note over G,S: walk df_buf → fb() (coverage feed)
-```
-
-#### 0x01 SESSION_SETUP
-
-#### 67. `session_setup`
-_Dedicated SESSION_SETUP auth-fuzz: fuzzes Flags/SecurityMode/Capabilities plus the whole SPNEGO/NTLMSSP security blob → ksmbd auth / ASN.1 decode surface._
-
-```mermaid
-sequenceDiagram
-    participant G as grain
-    participant S as ksmbd
-    Note over G: pool_lazy(1) ensure authed pool conn
-    G->>S: SESSION_SETUP (0x01) fuzzed Flags/SecurityMode/Capabilities + SPNEGO/NTLMSSP blob
+    Note over G: pool_ensure_fid("wf_v") — CREATE fid if absent
+    G->>S: WRITE (0x09) fuzzed Flags + bounded Offset + data
     S-->>G: response consumed
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 115. `spnego_asn1`
-
-_Fuzzes a SESSION_SETUP SPNEGO/DER security blob (GSS-API tag + SPNEGO OID + NegTokenInit TLV lengths) to stress the ASN.1/GSS-API decode path; may disrupt session (auto-reconnect)._
+#### 5. `append`
+_Seeks to EOF on the libsmbclient fd and writes fuzzed data → the file-grow / allocation path (chunked-upload style)._
 
 ```mermaid
 sequenceDiagram
     participant G as grain
     participant S as ksmbd
-    Note over G,S: pool_lazy(1) — authed conn
-    Note over G: build SPNEGO DER blob, fuzzed GSS/NegTokenInit/SEQUENCE lengths
-    G->>S: SESSION_SETUP (0x01) fuzzed SPNEGO blob
-    S-->>G: reply (may disrupt session → pool re-auth)
+    Note over G: smbc_lseek(g_smb_fd, 0, SEEK_END)
+    G->>S: WRITE (smbc_write fuzzed data at EOF, ≤512)
+    S-->>G: bytes written
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 162. `session_reauth_switch`
-_SESSION_SETUP re-auth on the existing SessionId with a fuzzed different-user NTLMSSP blob, then reconnect — session re-authentication / user-switch._
+#### 6. `write_compound_flush`
+_A single compound (RELATED) request chaining WRITE→FLUSH→WRITE on one fid — compound-request write/flush ordering._
 
 ```mermaid
 sequenceDiagram
     participant G as grain
     participant S as ksmbd
-    G->>S: SESSION_SETUP (0x01) existing sid, different-user NTLMSSP blob fuzzed
+    G->>S: CREATE (0x05) ensure fid (wcf_v)
+    S-->>G: fid
+    Note over G: build compound: WRITE (0x09) + FLUSH (0x07, RELATED) + WRITE (0x09, RELATED)
+    G->>S: compound WRITE→FLUSH→WRITE (single send)
     S-->>G: reply
-    Note over G: pool_reconnect(conn0) re-establish session
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 163. `guest_anon_auth`
-_Raw-socket SESSION_SETUP with a fuzzed NTLMSSP type-1 NegotiateFlags to force guest/anonymous downgrade auth-bypass._
+#### 7. `write_zero_length`
+_WRITE with Length=0 but a non-zero DataOffset — zero-length write with dangling data offset._
 
 ```mermaid
 sequenceDiagram
     participant G as grain
     participant S as ksmbd
-    G->>S: NEGOTIATE (0x00, raw sock, dialect 0x0311)
-    S-->>G: neg reply
-    G->>S: SESSION_SETUP (0x01, NTLMSSP type-1, fuzzed NegotiateFlags)
-    S-->>G: setup reply
+    G->>S: CREATE (0x05) ensure fid (wzl_v)
+    S-->>G: fid
+    G->>S: WRITE (0x09) Length=0, DataOffset non-zero fuzzed
+    S-->>G: reply
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 183. `gss_mechlist_mic`
-_SESSION_SETUP carrying a hand-built SPNEGO blob with a fuzzed [3] mechListMIC OCTET STRING length/body — GSS/SPNEGO negTokenInit parser._
+#### 8. `write_sparse_hole`
+_IOCTL FSCTL_SET_SPARSE then 3 WRITEs at scattered fuzzed offsets leaving holes between them — sparse-file hole allocation._
 
 ```mermaid
 sequenceDiagram
     participant G as grain
     participant S as ksmbd
-    G->>S: SESSION_SETUP (SPNEGO negTokenInit, fuzzed [3] mechListMIC OCTET STRING)
-    Note over G,S: pool_reconnect (tear + re-auth conn)
+    G->>S: CREATE "wsh_v" (pool_ensure_fid)
+    G->>S: IOCTL FSCTL_SET_SPARSE (0x000900C4)
+    G->>S: WRITE x3 (scattered fuzzed offsets, holes between)
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 210. `session_setup_no_negotiate`
-_Raw socket sends SESSION_SETUP first with no prior NEGOTIATE — out-of-order state-machine bug class._
+#### 9. `append_past_max`
+_Loop of 3 WRITEs at monotonically growing offsets on one fid — append/offset overflow bug class._
 
 ```mermaid
 sequenceDiagram
     participant G as grain
     participant S as ksmbd
-    Note over G,S: raw TCP connect :445 (no NEGOTIATE)
-    G->>S: SESSION_SETUP(0x01) first, fuzzed blob (&lt;=100B)
-    S-->>G: reply (read)
-    Note over G,S: socket closed (conn dropped)
+    Note over G,S: pool_ensure_fid → CREATE(0x05) if no fid
+    loop 3× (off += fuzzed each round)
+        G->>S: WRITE(0x09) wl=1..32B @ off (fid)
+        S-->>G: reply
+    end
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 0x02 LOGOFF
+#### 0x08 READ
 
-#### 36. `logoff`
-_Fuzzes SMB2 LOGOFF (0x02) optional SessionId + Reserved on the pool connection then forces re-auth — session-object lifetime / teardown UAF bug class._
+#### 10. `read`
+_Fuzzes SMB2 READ (0x08) Flags/Length/Offset/MinimumCount/Channel on the pool fid — read-boundary / length-overflow bug class._
 
 ```mermaid
 sequenceDiagram
@@ -351,132 +323,41 @@ sequenceDiagram
     G->>S: CREATE (pool fid) preamble
     S-->>G: fid
     Note over G: reconnect on failure
-    G->>S: LOGOFF 0x02 (optional fuzzed SessionId, Reserved fuzzed)
-    Note over G: drop socket + clear sid/tid/fid — re-auth next grain
+    G->>S: READ 0x08 (Flags, Length, Offset, MinimumCount, Channel fuzzed)
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 126. `logoff_inflight`
-
-_Fires a blocking SMB2 LOCK (no FAIL_IMMEDIATELY) then a LOGOFF while the lock is still inflight to race session teardown against a pending blocking wait._
+#### 11. `read_padding_edge`
+_READ with fuzzed Padding, Flags and MinimumCount versus Length — read-padding / minimum-count edge._
 
 ```mermaid
 sequenceDiagram
     participant G as grain
     participant S as ksmbd
-    Note over G,S: pool_ensure_fid("logoff_v") → CREATE if no fid
-    G->>S: LOCK (0x0A) SHARED blocking, fuzzed offset/len (send_only, no wait)
-    G->>S: LOGOFF (0x02) while lock inflight
-    S-->>G: reply
-    Note over G,S: session torn down → pool_reconnect() restore
-    Note over G,S: walk df_buf → fb() (coverage feed)
-```
-
-#### 164. `logoff_reuse_sid`
-_LOGOFF then ECHO reusing the just-freed SessionId (or a fuzzed one) to probe session-teardown UAF/stale-SID handling._
-
-```mermaid
-sequenceDiagram
-    participant G as grain
-    participant S as ksmbd
-    G->>S: LOGOFF (0x02, pool session)
-    S-->>G: logoff reply
-    G->>S: ECHO (0x0D, SessionId = stale sid or fuzzed)
-    S-->>G: echo reply
-    Note over G,S: reconnect pool (sid=0)
-    Note over G,S: walk df_buf → fb() (coverage feed)
-```
-
-#### 0x03 TREE_CONNECT
-
-#### 55. `tcon`
-_Raw SMB2 TREE_CONNECT with a fuzzed Flags field and fuzzed UNC path bytes → ksmbd tree-connect / share-lookup parsing (path confusion)._
-
-```mermaid
-sequenceDiagram
-    participant G as grain
-    participant S as ksmbd
-    Note over G: pool_lazy(1) ensure authed pool conn
-    G->>S: TREE_CONNECT (0x03) fuzzed Flags + UNC path \\ip\&lt;fuzzed&gt;
-    S-->>G: response consumed
-    Note over G,S: walk df_buf → fb() (coverage feed)
-```
-
-#### 165. `tcon_ipc_vs_disk`
-_TREE_CONNECT to IPC$ then a disk-style CREATE on that IPC tid to trigger tree-type (pipe vs share) confusion._
-
-```mermaid
-sequenceDiagram
-    participant G as grain
-    participant S as ksmbd
-    G->>S: TREE_CONNECT (0x03, \\127.0.0.1\IPC$)
-    S-->>G: reply (capture ipc_tid)
-    G->>S: CREATE (0x05, disk-file "ipc_confuse" on IPC$ tid)
-    S-->>G: create reply
-    Note over G,S: restore saved tid
-    Note over G,S: walk df_buf → fb() (coverage feed)
-```
-
-#### 196. `casefold_share_name`
-_TREE_CONNECT with a UNC path whose share name is fuzzed for case-folding and non-ASCII (0x80+) code units — share-name normalization/case handling._
-
-```mermaid
-sequenceDiagram
-    participant G as grain
-    participant S as ksmbd
-    G->>S: TREE_CONNECT (\\127.0.0.1\ + fuzzed mixed-case / non-ASCII share name)
-    Note over G,S: walk df_buf → fb() (coverage feed)
-```
-
-#### 207. `tcon_max_trees`
-_Loop of many TREE_CONNECTs with no TREE_DISCONNECT — exhausts the per-session tree-connection table._
-
-```mermaid
-sequenceDiagram
-    participant G as grain
-    participant S as ksmbd
-    Note over G,S: pool_lazy(1)
-    loop N=8..47× (no TREE_DISCONNECT → tree-table pressure)
-        G->>S: TREE_CONNECT(0x03) \\127.0.0.1\share
-        S-->>G: reply
-    end
-    Note over G,S: pool_reconnect (drop & re-auth conn)
-    Note over G,S: walk df_buf → fb() (coverage feed)
-```
-
-#### 0x04 TREE_DISCONNECT
-
-#### 34. `tdis`
-_Fuzzes SMB2 TREE_DISCONNECT (0x04) TreeId on the authed pool connection — stale-tree teardown bug class._
-
-```mermaid
-sequenceDiagram
-    participant G as grain
-    participant S as ksmbd
-    Note over G: pool_lazy — authed conn (lazy)
-    G->>S: TREE_DISCONNECT 0x04 (TreeId fuzzed)
-    Note over G: has_fid cleared — fid re-open next grain
-    Note over G,S: walk df_buf → fb() (coverage feed)
-```
-
-#### 127. `tdis_open_fid`
-_TREE_DISCONNECT issued while a fid is still open on the pool conn — tests use-after-tree-teardown fid handling._
-
-```mermaid
-sequenceDiagram
-    participant G as grain
-    participant S as ksmbd
-    G->>S: CREATE (0x05) open pool fid "tdis_open_v"
+    G->>S: CREATE (0x05) ensure fid (rpe_v)
     S-->>G: fid
-    G->>S: TREE_DISCONNECT (0x04) tree still holding open fid
+    G->>S: READ (0x08) Padding/Flags/MinimumCount fuzzed
     S-->>G: reply
-    Note over G,S: pool_reconnect → restore torn-down tree
+    Note over G,S: walk df_buf → fb() (coverage feed)
+```
+
+#### 12. `read_beyond_eof`
+_READ with an overflowing Length (~0xFFFFFFF0) and overflowing Offset — read integer overflow past EOF._
+
+```mermaid
+sequenceDiagram
+    participant G as grain
+    participant S as ksmbd
+    G->>S: CREATE (0x05) ensure fid (rbe_v)
+    S-->>G: fid
+    G->>S: READ (0x08) Length huge + Offset overflow
+    S-->>G: reply
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
 #### 0x05 CREATE
 
-#### 208. `session_max_opens`
+#### 13. `session_max_opens`
 _Loop of many CREATEs (op00..) with no CLOSE — exhausts the per-session open-file table._
 
 ```mermaid
@@ -492,209 +373,9 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 0x06 CLOSE
-
-#### 35. `close`
-_Fuzzes SMB2 CLOSE (0x06) Flags/Reserved on the pool fid then optionally double-closes the same stale FileId — use-after-close / double-close UAF bug class._
-
-```mermaid
-sequenceDiagram
-    participant G as grain
-    participant S as ksmbd
-    G->>S: CREATE (pool fid) preamble
-    S-->>G: fid
-    Note over G: reconnect on failure
-    G->>S: CLOSE 0x06 (Flags, Reserved fuzzed)
-    G->>S: CLOSE 0x06 (SAME now-stale FileId, data-gated double-close)
-    Note over G: has_fid cleared — fid re-open next grain
-    Note over G,S: walk df_buf → fb() (coverage feed)
-```
-
-#### 0x07 FLUSH
-
-#### 28. `flush`
-_Fuzzes SMB2 FLUSH (0x07) Reserved1/Reserved2 on the pool fid — reserved-field handling / flush path bug class._
-
-```mermaid
-sequenceDiagram
-    participant G as grain
-    participant S as ksmbd
-    G->>S: CREATE (pool fid) preamble
-    S-->>G: fid
-    Note over G: reconnect on failure
-    G->>S: FLUSH 0x07 (Reserved1, Reserved2 fuzzed)
-    Note over G,S: walk df_buf → fb() (coverage feed)
-```
-
-#### 0x08 READ
-
-#### 26. `read`
-_Fuzzes SMB2 READ (0x08) Flags/Length/Offset/MinimumCount/Channel on the pool fid — read-boundary / length-overflow bug class._
-
-```mermaid
-sequenceDiagram
-    participant G as grain
-    participant S as ksmbd
-    G->>S: CREATE (pool fid) preamble
-    S-->>G: fid
-    Note over G: reconnect on failure
-    G->>S: READ 0x08 (Flags, Length, Offset, MinimumCount, Channel fuzzed)
-    Note over G,S: walk df_buf → fb() (coverage feed)
-```
-
-#### 155. `read_padding_edge`
-_READ with fuzzed Padding, Flags and MinimumCount versus Length — read-padding / minimum-count edge._
-
-```mermaid
-sequenceDiagram
-    participant G as grain
-    participant S as ksmbd
-    G->>S: CREATE (0x05) ensure fid (rpe_v)
-    S-->>G: fid
-    G->>S: READ (0x08) Padding/Flags/MinimumCount fuzzed
-    S-->>G: reply
-    Note over G,S: walk df_buf → fb() (coverage feed)
-```
-
-#### 158. `read_beyond_eof`
-_READ with an overflowing Length (~0xFFFFFFF0) and overflowing Offset — read integer overflow past EOF._
-
-```mermaid
-sequenceDiagram
-    participant G as grain
-    participant S as ksmbd
-    G->>S: CREATE (0x05) ensure fid (rbe_v)
-    S-->>G: fid
-    G->>S: READ (0x08) Length huge + Offset overflow
-    S-->>G: reply
-    Note over G,S: walk df_buf → fb() (coverage feed)
-```
-
-#### 0x09 WRITE
-
-#### 1. `write`
-_Fuzzes SMB2 WRITE payload + 24-bit offset on the authed scratch fd (smbc_write); write-side bounds bug class._
-
-```mermaid
-sequenceDiagram
-    participant G as grain
-    participant S as ksmbd
-    G->>S: WRITE (0x09) — fuzzed 24-bit offset + data (&le;512B)
-    Note over G,S: walk df_buf → fb() (coverage feed)
-```
-
-#### 18. `write_ext`
-_Fuzzes SMB2 WRITE with a FULL 64-bit offset (holes / &gt;4GB / ~2^63) on the authed fd (smbc_write); sparse/boundary write bug class._
-
-```mermaid
-sequenceDiagram
-    participant G as grain
-    participant S as ksmbd
-    G->>S: WRITE (0x09) — fuzzed 64-bit offset + data (&le;512B)
-    Note over G,S: walk df_buf → fb() (coverage feed)
-```
-
-#### 59. `stream_write`
-_Alternate-data-stream write: opens "sfile:&lt;fuzzed-stream-name&gt;:$DATA" and writes fuzzed data → ksmbd streams_xattr stream-name parse + xattr-backed store._
-
-```mermaid
-sequenceDiagram
-    participant G as grain
-    participant S as ksmbd
-    G->>S: CREATE (smbc_open sfile:&lt;fuzzed name&gt;:$DATA, O_RDWR|O_CREAT)
-    S-->>G: fd
-    G->>S: WRITE (smbc_write fuzzed data, ≤256)
-    S-->>G: bytes written
-    G->>S: CLOSE (smbc_close)
-    Note over G,S: walk df_buf → fb() (coverage feed)
-```
-
-#### 60. `write_flags`
-_Raw SMB2 WRITE with fuzzed WriteFlags (WRITETHROUGH/UNBUFFERED) and a bounded Offset → write-through / direct-IO paths._
-
-```mermaid
-sequenceDiagram
-    participant G as grain
-    participant S as ksmbd
-    Note over G: pool_ensure_fid("wf_v") — CREATE fid if absent
-    G->>S: WRITE (0x09) fuzzed Flags + bounded Offset + data
-    S-->>G: response consumed
-    Note over G,S: walk df_buf → fb() (coverage feed)
-```
-
-#### 61. `append`
-_Seeks to EOF on the libsmbclient fd and writes fuzzed data → the file-grow / allocation path (chunked-upload style)._
-
-```mermaid
-sequenceDiagram
-    participant G as grain
-    participant S as ksmbd
-    Note over G: smbc_lseek(g_smb_fd, 0, SEEK_END)
-    G->>S: WRITE (smbc_write fuzzed data at EOF, ≤512)
-    S-->>G: bytes written
-    Note over G,S: walk df_buf → fb() (coverage feed)
-```
-
-#### 154. `write_compound_flush`
-_A single compound (RELATED) request chaining WRITE→FLUSH→WRITE on one fid — compound-request write/flush ordering._
-
-```mermaid
-sequenceDiagram
-    participant G as grain
-    participant S as ksmbd
-    G->>S: CREATE (0x05) ensure fid (wcf_v)
-    S-->>G: fid
-    Note over G: build compound: WRITE (0x09) + FLUSH (0x07, RELATED) + WRITE (0x09, RELATED)
-    G->>S: compound WRITE→FLUSH→WRITE (single send)
-    S-->>G: reply
-    Note over G,S: walk df_buf → fb() (coverage feed)
-```
-
-#### 156. `write_zero_length`
-_WRITE with Length=0 but a non-zero DataOffset — zero-length write with dangling data offset._
-
-```mermaid
-sequenceDiagram
-    participant G as grain
-    participant S as ksmbd
-    G->>S: CREATE (0x05) ensure fid (wzl_v)
-    S-->>G: fid
-    G->>S: WRITE (0x09) Length=0, DataOffset non-zero fuzzed
-    S-->>G: reply
-    Note over G,S: walk df_buf → fb() (coverage feed)
-```
-
-#### 198. `write_sparse_hole`
-_IOCTL FSCTL_SET_SPARSE then 3 WRITEs at scattered fuzzed offsets leaving holes between them — sparse-file hole allocation._
-
-```mermaid
-sequenceDiagram
-    participant G as grain
-    participant S as ksmbd
-    G->>S: CREATE "wsh_v" (pool_ensure_fid)
-    G->>S: IOCTL FSCTL_SET_SPARSE (0x000900C4)
-    G->>S: WRITE x3 (scattered fuzzed offsets, holes between)
-    Note over G,S: walk df_buf → fb() (coverage feed)
-```
-
-#### 201. `append_past_max`
-_Loop of 3 WRITEs at monotonically growing offsets on one fid — append/offset overflow bug class._
-
-```mermaid
-sequenceDiagram
-    participant G as grain
-    participant S as ksmbd
-    Note over G,S: pool_ensure_fid → CREATE(0x05) if no fid
-    loop 3× (off += fuzzed each round)
-        G->>S: WRITE(0x09) wl=1..32B @ off (fid)
-        S-->>G: reply
-    end
-    Note over G,S: walk df_buf → fb() (coverage feed)
-```
-
 #### 0x0A LOCK
 
-#### 27. `lock`
+#### 14. `lock`
 _Fuzzes SMB2 LOCK (0x0A) LockSequence/Offset/Length/Flags on the pool fid — byte-range lock SHARED/EXCL/UNLOCK state bug class._
 
 ```mermaid
@@ -708,7 +389,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 106. `lock_array`
+#### 15. `lock_array`
 
 _SMB2 LOCK with LockCount 2-8 and an independently-fuzzed lock-element array — smb2_lock() per-element for-loop over lock_ele[i] (overlap/huge/inverted Offset+Length; find.md #1 surface)._
 
@@ -719,14 +400,14 @@ sequenceDiagram
     G->>S: CREATE (0x05) ensure fid "lockarr_v"
     S-->>G: fid
     loop 2-8 elements (LockCount)
-        Note over G: smb2_lock_element[i] — fuzzed Offset/Length/Flags<br/>(SHARED/EXCL/UNLOCK/FAIL_IMMEDIATELY)
+        Note over G: smb2_lock_element[i] — fuzzed Offset/Length/Flags / (SHARED/EXCL/UNLOCK/FAIL_IMMEDIATELY)
     end
     G->>S: LOCK (0x0A) LockCount 2-8, fuzzed lock array
     S-->>G: status
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 159. `lock_unlock_mismatch`
+#### 16. `lock_unlock_mismatch`
 _LOCK with UNLOCK flag on a range that was never locked plus a mismatched LockSequenceNumber — unlock-without-lock state._
 
 ```mermaid
@@ -740,7 +421,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 160. `lock_shared_excl_conflict`
+#### 17. `lock_shared_excl_conflict`
 _Two connections lock the same range — C shared then C2 exclusive (FAIL_IMMEDIATELY) — cross-handle lock conflict._
 
 ```mermaid
@@ -757,7 +438,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 161. `lock_reflexive`
+#### 18. `lock_reflexive`
 _Same fid locks the identical range twice with a fuzzed lock flag — self-conflicting reflexive lock._
 
 ```mermaid
@@ -773,53 +454,136 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 0x0C CANCEL
+#### 0x07 FLUSH
 
-#### 30. `cancel`
-_Fuzzes SMB2 CANCEL (0x0C) MessageId on the authed pool connection — async-op teardown / stale-MID bug class._
-
-```mermaid
-sequenceDiagram
-    participant G as grain
-    participant S as ksmbd
-    Note over G: pool_lazy — authed conn (lazy)
-    G->>S: CANCEL 0x0C (MessageId fuzzed)
-    Note over G,S: walk df_buf → fb() (coverage feed)
-```
-
-#### 129. `cancel_async_target`
-_Fires a blocking async LOCK then a CANCEL targeting its MID (real or fuzzed) — races async request cancellation._
+#### 19. `flush`
+_Fuzzes SMB2 FLUSH (0x07) Reserved1/Reserved2 on the pool fid — reserved-field handling / flush path bug class._
 
 ```mermaid
 sequenceDiagram
     participant G as grain
     participant S as ksmbd
-    G->>S: CREATE (0x05) open pool fid "cancel_v"
+    G->>S: CREATE (pool fid) preamble
     S-->>G: fid
-    G->>S: LOCK (0x0A) blocking/async (send_only, no wait)
-    G->>S: CANCEL (0x0C) targeting lock MID (real or fuzzed)
-    S-->>G: reply
-    Note over G,S: pool_reconnect → restore conn
+    Note over G: reconnect on failure
+    G->>S: FLUSH 0x07 (Reserved1, Reserved2 fuzzed)
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 0x0D ECHO
+#### 0x10 QUERY_INFO
 
-#### 29. `echo`
-_Fuzzes SMB2 ECHO (0x0D) Reserved field on the authed pool connection — keepalive / reserved-field bug class._
+#### 20. `query_info`
+_Fuzzes SMB2 QUERY_INFO (0x10) InfoType/FileInfoClass/AdditionalInformation/Flags on the pool fid — info-class dispatch / parser bug class._
 
 ```mermaid
 sequenceDiagram
     participant G as grain
     participant S as ksmbd
-    Note over G: pool_lazy — authed conn (lazy)
-    G->>S: ECHO 0x0D (Reserved fuzzed)
+    G->>S: CREATE (pool fid) preamble
+    S-->>G: fid
+    Note over G: reconnect on failure
+    G->>S: QUERY_INFO 0x10 (InfoType, FileInfoClass, AdditionalInformation, Flags fuzzed)
+    Note over G,S: walk df_buf → fb() (coverage feed)
+```
+
+#### 21. `query_fs_info`
+_QUERY_INFO InfoType=FILESYSTEM with a fuzzed FsInfoClass (1–12) — filesystem-info query handlers._
+
+```mermaid
+sequenceDiagram
+    participant G as grain
+    participant S as ksmbd
+    G->>S: CREATE (0x05) open pool fid "qfs_v"
+    S-->>G: fid
+    G->>S: QUERY_INFO (0x10) InfoType=FILESYSTEM, FsInfoClass fuzzed
+    S-->>G: reply
+    Note over G,S: walk df_buf → fb() (coverage feed)
+```
+
+#### 22. `query_info_ea_list`
+_QUERY_INFO FILE_FULL_EA_INFORMATION with a fuzzed EaList whose NextEntryOffset chain is corrupted — EA-list traversal OOB._
+
+```mermaid
+sequenceDiagram
+    participant G as grain
+    participant S as ksmbd
+    G->>S: CREATE (0x05) ensure fid (qeal_v)
+    S-->>G: fid
+    G->>S: QUERY_INFO (0x10) FILE_FULL_EA_INFORMATION, EaList NextEntryOffset fuzzed
+    S-->>G: reply
+    Note over G,S: walk df_buf → fb() (coverage feed)
+```
+
+#### 23. `query_all_info`
+_QUERY_INFO FILE_ALL_INFORMATION (class 18) with a fuzzed AdditionalInformation on the pool fid._
+
+```mermaid
+sequenceDiagram
+    participant G as grain
+    participant S as ksmbd
+    Note over G,S: pool_ensure_fid → CREATE if needed
+    G->>S: QUERY_INFO (0x10, FILE_ALL_INFORMATION cls 18, fuzzed AddlInfo)
+    S-->>G: info reply
+    Note over G,S: walk df_buf → fb() (coverage feed)
+```
+
+#### 24. `query_stream_info`
+_QUERY_INFO FILE_STREAM_INFORMATION (class 22) with a fuzzed AdditionalInformation on the pool fid._
+
+```mermaid
+sequenceDiagram
+    participant G as grain
+    participant S as ksmbd
+    Note over G,S: pool_ensure_fid → CREATE if needed
+    G->>S: QUERY_INFO (0x10, FILE_STREAM_INFORMATION cls 22, fuzzed AddlInfo)
+    S-->>G: info reply
+    Note over G,S: walk df_buf → fb() (coverage feed)
+```
+
+#### 25. `query_network_openinfo`
+_QUERY_INFO cycling info classes NETWORK_OPEN/INTERNAL/ATTR_TAG/STANDARD/EA with fuzzed AdditionalInformation._
+
+```mermaid
+sequenceDiagram
+    participant G as grain
+    participant S as ksmbd
+    Note over G,S: pool_ensure_fid → CREATE if needed
+    G->>S: QUERY_INFO (0x10, cls ∈ {34,6,35,5,21}, fuzzed AddlInfo)
+    S-->>G: info reply
+    Note over G,S: walk df_buf → fb() (coverage feed)
+```
+
+#### 26. `query_full_ea_size`
+_QUERY_INFO FileFullEaInformation with a tiny OutputBufferLength — EA-buffer truncation/size bug class._
+
+```mermaid
+sequenceDiagram
+    participant G as grain
+    participant S as ksmbd
+    Note over G,S: pool_ensure_fid → CREATE(0x05) if no fid
+    G->>S: QUERY_INFO(0x10) FILE / FileFullEaInformation(15), OutBufLen = val%32 (fid)
+    S-->>G: reply
+    Note over G,S: walk df_buf → fb() (coverage feed)
+```
+
+#### 27. `query_attr_tag_reparse`
+_FSCTL_SET_REPARSE_POINT(0x000900A4) via IOCTL then QUERY_INFO FileAttributeTagInformation — reparse-point tag handling bug class._
+
+```mermaid
+sequenceDiagram
+    participant G as grain
+    participant S as ksmbd
+    Note over G,S: pool_ensure_fid → CREATE(0x05) if no fid
+    G->>S: IOCTL(0x0B) FSCTL_SET_REPARSE_POINT(0x000900A4), tag 0xA000000C (fid)
+    S-->>G: reply
+    G->>S: QUERY_INFO(0x10) FILE / FileAttributeTagInformation(35) (fid)
+    S-->>G: reply
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
 #### 0x0E QUERY_DIRECTORY
 
-#### 5. `query_dir`
+#### 28. `query_dir`
 _Enumerates a fuzzer-steered subpath of the share (smbc_opendir/readdir); QUERY_DIRECTORY + path-resolution / dir-iteration bug class._
 
 ```mermaid
@@ -837,7 +601,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 104. `dir_pattern`
+#### 29. `dir_pattern`
 
 _Open the share root as a directory then QUERY_DIRECTORY with a wildcard-dense UTF-16 search pattern — misc.c match_pattern() '*'/'?' backtracker._
 
@@ -853,7 +617,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 118. `query_dir_resume`
+#### 30. `query_dir_resume`
 
 _Opens a directory then fuzzes QUERY_DIRECTORY resume state (FileIndex + INDEX_SPECIFIED flag + search pattern) to exercise resume-key handling._
 
@@ -868,7 +632,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 204. `query_dir_short_buf`
+#### 31. `query_dir_short_buf`
 _CREATE a directory then QUERY_DIRECTORY with OutputBufferLength smaller than one entry — directory-enumeration short-buffer bug class._
 
 ```mermaid
@@ -877,14 +641,14 @@ sequenceDiagram
     participant S as ksmbd
     G->>S: CREATE(0x05) directory (DirAccess 0x100081, opt 0x01)
     S-->>G: reply → dir fid (STATUS_SUCCESS required)
-    G->>S: QUERY_DIRECTORY(0x0E) "*", OutBufLen = val%24 &lt; one entry (dir fid)
+    G->>S: QUERY_DIRECTORY(0x0E) "*", OutBufLen = val%24 ‹ one entry (dir fid)
     S-->>G: reply
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
 #### 0x0F CHANGE_NOTIFY
 
-#### 33. `notify`
+#### 32. `notify`
 _Fuzzes SMB2 CHANGE_NOTIFY (0x0F) Flags/OutputBufferLength/CompletionFilter on the pool fid — watch-tree / notify-buffer bug class._
 
 ```mermaid
@@ -898,7 +662,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 117. `notify_output_walk`
+#### 33. `notify_output_walk`
 
 _Opens a directory then fuzzes CHANGE_NOTIFY Flags/OutputBufferLength/CompletionFilter to walk the notify output-buffer boundary._
 
@@ -913,10 +677,10 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 0x10 QUERY_INFO
+#### 0x06 CLOSE
 
-#### 31. `query_info`
-_Fuzzes SMB2 QUERY_INFO (0x10) InfoType/FileInfoClass/AdditionalInformation/Flags on the pool fid — info-class dispatch / parser bug class._
+#### 34. `close`
+_Fuzzes SMB2 CLOSE (0x06) Flags/Reserved on the pool fid then optionally double-closes the same stale FileId — use-after-close / double-close UAF bug class._
 
 ```mermaid
 sequenceDiagram
@@ -925,102 +689,347 @@ sequenceDiagram
     G->>S: CREATE (pool fid) preamble
     S-->>G: fid
     Note over G: reconnect on failure
-    G->>S: QUERY_INFO 0x10 (InfoType, FileInfoClass, AdditionalInformation, Flags fuzzed)
+    G->>S: CLOSE 0x06 (Flags, Reserved fuzzed)
+    G->>S: CLOSE 0x06 (SAME now-stale FileId, data-gated double-close)
+    Note over G: has_fid cleared — fid re-open next grain
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 143. `query_fs_info`
-_QUERY_INFO InfoType=FILESYSTEM with a fuzzed FsInfoClass (1–12) — filesystem-info query handlers._
+#### 0x0C CANCEL
+
+#### 35. `cancel`
+_Fuzzes SMB2 CANCEL (0x0C) MessageId on the authed pool connection — async-op teardown / stale-MID bug class._
 
 ```mermaid
 sequenceDiagram
     participant G as grain
     participant S as ksmbd
-    G->>S: CREATE (0x05) open pool fid "qfs_v"
+    Note over G: pool_lazy — authed conn (lazy)
+    G->>S: CANCEL 0x0C (MessageId fuzzed)
+    Note over G,S: walk df_buf → fb() (coverage feed)
+```
+
+#### 36. `cancel_async_target`
+_Fires a blocking async LOCK then a CANCEL targeting its MID (real or fuzzed) — races async request cancellation._
+
+```mermaid
+sequenceDiagram
+    participant G as grain
+    participant S as ksmbd
+    G->>S: CREATE (0x05) open pool fid "cancel_v"
     S-->>G: fid
-    G->>S: QUERY_INFO (0x10) InfoType=FILESYSTEM, FsInfoClass fuzzed
+    G->>S: LOCK (0x0A) blocking/async (send_only, no wait)
+    G->>S: CANCEL (0x0C) targeting lock MID (real or fuzzed)
     S-->>G: reply
+    Note over G,S: pool_reconnect → restore conn
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 146. `query_info_ea_list`
-_QUERY_INFO FILE_FULL_EA_INFORMATION with a fuzzed EaList whose NextEntryOffset chain is corrupted — EA-list traversal OOB._
+#### 0x0D ECHO
+
+#### 37. `echo`
+_Fuzzes SMB2 ECHO (0x0D) Reserved field on the authed pool connection — keepalive / reserved-field bug class._
 
 ```mermaid
 sequenceDiagram
     participant G as grain
     participant S as ksmbd
-    G->>S: CREATE (0x05) ensure fid (qeal_v)
+    Note over G: pool_lazy — authed conn (lazy)
+    G->>S: ECHO 0x0D (Reserved fuzzed)
+    Note over G,S: walk df_buf → fb() (coverage feed)
+```
+
+#### 0x03 TREE_CONNECT
+
+#### 38. `tcon`
+_Raw SMB2 TREE_CONNECT with a fuzzed Flags field and fuzzed UNC path bytes → ksmbd tree-connect / share-lookup parsing (path confusion)._
+
+```mermaid
+sequenceDiagram
+    participant G as grain
+    participant S as ksmbd
+    Note over G: pool_lazy(1) ensure authed pool conn
+    G->>S: TREE_CONNECT (0x03) fuzzed Flags + UNC path \\ip\‹fuzzed›
+    S-->>G: response consumed
+    Note over G,S: walk df_buf → fb() (coverage feed)
+```
+
+#### 39. `tcon_ipc_vs_disk`
+_TREE_CONNECT to IPC$ then a disk-style CREATE on that IPC tid to trigger tree-type (pipe vs share) confusion._
+
+```mermaid
+sequenceDiagram
+    participant G as grain
+    participant S as ksmbd
+    G->>S: TREE_CONNECT (0x03, \\127.0.0.1\IPC$)
+    S-->>G: reply (capture ipc_tid)
+    G->>S: CREATE (0x05, disk-file "ipc_confuse" on IPC$ tid)
+    S-->>G: create reply
+    Note over G,S: restore saved tid
+    Note over G,S: walk df_buf → fb() (coverage feed)
+```
+
+#### 40. `casefold_share_name`
+_TREE_CONNECT with a UNC path whose share name is fuzzed for case-folding and non-ASCII (0x80+) code units — share-name normalization/case handling._
+
+```mermaid
+sequenceDiagram
+    participant G as grain
+    participant S as ksmbd
+    G->>S: TREE_CONNECT (\\127.0.0.1\ + fuzzed mixed-case / non-ASCII share name)
+    Note over G,S: walk df_buf → fb() (coverage feed)
+```
+
+#### 41. `tcon_max_trees`
+_Loop of many TREE_CONNECTs with no TREE_DISCONNECT — exhausts the per-session tree-connection table._
+
+```mermaid
+sequenceDiagram
+    participant G as grain
+    participant S as ksmbd
+    Note over G,S: pool_lazy(1)
+    loop N=8..47× (no TREE_DISCONNECT → tree-table pressure)
+        G->>S: TREE_CONNECT(0x03) \\127.0.0.1\share
+        S-->>G: reply
+    end
+    Note over G,S: pool_reconnect (drop & re-auth conn)
+    Note over G,S: walk df_buf → fb() (coverage feed)
+```
+
+#### 0x04 TREE_DISCONNECT
+
+#### 42. `tdis`
+_Fuzzes SMB2 TREE_DISCONNECT (0x04) TreeId on the authed pool connection — stale-tree teardown bug class._
+
+```mermaid
+sequenceDiagram
+    participant G as grain
+    participant S as ksmbd
+    Note over G: pool_lazy — authed conn (lazy)
+    G->>S: TREE_DISCONNECT 0x04 (TreeId fuzzed)
+    Note over G: has_fid cleared — fid re-open next grain
+    Note over G,S: walk df_buf → fb() (coverage feed)
+```
+
+#### 43. `tdis_open_fid`
+_TREE_DISCONNECT issued while a fid is still open on the pool conn — tests use-after-tree-teardown fid handling._
+
+```mermaid
+sequenceDiagram
+    participant G as grain
+    participant S as ksmbd
+    G->>S: CREATE (0x05) open pool fid "tdis_open_v"
     S-->>G: fid
-    G->>S: QUERY_INFO (0x10) FILE_FULL_EA_INFORMATION, EaList NextEntryOffset fuzzed
+    G->>S: TREE_DISCONNECT (0x04) tree still holding open fid
     S-->>G: reply
+    Note over G,S: pool_reconnect → restore torn-down tree
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 166. `query_all_info`
-_QUERY_INFO FILE_ALL_INFORMATION (class 18) with a fuzzed AdditionalInformation on the pool fid._
+#### 0x01 SESSION_SETUP
+
+#### 44. `session_setup`
+_Dedicated SESSION_SETUP auth-fuzz: fuzzes Flags/SecurityMode/Capabilities plus the whole SPNEGO/NTLMSSP security blob → ksmbd auth / ASN.1 decode surface._
 
 ```mermaid
 sequenceDiagram
     participant G as grain
     participant S as ksmbd
-    Note over G,S: pool_ensure_fid → CREATE if needed
-    G->>S: QUERY_INFO (0x10, FILE_ALL_INFORMATION cls 18, fuzzed AddlInfo)
-    S-->>G: info reply
+    Note over G: pool_lazy(1) ensure authed pool conn
+    G->>S: SESSION_SETUP (0x01) fuzzed Flags/SecurityMode/Capabilities + SPNEGO/NTLMSSP blob
+    S-->>G: response consumed
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 168. `query_stream_info`
-_QUERY_INFO FILE_STREAM_INFORMATION (class 22) with a fuzzed AdditionalInformation on the pool fid._
+#### 45. `spnego_asn1`
+
+_Fuzzes a SESSION_SETUP SPNEGO/DER security blob (GSS-API tag + SPNEGO OID + NegTokenInit TLV lengths) to stress the ASN.1/GSS-API decode path; may disrupt session (auto-reconnect)._
 
 ```mermaid
 sequenceDiagram
     participant G as grain
     participant S as ksmbd
-    Note over G,S: pool_ensure_fid → CREATE if needed
-    G->>S: QUERY_INFO (0x10, FILE_STREAM_INFORMATION cls 22, fuzzed AddlInfo)
-    S-->>G: info reply
+    Note over G,S: pool_lazy(1) — authed conn
+    Note over G: build SPNEGO DER blob, fuzzed GSS/NegTokenInit/SEQUENCE lengths
+    G->>S: SESSION_SETUP (0x01) fuzzed SPNEGO blob
+    S-->>G: reply (may disrupt session → pool re-auth)
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 170. `query_network_openinfo`
-_QUERY_INFO cycling info classes NETWORK_OPEN/INTERNAL/ATTR_TAG/STANDARD/EA with fuzzed AdditionalInformation._
+#### 46. `session_reauth_switch`
+_SESSION_SETUP re-auth on the existing SessionId with a fuzzed different-user NTLMSSP blob, then reconnect — session re-authentication / user-switch._
 
 ```mermaid
 sequenceDiagram
     participant G as grain
     participant S as ksmbd
-    Note over G,S: pool_ensure_fid → CREATE if needed
-    G->>S: QUERY_INFO (0x10, cls ∈ {34,6,35,5,21}, fuzzed AddlInfo)
-    S-->>G: info reply
-    Note over G,S: walk df_buf → fb() (coverage feed)
-```
-
-#### 202. `query_full_ea_size`
-_QUERY_INFO FileFullEaInformation with a tiny OutputBufferLength — EA-buffer truncation/size bug class._
-
-```mermaid
-sequenceDiagram
-    participant G as grain
-    participant S as ksmbd
-    Note over G,S: pool_ensure_fid → CREATE(0x05) if no fid
-    G->>S: QUERY_INFO(0x10) FILE / FileFullEaInformation(15), OutBufLen = val%32 (fid)
+    G->>S: SESSION_SETUP (0x01) existing sid, different-user NTLMSSP blob fuzzed
     S-->>G: reply
+    Note over G: pool_reconnect(conn0) re-establish session
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 206. `query_attr_tag_reparse`
-_FSCTL_SET_REPARSE_POINT(0x000900A4) via IOCTL then QUERY_INFO FileAttributeTagInformation — reparse-point tag handling bug class._
+#### 47. `guest_anon_auth`
+_Raw-socket SESSION_SETUP with a fuzzed NTLMSSP type-1 NegotiateFlags to force guest/anonymous downgrade auth-bypass._
 
 ```mermaid
 sequenceDiagram
     participant G as grain
     participant S as ksmbd
-    Note over G,S: pool_ensure_fid → CREATE(0x05) if no fid
-    G->>S: IOCTL(0x0B) FSCTL_SET_REPARSE_POINT(0x000900A4), tag 0xA000000C (fid)
+    G->>S: NEGOTIATE (0x00, raw sock, dialect 0x0311)
+    S-->>G: neg reply
+    G->>S: SESSION_SETUP (0x01, NTLMSSP type-1, fuzzed NegotiateFlags)
+    S-->>G: setup reply
+    Note over G,S: walk df_buf → fb() (coverage feed)
+```
+
+#### 48. `gss_mechlist_mic`
+_SESSION_SETUP carrying a hand-built SPNEGO blob with a fuzzed [3] mechListMIC OCTET STRING length/body — GSS/SPNEGO negTokenInit parser._
+
+```mermaid
+sequenceDiagram
+    participant G as grain
+    participant S as ksmbd
+    G->>S: SESSION_SETUP (SPNEGO negTokenInit, fuzzed [3] mechListMIC OCTET STRING)
+    Note over G,S: pool_reconnect (tear + re-auth conn)
+    Note over G,S: walk df_buf → fb() (coverage feed)
+```
+
+#### 49. `session_setup_no_negotiate`
+_Raw socket sends SESSION_SETUP first with no prior NEGOTIATE — out-of-order state-machine bug class._
+
+```mermaid
+sequenceDiagram
+    participant G as grain
+    participant S as ksmbd
+    Note over G,S: raw TCP connect :445 (no NEGOTIATE)
+    G->>S: SESSION_SETUP(0x01) first, fuzzed blob (≤100B)
+    S-->>G: reply (read)
+    Note over G,S: socket closed (conn dropped)
+    Note over G,S: walk df_buf → fb() (coverage feed)
+```
+
+#### 0x02 LOGOFF
+
+#### 50. `logoff`
+_Fuzzes SMB2 LOGOFF (0x02) optional SessionId + Reserved on the pool connection then forces re-auth — session-object lifetime / teardown UAF bug class._
+
+```mermaid
+sequenceDiagram
+    participant G as grain
+    participant S as ksmbd
+    G->>S: CREATE (pool fid) preamble
+    S-->>G: fid
+    Note over G: reconnect on failure
+    G->>S: LOGOFF 0x02 (optional fuzzed SessionId, Reserved fuzzed)
+    Note over G: drop socket + clear sid/tid/fid — re-auth next grain
+    Note over G,S: walk df_buf → fb() (coverage feed)
+```
+
+#### 51. `logoff_inflight`
+
+_Fires a blocking SMB2 LOCK (no FAIL_IMMEDIATELY) then a LOGOFF while the lock is still inflight to race session teardown against a pending blocking wait._
+
+```mermaid
+sequenceDiagram
+    participant G as grain
+    participant S as ksmbd
+    Note over G,S: pool_ensure_fid("logoff_v") → CREATE if no fid
+    G->>S: LOCK (0x0A) SHARED blocking, fuzzed offset/len (send_only, no wait)
+    G->>S: LOGOFF (0x02) while lock inflight
     S-->>G: reply
-    G->>S: QUERY_INFO(0x10) FILE / FileAttributeTagInformation(35) (fid)
-    S-->>G: reply
+    Note over G,S: session torn down → pool_reconnect() restore
+    Note over G,S: walk df_buf → fb() (coverage feed)
+```
+
+#### 52. `logoff_reuse_sid`
+_LOGOFF then ECHO reusing the just-freed SessionId (or a fuzzed one) to probe session-teardown UAF/stale-SID handling._
+
+```mermaid
+sequenceDiagram
+    participant G as grain
+    participant S as ksmbd
+    G->>S: LOGOFF (0x02, pool session)
+    S-->>G: logoff reply
+    G->>S: ECHO (0x0D, SessionId = stale sid or fuzzed)
+    S-->>G: echo reply
+    Note over G,S: reconnect pool (sid=0)
+    Note over G,S: walk df_buf → fb() (coverage feed)
+```
+
+#### 0x00 NEGOTIATE
+
+#### 53. `negotiate`
+_Fires a raw SMB2 NEGOTIATE (dialect 0x0311) with fuzzed negotiate contexts, no session; context-parsing bug class._
+
+```mermaid
+sequenceDiagram
+    participant G as grain
+    participant S as ksmbd
+    G->>S: TCP connect :445
+    G->>S: NEGOTIATE (0x00) dialect 0x0311 + fuzzed contexts
+    Note over G: reads response, discarded
+    Note over G,S: walk df_buf → fb() (coverage feed)
+```
+
+#### 54. `negotiate_ctx_multi`
+
+_Throwaway-socket NEGOTIATE with NegotiateContextCount 2-6 and N fuzzed contexts — deassemble_neg_contexts() array-walk + 2nd..Nth sub-decoders (preauth/compress/encrypt)._
+
+```mermaid
+sequenceDiagram
+    participant G as grain
+    participant S as ksmbd
+    Note over G: throwaway socket connect :445 (does NOT touch pool)
+    Note over G: NEGOTIATE dialect 3.1.1, NegotiateContextCount 2-6
+    loop 2-6 contexts (NegotiateContextCount)
+        Note over G: ContextType from preauth/enc/compress/netname/signing/posix / fuzzed DataLength + counts/salts/algs
+    end
+    G->>S: NEGOTIATE (0x00) multi-context (send + read, throwaway conn)
+    S-->>G: response (read into df_buf)
+    Note over G,S: walk df_buf → fb() (coverage feed)
+```
+
+#### 55. `negotiate_dialects`
+
+_Fuzzes NEGOTIATE DialectCount 2-31 plus a mixed real/fuzzed dialect array to exercise smb2_handle_negotiate's dialect-selection loop; throwaway socket._
+
+```mermaid
+sequenceDiagram
+    participant G as grain
+    participant S as ksmbd
+    Note over G: fresh TCP socket to :445, DialectCount 2-31, mixed real/fuzzed dialects
+    G->>S: NEGOTIATE (0x00) (raw write, read reply)
+    S-->>G: reply (discarded)
+    Note over G,S: walk df_buf → fb() (coverage feed)
+```
+
+#### 56. `negotiate_signing_ctx`
+_Fresh-socket NEGOTIATE with an SMB2_SIGNING_CAPABILITIES context whose SigningAlgorithmCount + algorithm array are fuzzed (count vs. array length mismatch) — negotiate context parser._
+
+```mermaid
+sequenceDiagram
+    participant G as grain
+    participant S as ksmbd
+    Note over G,S: raw connect :445 (own socket, no pool)
+    G->>S: NEGOTIATE (SMB2_SIGNING_CAPABILITIES ctx, SigningAlgorithmCount + fuzzed algo[] loop)
+    S-->>G: NEGOTIATE resp (read into resp)
+    Note over G,S: walk df_buf → fb() (coverage feed)
+```
+
+#### 57. `conn_negotiate_twice`
+_Raw socket sends NEGOTIATE twice (2nd dialect fuzzed) on one connection — double-negotiate state-machine bug class._
+
+```mermaid
+sequenceDiagram
+    participant G as grain
+    participant S as ksmbd
+    Note over G,S: raw TCP connect :445
+    loop 2× (1st dialect 0x0311, 2nd fuzzed)
+        G->>S: NEGOTIATE(0x00) re-negotiate on same conn
+        S-->>G: reply (read)
+    end
+    Note over G,S: socket closed (conn dropped)
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
@@ -1057,7 +1066,7 @@ sequenceDiagram
 
 See §9 for the shared archetypes and reading guide.
 
-#### 4. `copychunk`
+#### 58. `copychunk`
 _Fuzzes FSCTL_SRV_COPYCHUNK_WRITE chunk src/dst offsets + length across a real ResumeKey; copy-range bounds/overflow bug class._
 
 ```mermaid
@@ -1076,7 +1085,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 6. `compress`
+#### 59. `compress`
 _Fires a raw SMB2 Compression Transform PDU (fuzzed algo + OriginalSize) with no session; decompressor bounds bug class._
 
 ```mermaid
@@ -1089,7 +1098,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 7. `reparse`
+#### 60. `reparse`
 _Fuzzes FSCTL_SET_REPARSE_POINT tag + data (symlink/junction injection); path-traversal bug class._
 
 ```mermaid
@@ -1103,7 +1112,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 9. `ndr`
+#### 61. `ndr`
 _Opens the srvsvc pipe on IPC$ and sprays malformed DCE/RPC via FSCTL_PIPE_TRANSCEIVE; NDR/RPC decoder bug class._
 
 ```mermaid
@@ -1115,11 +1124,11 @@ sequenceDiagram
     S-->>G: ipc_tid
     G->>P: CREATE \srvsvc (0x05)
     P-->>G: pipe_fid
-    G->>P: IOCTL FSCTL_PIPE_TRANSCEIVE (0x0B) — fuzzed DCE/RPC (&le;800B)
+    G->>P: IOCTL FSCTL_PIPE_TRANSCEIVE (0x0B) — fuzzed DCE/RPC (≤800B)
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 16. `pipe`
+#### 62. `pipe`
 _CREATEs an unknown/garbage pipe name on IPC$; pipe-name dispatch / lookup bug class._
 
 ```mermaid
@@ -1129,11 +1138,11 @@ sequenceDiagram
     participant P as IPC$ pipe
     G->>S: TREE_CONNECT \\IPC$ (0x03)
     S-->>G: ipc_tid
-    G->>P: CREATE (0x05) — fuzzed pipe name (&le;200B)
+    G->>P: CREATE (0x05) — fuzzed pipe name (≤200B)
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 37. `fsctl_zero`
+#### 63. `fsctl_zero`
 _IOCTL FSCTL_SET_ZERO_DATA on the pool fid with a fuzzed FileOffset/BeyondFinalZero range — integer/range validation & sparse-punch bug class._
 
 ```mermaid
@@ -1147,7 +1156,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 38. `fsctl_dupext`
+#### 64. `fsctl_dupext`
 _IOCTL FSCTL_DUPLICATE_EXTENTS_TO_FILE (source = self fid) with fuzzed offsets and ByteCount — extent-clone bounds/overlap bug class._
 
 ```mermaid
@@ -1161,7 +1170,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 48. `fsctl_sparse`
+#### 65. `fsctl_sparse`
 _IOCTL FSCTL_SET_SPARSE on the pool fid with a fuzzed on/off flag — sparse-attribute toggle bug class._
 
 ```mermaid
@@ -1175,7 +1184,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 49. `fsctl_qar`
+#### 66. `fsctl_qar`
 _IOCTL FSCTL_QUERY_ALLOCATED_RANGES on the pool fid with a fuzzed Offset/Length range — range-query bounds bug class._
 
 ```mermaid
@@ -1189,7 +1198,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 50. `fsctl_setcomp`
+#### 67. `fsctl_setcomp`
 _IOCTL FSCTL_SET_COMPRESSION on the pool fid with a fuzzed compression state — compression-attribute handler bug class._
 
 ```mermaid
@@ -1203,7 +1212,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 51. `fsctl_objid`
+#### 68. `fsctl_objid`
 _IOCTL FSCTL_CREATE_OR_GET_OBJECT_ID on the pool fid with no input — object-id handler bug class._
 
 ```mermaid
@@ -1217,7 +1226,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 52. `fsctl_valneg`
+#### 69. `fsctl_valneg`
 _Session-level IOCTL FSCTL_VALIDATE_NEGOTIATE_INFO (all-0xFF fid) with fuzzed input — negotiate-validation downgrade bug class._
 
 ```mermaid
@@ -1228,7 +1237,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 53. `fsctl_dfs`
+#### 70. `fsctl_dfs`
 _Session-level IOCTL FSCTL_DFS_GET_REFERRALS (all-0xFF fid) with a fuzzed MaxReferralLevel and UTF-16 path — DFS referral path-parse bug class._
 
 ```mermaid
@@ -1239,7 +1248,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 54. `fsctl_netif`
+#### 71. `fsctl_netif`
 _Session-level IOCTL FSCTL_QUERY_NETWORK_INTERFACE_INFO (all-0xFF fid) with no input — network-interface enumeration handler bug class._
 
 ```mermaid
@@ -1250,7 +1259,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 79. `offload_write`
+#### 72. `offload_write`
 
 _Fuzzes FSCTL_OFFLOAD_WRITE (0x00098268) token-based server-side copy write side (up to 64 bytes input)._
 
@@ -1264,7 +1273,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 80. `offload_read`
+#### 73. `offload_read`
 
 _Fuzzes FSCTL_OFFLOAD_READ (0x00094264) offload-read token (up to 32 bytes input)._
 
@@ -1278,7 +1287,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 81. `del_reparse`
+#### 74. `del_reparse`
 
 _Fuzzes FSCTL_DELETE_REPARSE_POINT (0x000900AC) reparse-point removal write side (up to 24 bytes input)._
 
@@ -1292,7 +1301,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 83. `copychunk_write`
+#### 75. `copychunk_write`
 
 _Fuzzes FSCTL_SRV_COPYCHUNK_WRITE (0x001480F2) with fuzzed SourceKey/ChunkCount/SourceOffset/TargetOffset/Length → server-side copy write variant._
 
@@ -1306,7 +1315,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 84. `resume_key`
+#### 76. `resume_key`
 
 _Drives FSCTL_SRV_REQUEST_RESUME_KEY (0x00140078) with empty input → resume-key generation path._
 
@@ -1320,7 +1329,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 85. `fsctl_dfs_ex`
+#### 77. `fsctl_dfs_ex`
 
 _Fuzzes FSCTL_DFS_GET_REFERRALS_EX (0x000601B0) at session level (all-0xFF fid, no file) with up to 64 fuzzed bytes → DFS referral parser._
 
@@ -1333,7 +1342,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 86. `get_reparse`
+#### 78. `get_reparse`
 
 _Drives FSCTL_GET_REPARSE_POINT (0x000900A8) with empty input → reparse-point read path._
 
@@ -1347,7 +1356,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 87. `get_compression`
+#### 79. `get_compression`
 
 _Drives FSCTL_GET_COMPRESSION (0x0009003C) with empty input → compression-attribute read path._
 
@@ -1361,7 +1370,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 88. `fsctl_sweep`
+#### 80. `fsctl_sweep`
 
 _Sweeps ANY FSCTL control code (fuzzed 4-byte ctl, including unimplemented) → default/reject dispatch paths (unexpected-op robustness)._
 
@@ -1377,7 +1386,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 93. `rpc_opnum`
+#### 81. `rpc_opnum`
 
 _DCE/RPC REQUEST over the IPC$ \srvsvc pipe with a fuzzed opnum + stub — ksmbd's RPC decoder / per-opnum dispatch (srvsvc/wkssvc/samr)._
 
@@ -1396,7 +1405,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 96. `set_integrity`
+#### 82. `set_integrity`
 
 _FSCTL_SET_INTEGRITY_INFORMATION via IOCTL with a fuzzed &le;16-byte input — integrity-info write path._
 
@@ -1411,7 +1420,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 108. `copychunk_multi`
+#### 83. `copychunk_multi`
 
 _FSCTL_SRV_COPYCHUNK with ChunkCount 2-8 and independently-fuzzed per-chunk Source/TargetOffset+Length after fetching a real ResumeKey — fsctl_copychunk() chunk-array walk / copy-range bounds._
 
@@ -1428,14 +1437,14 @@ sequenceDiagram
     G->>S: IOCTL (0x0B) FSCTL_SRV_REQUEST_RESUME_KEY (0x00140078)
     S-->>G: 24-byte ResumeKey
     loop 2-8 chunks (ChunkCount)
-        Note over G: srv_copychunk[i] — fuzzed SourceOffset/TargetOffset/Length<br/>(overlap/backward/huge)
+        Note over G: srv_copychunk[i] — fuzzed SourceOffset/TargetOffset/Length / (overlap/backward/huge)
     end
     G->>S: IOCTL (0x0B) FSCTL_SRV_COPYCHUNK (0x001440F2), ChunkCount 2-8
     S-->>G: status
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 112. `reparse_symlink`
+#### 84. `reparse_symlink`
 
 _Fuzzes FSCTL_SET_REPARSE_POINT symlink REPARSE_DATA_BUFFER (SubstituteName/PrintName Offset+Length) to stress parse_reparse_symlink bounds._
 
@@ -1450,7 +1459,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 113. `dfs_referral_ex`
+#### 85. `dfs_referral_ex`
 
 _Fuzzes FSCTL_DFS_GET_REFERRALS_EX structured request (MaxReferralLevel/RequestFlags/RequestDataLength/FileNameLength) in the DFS referral handler (no fid)._
 
@@ -1464,7 +1473,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 120. `ioctl_inout_overlap`
+#### 86. `ioctl_inout_overlap`
 
 _Fuzzes IOCTL input/output offset+count fields (InputOffset/Count, OutputOffset/Count, MaxOutputResponse) so in/out regions overlap or exceed the PDU._
 
@@ -1479,7 +1488,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 141. `pipe_transceive_bind`
+#### 87. `pipe_transceive_bind`
 _DCE/RPC BIND PDU (fuzzed frag_length / max_xmit_frag / num_ctx_items) sent over the \srvsvc IPC$ pipe via FSCTL_PIPE_TRANSCEIVE — RPC bind parser._
 
 ```mermaid
@@ -1497,7 +1506,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 142. `set_integrity_deep`
+#### 88. `set_integrity_deep`
 _IOCTL FSCTL_SET_INTEGRITY_INFORMATION on the pool fid with fuzzed ChecksumAlgorithm/Flags — integrity-info handler._
 
 ```mermaid
@@ -1511,7 +1520,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 145. `fsctl_reparse_get_chain`
+#### 89. `fsctl_reparse_get_chain`
 _IOCTL FSCTL_SET_REPARSE_POINT then FSCTL_GET_REPARSE_POINT with a fuzzed MaxOutputResponse — reparse-buffer chain / output-length overflow._
 
 ```mermaid
@@ -1524,7 +1533,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 175. `fsctl_set_object_id`
+#### 90. `fsctl_set_object_id`
 _IOCTL FSCTL_SET_OBJECT_ID (0x00090098) with a 64-byte fuzzed object-id body on the pool fid._
 
 ```mermaid
@@ -1537,7 +1546,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 176. `fsctl_lmr_set_link`
+#### 91. `fsctl_lmr_set_link`
 _IOCTL LMR_SET_LINK_TRACKING_INFORMATION (0x001400EC) with fuzzed type/name fields on the pool fid._
 
 ```mermaid
@@ -1550,7 +1559,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 177. `fsctl_query_file_regions`
+#### 92. `fsctl_query_file_regions`
 _IOCTL FSCTL_QUERY_FILE_REGIONS (0x00090284) with fuzzed offset/length in a 20-byte body._
 
 ```mermaid
@@ -1563,7 +1572,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 178. `fsctl_duplicate_extents_v2`
+#### 93. `fsctl_duplicate_extents_v2`
 _IOCTL DUPLICATE_EXTENTS_TO_FILE_EX (0x000983E8) with the pool fid as source and fuzzed src/target/byte-count offsets._
 
 ```mermaid
@@ -1576,7 +1585,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 179. `fsctl_offload_read_token`
+#### 94. `fsctl_offload_read_token`
 _IOCTL OFFLOAD_READ to mint a copy token, then OFFLOAD_WRITE feeding that token back (optionally corrupted) to attack token validation/UAF._
 
 ```mermaid
@@ -1586,13 +1595,13 @@ sequenceDiagram
     Note over G,S: pool_ensure_fid → CREATE if needed
     G->>S: IOCTL (0x0B, FSCTL_OFFLOAD_READ 0x00094264)
     S-->>G: reply (extract 512B token)
-    Note over G,S: build OFFLOAD_WRITE window; maybe corrupt token
+    Note over G,S: build OFFLOAD_WRITE window, maybe corrupt token
     G->>S: IOCTL (0x0B, FSCTL_OFFLOAD_WRITE 0x00098268, token + 544B window)
     S-->>G: ioctl reply
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 197. `copychunk_self`
+#### 95. `copychunk_self`
 _IOCTL FSCTL_SRV_REQUEST_RESUME_KEY then FSCTL_SRV_COPYCHUNK with target == source fid and fuzzed overlapping chunk ranges — self-copy / overlapping-range copychunk._
 
 ```mermaid
@@ -1632,7 +1641,7 @@ sequenceDiagram
 
 See §9 for the shared archetypes and reading guide.
 
-#### 2. `truncate`
+#### 96. `truncate`
 _Fuzzes SMB2 SET_INFO EndOfFile size (smbc_ftruncate); file-size / allocation bug class._
 
 ```mermaid
@@ -1643,18 +1652,18 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 3. `setxattr`
+#### 97. `setxattr`
 _Fuzzes SMB2 SET_INFO EA value on name user.grain (smbc_fsetxattr); xattr/EA parsing bug class._
 
 ```mermaid
 sequenceDiagram
     participant G as grain
     participant S as ksmbd
-    G->>S: SET_INFO (0x11) EA "user.grain" — fuzzed value (&le;256B)
+    G->>S: SET_INFO (0x11) EA "user.grain" — fuzzed value (≤256B)
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 19. `setattr`
+#### 98. `setattr`
 _Fuzzes SMB2 SET_INFO FileBasicInformation on `fuzz_target` (mode + atime/mtime via libsmbclient chmod/utimes) — metadata / attribute-write surface._
 
 ```mermaid
@@ -1667,7 +1676,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 20. `rename`
+#### 99. `rename`
 _Fuzzes the SMB2 SET_INFO FileRenameInformation destination name component on `rename_v` — path-traversal / unicode / casing bug class._
 
 ```mermaid
@@ -1682,7 +1691,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 21. `secdesc`
+#### `secdesc` — suppressed (not in GRAINS[]; no registry index, see §8)
 _Fuzzes SMB2 SET_INFO FileSecurityInformation (owner RID, access mask, ACE type/flags) on `aclshare/acl_victim` — ACL / security-descriptor write; NOTE: this grain is SUPPRESSED in the registry._
 
 ```mermaid
@@ -1696,7 +1705,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 22. `dosattr`
+#### 100. `dosattr`
 _Fuzzes the SMB2 SET_INFO DOS-attribute xattr `system.dos_attr.mode` bits on `fuzz_target` — xattr-backed metadata write._
 
 ```mermaid
@@ -1707,7 +1716,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 23. `unlink`
+#### 101. `unlink`
 _Exercises the SMB2 set-disposition + unlink path on `unlink_v` — namespace delete / lifetime bug class._
 
 ```mermaid
@@ -1721,7 +1730,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 24. `mkrmdir`
+#### 102. `mkrmdir`
 _Fuzzes the directory-name component of a CREATE(dir) then RMDIR on `mkd_<name>` — path-resolution / dir create-remove bug class._
 
 ```mermaid
@@ -1734,7 +1743,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 25. `rmxattr`
+#### 103. `rmxattr`
 _Fuzzes the SMB2 SET_INFO EA add (`user.rmv` value bytes) then remove on the open `g_smb_fd` — extended-attribute add/remove surface._
 
 ```mermaid
@@ -1746,7 +1755,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 39. `set_alloc`
+#### 104. `set_alloc`
 _SET_INFO FILE_ALLOCATION_INFORMATION on the pool fid with a fuzzed AllocationSize — size/allocation integer-overflow bug class._
 
 ```mermaid
@@ -1760,7 +1769,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 40. `hardlink`
+#### 105. `hardlink`
 _SET_INFO FILE_LINK_INFORMATION creating a hardlink to a fuzzed target name with fuzzed ReplaceIfExists — path-parse/link bug class._
 
 ```mermaid
@@ -1774,7 +1783,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 73. `set_valid_data`
+#### 106. `set_valid_data`
 
 _Fuzzes SET_INFO FILE_VALID_DATA_LENGTH (class 39) with an 8-byte length → write-side valid-data-length metadata handler._
 
@@ -1788,7 +1797,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 74. `set_eof`
+#### 107. `set_eof`
 
 _Fuzzes SET_INFO FILE_END_OF_FILE (class 20) via raw PDU with an 8-byte EOF → file-size/truncate handler._
 
@@ -1802,7 +1811,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 75. `set_position`
+#### 108. `set_position`
 
 _Fuzzes SET_INFO FILE_POSITION (class 14) with an 8-byte current byte offset._
 
@@ -1816,7 +1825,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 76. `set_mode`
+#### 109. `set_mode`
 
 _Fuzzes SET_INFO FILE_MODE (class 16) with a 4-byte mode flag word (write-through/no-buffering/delete)._
 
@@ -1830,7 +1839,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 77. `set_disposition`
+#### 110. `set_disposition`
 
 _Fuzzes SET_INFO FILE_DISPOSITION (class 13) with a 1-byte delete-pending flag._
 
@@ -1844,7 +1853,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 78. `set_full_ea`
+#### 111. `set_full_ea`
 
 _Fuzzes SET_INFO FILE_FULL_EA (class 15) with a crafted EA entry list (NextEntryOffset/Flags/EaNameLength/EaValueLength + name + value) → raw EA parser._
 
@@ -1858,7 +1867,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 82. `set_secinfo`
+#### 112. `set_secinfo`
 
 _Fuzzes SET_INFO InfoType=SECURITY (0x03) with a fuzzed AdditionalInformation + security descriptor (Revision/Control/ACL) → write-side ACL / SD parser (smb2_set_info_sec)._
 
@@ -1872,7 +1881,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 89. `setinfo_sweep`
+#### 113. `setinfo_sweep`
 
 _Sweeps ANY FILE info class (fuzzed 1-byte class, including unimplemented) via SET_INFO → default/reject info-class dispatch paths._
 
@@ -1888,7 +1897,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 91. `dacl_deep`
+#### 114. `dacl_deep`
 
 _SET_INFO SECURITY on a pool fid with a deeply-nested DACL (2-4 ACEs, each 1-4 subauthorities) — SD/ACL parser bounds &amp; ACE-size overflow._
 
@@ -1898,13 +1907,13 @@ sequenceDiagram
     participant S as ksmbd
     G->>S: CREATE (0x05) ensure pool fid "dacl_v"
     S-->>G: fid
-    Note over G: build SD, DACL AclRevision=2, AceCount 2-4<br/>each ACE fuzzed Type/Flags/Mask + 1-4 SID subauthorities
+    Note over G: build SD, DACL AclRevision=2, AceCount 2-4 / each ACE fuzzed Type/Flags/Mask + 1-4 SID subauthorities
     G->>S: SET_INFO (0x11) InfoType=SECURITY, DACL_SECURITY_INFORMATION
     S-->>G: status
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 100. `set_ea_chain`
+#### 115. `set_ea_chain`
 
 _SET_INFO FILE_FULL_EA_INFORMATION with 2-4 chained EA entries whose NextEntryOffset is fuzzed to overlap/underflow — smb2_set_ea() do/while chain-walk bounds._
 
@@ -1915,14 +1924,14 @@ sequenceDiagram
     G->>S: CREATE (0x05) ensure fid "si_v"
     S-->>G: fid
     loop 2-4 entries (linked by NextEntryOffset)
-        Note over G: build FILE_FULL_EA entry — fuzzed Flags/NameLen/ValueLen<br/>NextEntryOffset = natural link OR fuzzed overlap/underflow
+        Note over G: build FILE_FULL_EA entry — fuzzed Flags/NameLen/ValueLen / NextEntryOffset = natural link OR fuzzed overlap/underflow
     end
     G->>S: SET_INFO (0x11) FILE_FULL_EA_INFORMATION (class 15), chained EA list
     S-->>G: status
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 103. `ndr_xattr`
+#### 116. `ndr_xattr`
 
 _Write then read-back a self-relative security descriptor — SET_INFO SECURITY stores it as the security.NTACL xattr (ndr_encode_v4_ntacl); QUERY_INFO SECURITY runs ndr_decode_v4_ntacl on the stored blob (size math / bounds)._
 
@@ -1940,7 +1949,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 119. `set_ea_private`
+#### 117. `set_ea_private`
 
 _Fuzzes SET_INFO FILE_FULL_EA_INFORMATION with a privileged/reserved EA name (security.NTACL, DOSATTRIB, $DATA…) and fuzzed value to hit EA write handlers._
 
@@ -1955,7 +1964,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 121. `sd_owner_group`
+#### 118. `sd_owner_group`
 
 _Fuzzes SET_INFO OWNER|GROUP security-descriptor (OffsetOwner/OffsetGroup + owner SID) to stress SD parse/apply bounds._
 
@@ -1970,7 +1979,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 122. `sd_sacl`
+#### 119. `sd_sacl`
 
 _Fuzzes SET_INFO SACL security-descriptor with a variable SYSTEM_AUDIT_ACE array to stress SACL/ACE list parsing._
 
@@ -1987,7 +1996,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 140. `rename_target_edge`
+#### 120. `rename_target_edge`
 _SET_INFO FILE_RENAME_INFORMATION with fuzzed RootDirectory, edge target name (`..\`, `:s`), and possibly mismatched FileNameLength — rename target validation._
 
 ```mermaid
@@ -2001,7 +2010,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 147. `set_link_root`
+#### 121. `set_link_root`
 _SET_INFO FILE_LINK_INFORMATION with fuzzed RootDirectory handle and oversized FileNameLength — link-name / root-dir validation._
 
 ```mermaid
@@ -2013,7 +2022,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 167. `set_basic_time_edge`
+#### 122. `set_basic_time_edge`
 _SET_INFO FILE_BASIC_INFORMATION with edge-value timestamps (0, INT64_MAX, sign-bit) to stress ksmbd_NTtimeToUnix conversion._
 
 ```mermaid
@@ -2026,7 +2035,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 169. `set_pipe_info`
+#### 123. `set_pipe_info`
 _Opens the srvsvc named pipe over IPC$, then SET_INFO FILE_PIPE_INFORMATION with fuzzed fields to exercise the RPC-pipe metadata path._
 
 ```mermaid
@@ -2043,7 +2052,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 191. `xattr_name_max`
+#### 124. `xattr_name_max`
 _SET_INFO FILE_FULL_EA_INFORMATION (class 15) with EaNameLength driven to the XATTR_NAME_MAX (250-253) boundary — extended-attribute name-length bound._
 
 ```mermaid
@@ -2055,7 +2064,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 194. `stream_delete`
+#### 125. `stream_delete`
 _CREATE of an alternate data stream "sd_f:strm:$DATA", then SET_INFO FILE_DISPOSITION_INFORMATION (class 13) delete-on-close — stream deletion path._
 
 ```mermaid
@@ -2068,7 +2077,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 195. `hardlink_cross_share`
+#### 126. `hardlink_cross_share`
 _SET_INFO FILE_LINK_INFORMATION (class 11) whose target path (..\..\etc\x, \\other\y, ...) escapes the share — hardlink path-traversal check._
 
 ```mermaid
@@ -2080,7 +2089,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 200. `set_eof_shrink_race`
+#### 127. `set_eof_shrink_race`
 _WRITE then shrink FileEndOfFileInformation via SET_INFO then READ past the new EOF — end-of-file truncation vs stale read bug class._
 
 ```mermaid
@@ -2097,7 +2106,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 203. `set_rename_stream`
+#### 128. `set_rename_stream`
 _SET_INFO FileRenameInformation targeting an ADS stream name (:newstream:$DATA) — rename-to-stream parsing bug class._
 
 ```mermaid
@@ -2110,7 +2119,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 205. `set_disposition_dir`
+#### 129. `set_disposition_dir`
 _CREATE a directory then SET_INFO FileDispositionInformation with DeletePending set on a non-empty dir — delete-pending disposition bug class._
 
 ```mermaid
@@ -2146,18 +2155,18 @@ sequenceDiagram
 
 See §9 for the shared archetypes and reading guide.
 
-#### 8. `unicode`
+#### 130. `unicode`
 _Fuzzes the SMB2 CREATE filename with extreme UTF-16 paths; unicode/path-resolution bug class._
 
 ```mermaid
 sequenceDiagram
     participant G as grain
     participant S as ksmbd
-    G->>S: CREATE (0x05) — fuzzed UTF-16 filename (&le;3000B)
+    G->>S: CREATE (0x05) — fuzzed UTF-16 filename (≤3000B)
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 11. `lease`
+#### 131. `lease`
 _Races a lease-break: conn0 CREATE with RqLs (fuzzed LeaseKey + LeaseState), conn1 CREATE same file, disconnect during break; opinfo UAF bug class._
 
 ```mermaid
@@ -2172,7 +2181,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 12. `durable`
+#### 132. `durable`
 _Grabs a durable handle (DH2Q), simulates client crash, then reconnects it (DH2C); durable-handle reclaim / stale-fp bug class._
 
 ```mermaid
@@ -2187,7 +2196,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 42. `create_ea`
+#### 133. `create_ea`
 _CREATE carrying an ExtA (FILE_FULL_EA_INFO) create-context with fuzzed bytes — EA-context parser bug class._
 
 ```mermaid
@@ -2199,7 +2208,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 43. `create_sd`
+#### 134. `create_sd`
 _CREATE carrying a SecD (security descriptor) create-context with raw fuzzed SD bytes — NDR/SD parser bug class._
 
 ```mermaid
@@ -2211,7 +2220,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 44. `create_mxac`
+#### 135. `create_mxac`
 _CREATE carrying an MxAc (query maximal access) create-context with fuzzed bytes — maximal-access context handler bug class._
 
 ```mermaid
@@ -2223,7 +2232,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 45. `create_alsi`
+#### 136. `create_alsi`
 _CREATE carrying an AlSi (allocation size) create-context with a fuzzed 8-byte size — allocation-size context integer bug class._
 
 ```mermaid
@@ -2235,7 +2244,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 46. `create_qfid`
+#### 137. `create_qfid`
 _CREATE carrying a QFid (query on-disk id) create-context with no data — on-disk-id context handler bug class._
 
 ```mermaid
@@ -2247,7 +2256,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 47. `create_posix`
+#### 138. `create_posix`
 _CREATE carrying the POSIX extension create-context (16-byte GUID tag) with a fuzzed mode — POSIX-extension context parser bug class._
 
 ```mermaid
@@ -2259,7 +2268,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 56. `create_aapl`
+#### 139. `create_aapl`
 _CREATE carrying an "AAPL" (Apple SMB extension) create context with fuzzed context data → ksmbd AAPL context parser._
 
 ```mermaid
@@ -2272,7 +2281,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 57. `create_appinst`
+#### 140. `create_appinst`
 _CREATE with an APP_INSTANCE_ID (fixed 16-byte GUID tag) create context and up-to-20 fuzzed bytes → app-instance-id context handling._
 
 ```mermaid
@@ -2285,7 +2294,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 58. `create_dh2`
+#### 141. `create_dh2`
 _CREATE with a "DH2Q" durable-handle-v2 request context; fuzzes Timeout, persistent Flags and the 16-byte CreateGuid → durable-v2 grant path._
 
 ```mermaid
@@ -2298,7 +2307,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 107. `create_ctx_chain`
+#### 142. `create_ctx_chain`
 
 _A CREATE carrying 2-4 create contexts linked by fuzzed Next offsets — smb2_open()/smb2_find_context_vals create-context array walk (overlap/underflow Next)._
 
@@ -2306,16 +2315,16 @@ _A CREATE carrying 2-4 create contexts linked by fuzzed Next offsets — smb2_op
 sequenceDiagram
     participant G as grain
     participant S as ksmbd
-    Note over G: pool_lazy(1); CREATE name "cc_chain"
+    Note over G: pool_lazy(1), CREATE name "cc_chain"
     loop 2-4 contexts (linked by Next)
-        Note over G: tag from ExtA/MxAc/QFid/AlSi/SecD/RqLs<br/>fuzzed DataLength; Next = natural link OR fuzzed overlap/underflow
+        Note over G: tag from ExtA/MxAc/QFid/AlSi/SecD/RqLs / fuzzed DataLength, Next = natural link OR fuzzed overlap/underflow
     end
     G->>S: CREATE (0x05) with chained create-context array
     S-->>G: fid / status
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 116. `create_dh2q_internals`
+#### 143. `create_dh2q_internals`
 
 _Fuzzes CREATE durable-handle DH2Q context (Timeout/Flags/CreateGuid) then a DH2C reconnect matching the guid to exercise durable-handle grant/reconnect internals._
 
@@ -2330,7 +2339,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 137. `create_path_traversal`
+#### 144. `create_path_traversal`
 _CREATE whose UTF-16 name is assembled from traversal segments (`..\`, `\\`, `:`, `.\`) — path-traversal / name canonicalization._
 
 ```mermaid
@@ -2343,7 +2352,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 138. `stream_name_edge`
+#### 145. `stream_name_edge`
 _CREATE carrying malformed NTFS ADS stream names (`f::$DATA`, `f:s:$BAD`, `:s:$DATA`) — stream-name parser edges._
 
 ```mermaid
@@ -2356,7 +2365,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 139. `unicode_surrogate`
+#### 146. `unicode_surrogate`
 _CREATE with a UTF-16 name of lone high/low surrogates and combining marks — Unicode conversion edges._
 
 ```mermaid
@@ -2369,7 +2378,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 148. `create_ctx_dup`
+#### 147. `create_ctx_dup`
 _CREATE carrying multiple duplicate create-contexts of one tag (MxAc/QFid/AlSi/SecD) — duplicate create-context handling._
 
 ```mermaid
@@ -2384,7 +2393,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 149. `create_ctx_giant_data`
+#### 148. `create_ctx_giant_data`
 _CREATE with an "ExtA" create-context whose DataLength is huge versus only 8 real bytes — context length overflow._
 
 ```mermaid
@@ -2396,7 +2405,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 150. `create_twrp`
+#### 149. `create_twrp`
 _CREATE with a TWrp (timewarp/snapshot) create-context carrying a fuzzed FILETIME timestamp — timewarp token parsing._
 
 ```mermaid
@@ -2408,7 +2417,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 151. `create_alloc_vs_eof`
+#### 150. `create_alloc_vs_eof`
 _CREATE with an AlSi (AllocationSize) context, then SET_INFO end-of-file — allocation-vs-EOF size conflict._
 
 ```mermaid
@@ -2422,7 +2431,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 152. `create_disposition_matrix`
+#### 151. `create_disposition_matrix`
 _CREATE with a fuzzed CreateDisposition (0-5) and CreateOptions bitmask — disposition/options combination handling._
 
 ```mermaid
@@ -2434,7 +2443,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 153. `create_impersonation`
+#### 152. `create_impersonation`
 _CREATE with fuzzed SecurityFlags, RequestedOplockLevel and ImpersonationLevel (0-3) — impersonation/oplock field validation._
 
 ```mermaid
@@ -2446,7 +2455,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 192. `filename_null_embed`
+#### 153. `filename_null_embed`
 _CREATE whose UTF-16 filename has embedded NUL code units scattered through it — name-parsing/length-vs-terminator handling._
 
 ```mermaid
@@ -2457,7 +2466,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 193. `filename_max_path`
+#### 154. `filename_max_path`
 _CREATE with a 200-256 char UTF-16 filename (backslash/slash/NUL scrubbed to 'x') — max-path-length name handling._
 
 ```mermaid
@@ -2496,7 +2505,7 @@ sequenceDiagram
 
 See §9 for the shared archetypes and reading guide.
 
-#### 13. `race`
+#### 155. `race`
 _Races SMB2 WRITE on fd1 against CLOSE+reopen of fd2 in parallel threads; conn->fp use-after-free bug class._
 
 ```mermaid
@@ -2515,7 +2524,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 14. `sequence`
+#### 156. `sequence`
 _Dispatches d[0] % 8 to one stateful multi-step scenario (write / lock / oplock / ioctl / query / lease / durable); state-machine ordering bug class._
 
 ```mermaid
@@ -2566,7 +2575,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 15. `compound`
+#### 157. `compound`
 _Fires the raw fuzzer bytes as a single pre-built SMB2 compound chain PDU; NextCommand chaining / related-op bug class._
 
 ```mermaid
@@ -2578,7 +2587,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 17. `rdma`
+#### 158. `rdma`
 _EXCL — attempts SMBDirect over RXE/SIW: RDMA CM connect then a fuzzed SMBDirect negotiate_req; transport-layer negotiate bug class._
 
 ```mermaid
@@ -2596,7 +2605,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 32. `get_quota`
+#### 159. `get_quota`
 _Fuzzes SMB2 QUERY_INFO (0x10) InfoType=QUOTA with a real SMB2_QUERY_QUOTA_INFO input (ReturnSingle/RestartScan/SidListLength/StartSidLength/StartSidOffset + fuzzed SID blob) — quota-parser walk bug class._
 
 ```mermaid
@@ -2610,7 +2619,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 62. `encrypt`
+#### 160. `encrypt`
 _SMB3 TRANSFORM_HEADER (0xFD'SMB') with fuzzed Signature/Nonce/OriginalMessageSize/Flags + "ciphertext" payload → ksmbd's smb3 decrypt/transform path._
 
 ```mermaid
@@ -2623,7 +2632,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 63. `session_bind`
+#### 161. `session_bind`
 _Multichannel SESSION_SETUP with SMB2_SESSION_FLAG_BINDING over a second channel (pfz_session_binding_race) → ksmbd channel-bind logic / binding-race deadlock edge._
 
 ```mermaid
@@ -2637,7 +2646,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 64. `lease_v2`
+#### 162. `lease_v2`
 _CREATE with an "RqLs" 52-byte lease-v2 context; fuzzes LeaseKey, LeaseState, LeaseFlags and Epoch → lease-v2 grant path._
 
 ```mermaid
@@ -2650,7 +2659,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 65. `dh2c`
+#### 163. `dh2c`
 _CREATE with a "DH2C" durable-v2 RECONNECT context; fuzzes FileId + CreateGuid + Flags → durable-handle reconnect path._
 
 ```mermaid
@@ -2663,7 +2672,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 66. `oplock_ack`
+#### 164. `oplock_ack`
 _OPLOCK_BREAK acknowledgement (0x12) with a fuzzed OplockLevel on the pool fid → oplock-break ack handling._
 
 ```mermaid
@@ -2676,7 +2685,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 90. `ipc`
+#### 165. `ipc`
 
 _EXCL: drives the SMBD_GENL generic-netlink channel (kernel↔ksmbd.mountd), sending a fuzzed *_RESPONSE event to handle_generic_event — not SMB-reachable._
 
@@ -2690,7 +2699,7 @@ sequenceDiagram
     Note over G,ipc: walk df_buf → fb() (coverage feed)
 ```
 
-#### 92. `sign`
+#### 166. `sign`
 
 _A SIGNED QUERY_DIRECTORY carrying a fuzzed 16-byte signature — exercises ksmbd's HMAC-SHA256 / AES-CMAC signature verification engine._
 
@@ -2698,13 +2707,13 @@ _A SIGNED QUERY_DIRECTORY carrying a fuzzed 16-byte signature — exercises ksmb
 sequenceDiagram
     participant G as grain
     participant S as ksmbd
-    Note over G: pool_lazy(1); set SMB2_FLAGS_SIGNED<br/>overwrite Signature[16] with fuzzed bytes
+    Note over G: pool_lazy(1), set SMB2_FLAGS_SIGNED / overwrite Signature[16] with fuzzed bytes
     G->>S: QUERY_DIRECTORY (0x0E) flags=SIGNED, fuzzed signature
     S-->>G: status (signature mismatch expected)
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 94. `compress_transform`
+#### 167. `compress_transform`
 
 _A raw 0xFC'SMB' COMPRESSION_TRANSFORM header with fuzzed OriginalSize/Algorithm/Flags/Offset + compressed payload — decompression-bomb / offset-length overflow in the decompress path._
 
@@ -2712,13 +2721,13 @@ _A raw 0xFC'SMB' COMPRESSION_TRANSFORM header with fuzzed OriginalSize/Algorithm
 sequenceDiagram
     participant G as grain
     participant S as ksmbd
-    Note over G: pool_lazy(1); craft 0xFC'SMB' transform<br/>fuzzed OriginalCompressedSegmentSize/Algorithm/Flags/Offset + payload
+    Note over G: pool_lazy(1), craft 0xFC'SMB' transform / fuzzed OriginalCompressedSegmentSize/Algorithm/Flags/Offset + payload
     G->>S: COMPRESSION_TRANSFORM (0xFC'SMB') fuzzed compressed segment
     S-->>G: status (may protocol-reject)
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 95. `shadow_copy`
+#### 168. `shadow_copy`
 
 _FSCTL_SRV_ENUMERATE_SNAPSHOTS (VSS) via IOCTL on a pool fid — snapshot-enumeration path._
 
@@ -2733,7 +2742,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 97. `pipe_wait`
+#### 169. `pipe_wait`
 
 _FSCTL_PIPE_WAIT via IOCTL (fid 0xFFFF, no file) with a fuzzed &le;64-byte body — named-pipe wait handler._
 
@@ -2747,7 +2756,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 98. `resiliency`
+#### 170. `resiliency`
 
 _FSCTL_LMR_REQUEST_RESILIENCY via IOCTL with a fuzzed Timeout — resiliency-request handler._
 
@@ -2763,7 +2772,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 99. `set_quota`
+#### 171. `set_quota`
 
 _SET_INFO InfoType=QUOTA with a fuzzed FILE_QUOTA_INFORMATION buffer — ksmbd quota-set handling._
 
@@ -2773,13 +2782,13 @@ sequenceDiagram
     participant S as ksmbd
     G->>S: CREATE (0x05) ensure pool fid "quota_v"
     S-->>G: fid
-    Note over G: fuzzed quota info (&ge;32 bytes)
+    Note over G: fuzzed quota info (≥32 bytes)
     G->>S: SET_INFO (0x11) InfoType=QUOTA, fuzzed FILE_QUOTA_INFORMATION
     S-->>G: status
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 102. `compound_chain`
+#### 172. `compound_chain`
 
 _Throwaway-socket compound of 2-4 sub-commands linked by fuzzed NextCommand with SMB2_FLAGS_RELATED_OPERATIONS + mid-chain SessionId/TreeId — __handle_ksmbd_work() do/while chaining loop._
 
@@ -2791,14 +2800,14 @@ sequenceDiagram
     G->>S: NEGOTIATE (0x00) minimal (give conn a dialect)
     S-->>G: response
     loop 2-4 sub-commands (linked by NextCommand)
-        Note over G: Command from ECHO/FLUSH/QDIR/TCON<br/>i&gt;0 sets RELATED_OPERATIONS + fuzzed TreeId/SessionId<br/>NextCommand = natural OR fuzzed overlap/short/unaligned
+        Note over G: Command from ECHO/FLUSH/QDIR/TCON / i›0 sets RELATED_OPERATIONS + fuzzed TreeId/SessionId / NextCommand = natural OR fuzzed overlap/short/unaligned
     end
     G->>S: compound request (send + read, throwaway conn)
     S-->>G: response (read into df_buf)
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 105. `transport_frame`
+#### 173. `transport_frame`
 
 _Throwaway-socket fuzz of the RFC1001/NetBIOS 4-byte session header (message-type + 24-bit length that may mismatch the payload) — ksmbd_tcp_readv read-assembly / length validation before any SMB parse._
 
@@ -2807,13 +2816,13 @@ sequenceDiagram
     participant G as grain
     participant S as ksmbd
     Note over G: throwaway socket connect :445
-    Note over G: hdr4 = fuzzed msg-type byte + 24-bit claimed length<br/>body = "\xfeSMB" + fuzzed bytes (length may != claim)
+    Note over G: hdr4 = fuzzed msg-type byte + 24-bit claimed length / body = "\xfeSMB" + fuzzed bytes (length may != claim)
     G->>S: RFC1001 header (4B) + body (send only)
     S-->>G: response (read into df_buf)
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 109. `quota_chain`
+#### 174. `quota_chain`
 
 _Fuzzes SMB2 QUERY_INFO InfoType=QUOTA's chained FILE_GET_QUOTA_INFORMATION SID list (NextEntryOffset / SidLength) for list-walk overflow._
 
@@ -2830,7 +2839,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 110. `rdma_channel_desc`
+#### 175. `rdma_channel_desc`
 
 _Fuzzes SMB2 READ Channel=RDMA_V1[_INVALIDATE] plus a smbdirect_buffer_descriptor_v1 array (offset/token/length) to hit channel-info validation in smb2_read._
 
@@ -2847,7 +2856,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 111. `compound_related_fid`
+#### 176. `compound_related_fid`
 
 _Fuzzes a RELATED compound CREATE→WRITE→CLOSE where WRITE/CLOSE inherit FileId=0xFF.. to exercise cross-op fid-inheritance / state resolution._
 
@@ -2864,7 +2873,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 123. `durable_reconnect_race`
+#### 177. `durable_reconnect_race`
 
 _Fuzzes a PERSISTENT durable-handle DH2Q grant then a DH2C reconnect with a matching-or-mismatched guid to race the durable reconnect path._
 
@@ -2879,7 +2888,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 124. `lease_break_ack_mismatch`
+#### 178. `lease_break_ack_mismatch`
 
 _Opens a lease (RqLs, state RWH) then sends an OPLOCK_BREAK ack with a mismatched LeaseKey / fuzzed LeaseState to hit lease-break ack validation._
 
@@ -2894,7 +2903,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 125. `oplock_break_race`
+#### 179. `oplock_break_race`
 
 _Two openers of one file: conn1's CREATE triggers a break to conn0, then conn0 races an OPLOCK_BREAK ack against an immediate CLOSE — lifetime/UAF race._
 
@@ -2913,7 +2922,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 128. `close_durable_scavenger`
+#### 180. `close_durable_scavenger`
 _CREATE with a DH2Q durable-handle context (short fuzzed Timeout, PERSISTENT) then CLOSE — races the durable-handle scavenger reclaim path._
 
 ```mermaid
@@ -2927,7 +2936,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 130. `credit_exhaust`
+#### 181. `credit_exhaust`
 _Loop of 4 READs with fuzzed CreditCharge / CreditRequest (0 = drain) and fuzzed Length — stresses credit accounting._
 
 ```mermaid
@@ -2943,7 +2952,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 131. `compound_unrelated_session`
+#### 182. `compound_unrelated_session`
 _Compound chain of 2–4 ECHOs, each carrying a fuzzed unrelated TreeId/SessionId — tests compound-request session binding._
 
 ```mermaid
@@ -2956,7 +2965,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 132. `transform_nested`
+#### 183. `transform_nested`
 _Hand-crafted double-wrapped SMB2 TRANSFORM_HDR (0xFD534D42) with mismatched OriginalMessageSize and fuzzed Flags/EncryptionAlgorithm — tests the decrypt path._
 
 ```mermaid
@@ -2969,7 +2978,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 133. `compress_bomb`
+#### 184. `compress_bomb`
 _SMB2 COMPRESSION_TRANSFORM_HDR (0xFC534D42) with huge OriginalCompressedSegmentSize and fuzzed CompressionAlgorithm/Flags — decompression-bomb path._
 
 ```mermaid
@@ -2982,7 +2991,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 134. `sign_downgrade`
+#### 185. `sign_downgrade`
 _READ marked SMB2_FLAGS_SIGNED with a forged 16-byte Signature — tests signature-verification bypass._
 
 ```mermaid
@@ -2996,7 +3005,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 135. `preauth_hash_mismatch`
+#### 186. `preauth_hash_mismatch`
 _Raw NEGOTIATE (dialect 0x0311) on a fresh conn with a fuzzed PREAUTH_INTEGRITY_CAPABILITIES context (HashAlgorithmCount/SaltLength/hash ids) — preauth hash negotiation._
 
 ```mermaid
@@ -3009,7 +3018,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 136. `multichannel_bind_replay`
+#### 187. `multichannel_bind_replay`
 _SESSION_SETUP with SMB2_SESSION_FLAG_BINDING and a fuzzed/replayed SessionId + raw blob — multichannel bind auth._
 
 ```mermaid
@@ -3022,7 +3031,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 157. `write_rdma_channel`
+#### 188. `write_rdma_channel`
 _WRITE flagged RDMA_V1/V1_INVALIDATE carrying fuzzed SMB-direct buffer descriptors — RDMA channel descriptor parsing._
 
 ```mermaid
@@ -3036,7 +3045,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 171. `pipelined_requests`
+#### 189. `pipelined_requests`
 _Fires 4..23 ECHO PDUs back-to-back before a single read to stress the request-assembly/credit pipeline._
 
 ```mermaid
@@ -3051,7 +3060,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 172. `oversize_pdu`
+#### 190. `oversize_pdu`
 _A WRITE PDU whose RFC1001 length claim is near-max (~0x00FFFFF0) but real body is short, stressing the length-vs-buffer read path._
 
 ```mermaid
@@ -3064,7 +3073,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 173. `partial_pdu_dribble`
+#### 191. `partial_pdu_dribble`
 _Sends one ECHO PDU one byte at a time to stress the partial-receive/reassembly state machine._
 
 ```mermaid
@@ -3078,20 +3087,20 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 174. `compound_padding`
+#### 192. `compound_padding`
 _A 2..4-command ECHO compound where each NextCommand offset overshoots the real sub-command length, leaving inter-command padding gaps._
 
 ```mermaid
 sequenceDiagram
     participant G as grain
     participant S as ksmbd
-    Note over G,S: build ncmd=2..4 ECHO chain, NextCommand &gt; real len (gap)
+    Note over G,S: build ncmd=2..4 ECHO chain, NextCommand › real len (gap)
     G->>S: compound ECHO (0x0D ×ncmd, padded NextCommand)
     S-->>G: compound reply
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 180. `encrypt_then_compound`
+#### 193. `encrypt_then_compound`
 _A TRANSFORM_HDR (0xFD SMB) with fuzzed nonce/signature wrapping a 2-command ECHO compound as "ciphertext", exercising decrypt→compound-parse (may tear the conn)._
 
 ```mermaid
@@ -3105,7 +3114,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 181. `sign_compound_mixed`
+#### 194. `sign_compound_mixed`
 _Compounds 3 ECHO PDUs where only some carry the per-command SMB2_FLAGS_SIGNED bit + a fuzzed 16-byte signature — tests signing-state consistency across a compound chain._
 
 ```mermaid
@@ -3116,7 +3125,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 182. `encrypt_wrong_session`
+#### 195. `encrypt_wrong_session`
 _Sends an SMB2 TRANSFORM (0xFD SMB) encrypted header whose SessionId is deliberately wrong (sid^1) with fuzzed nonce/payload — transform-decrypt path with a mismatched session key._
 
 ```mermaid
@@ -3127,7 +3136,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 185. `lease_upgrade_downgrade`
+#### 196. `lease_upgrade_downgrade`
 _CREATE with an RqLs lease at RWH state, then a second CREATE reusing the same LeaseKey with a fuzzed lease state — lease upgrade/downgrade transition._
 
 ```mermaid
@@ -3141,7 +3150,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 186. `durable_v1_v2_mix`
+#### 197. `durable_v1_v2_mix`
 _CREATE with a v1 durable handle (DHnQ), then a CREATE reconnecting it as a v2 handle (DH2C) with a fuzzed CreateGuid — mixing durable-handle versions on one fid._
 
 ```mermaid
@@ -3155,7 +3164,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 187. `oplock_level2_break`
+#### 198. `oplock_level2_break`
 _Opens a LEVEL2 oplock on conn0, has conn1 WRITE the shared file to force a break, then sends a fuzzed OPLOCK_BREAK ack on conn0 — cross-connection level-2 oplock break-ack path._
 
 ```mermaid
@@ -3171,7 +3180,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 188. `lease_parent_key`
+#### 199. `lease_parent_key`
 _CREATE with an RqLs lease that sets PARENT_LEASE_KEY_SET and a fuzzed nonexistent ParentLeaseKey + Epoch — directory-lease parent-key lookup._
 
 ```mermaid
@@ -3183,7 +3192,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 189. `durable_timeout_zero`
+#### 200. `durable_timeout_zero`
 _CREATE with a DH2Q durable-v2 context whose Timeout=0 (default path) and fuzzed Flags/CreateGuid — durable timeout defaulting._
 
 ```mermaid
@@ -3195,7 +3204,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 190. `persistent_handle_ca`
+#### 201. `persistent_handle_ca`
 _CREATE with a DH2Q context requesting a PERSISTENT handle (Flags=0x02) on a non-continuous-availability share — persistent-handle eligibility check._
 
 ```mermaid
@@ -3207,7 +3216,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 199. `read_compound_close`
+#### 202. `read_compound_close`
 _Compound READ(0x08)+RELATED CLOSE(0x06) chained in one PDU on the pool fid — tests ksmbd's related-request/compound close handling._
 
 ```mermaid
@@ -3220,7 +3229,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 211. `interim_response_flood`
+#### 203. `interim_response_flood`
 _Flood of blocking LOCK(0x0A) requests sent back-to-back without waiting — async interim-response flood/exhaustion bug class._
 
 ```mermaid
@@ -3250,7 +3259,7 @@ attack surface. TODO: split into per-opcode variants (see §8).
 
 See §9 for the shared archetypes and reading guide.
 
-#### 41. `smb1`
+#### 204. `smb1`
 _Sends a legacy \xffSMB PDU with a fuzzed command over a freshly-negotiated SMB2 connection — protocol version-conflict / legacy-dispatch bug class._
 
 ```mermaid
@@ -3258,12 +3267,12 @@ sequenceDiagram
     participant G as G
     participant S as S
     Note over G: throwaway socket (isolated from pool)
-    G->>S: SMB2 NEGOTIATE (waits; reply discarded)
-    G->>S: legacy \xffSMB PDU, fuzzed command + WordCount (waits; reply discarded)
+    G->>S: SMB2 NEGOTIATE (waits, reply discarded)
+    G->>S: legacy \xffSMB PDU, fuzzed command + WordCount (waits, reply discarded)
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 68. `smb1_tconx`
+#### 205. `smb1_tconx`
 _Sends a legacy SMB1 SMBtconX (\xffSMB, opcode 0x75) over a freshly SMB2-negotiated throwaway conn → the SMB1/SMB2 version-conflict handling._
 
 ```mermaid
@@ -3280,7 +3289,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 69. `smb1_ntcreate`
+#### 206. `smb1_ntcreate`
 _Sends a legacy SMB1 SMBntcreateX (\xffSMB, opcode 0xA2) over a throwaway SMB2-negotiated conn → SMB1 NT-create legacy path (version-conflict)._
 
 ```mermaid
@@ -3297,7 +3306,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 70. `smb1_trans`
+#### 207. `smb1_trans`
 _Sends a legacy SMB1 SMBtrans (\xffSMB, opcode 0x25) over a throwaway SMB2-negotiated conn → SMB1 transaction legacy path._
 
 ```mermaid
@@ -3314,7 +3323,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 71. `smb1_open`
+#### 208. `smb1_open`
 _Sends a legacy SMB1 SMBopen (\xffSMB, opcode 0x02) over a throwaway SMB2-negotiated conn → SMB1 open legacy path._
 
 ```mermaid
@@ -3331,7 +3340,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 72. `smb1_write`
+#### 209. `smb1_write`
 _Sends a legacy SMB1 SMBwrite (\xffSMB, opcode 0x0B) over a throwaway SMB2-negotiated conn → SMB1 write legacy path._
 
 ```mermaid
@@ -3348,7 +3357,7 @@ sequenceDiagram
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
 
-#### 144. `smb1_dialects`
+#### 210. `smb1_dialects`
 _Raw SMB1 NEGOTIATE (0x72) on a fresh conn with a fuzzed dialect list (count, entries, lengths) — SMB1→SMB2 negotiate downgrade path._
 
 ```mermaid
@@ -3688,7 +3697,7 @@ places all 211.
 ```mermaid
 flowchart TD
     subgraph INIT["LLVMFuzzerInitialize — once per process"]
-        A["df_init(): open kcov_dataflow,<br/>mmap g_df_buf, arm remote handle<br/>KSMBD_KCOV_DF_IP_HANDLE(octet)"] --> B["smb_setup(SHARE):<br/>NEGOTIATE → SESSION_SETUP (NTLM) → TREE_CONNECT"]
+        A["df_init(): open kcov_dataflow, / mmap g_df_buf, arm remote handle / KSMBD_KCOV_DF_IP_HANDLE(octet)"] --> B["smb_setup(SHARE): / NEGOTIATE → SESSION_SETUP (NTLM) → TREE_CONNECT"]
         B --> C{"preamble ok?"}
         C -- no --> Z["_exit(1) ⇒ BAIL"]
         C -- yes --> D["create_targets(): CREATE persistent fid(s)"]
@@ -3699,9 +3708,9 @@ flowchart TD
         F -- no --> G["smb_reconnect() + re-create fid"]
         F -- yes --> H["build the ONE fuzzed PDU from (data, size)"]
         G --> H
-        H --> I["xact() / send_only() → ksmbd over loopback 127.0.0.&lt;octet&gt;"]
-        I --> J["walk df_buf TLV records:<br/>entry(args) vs ret(0xF) → weight ctr[]"]
-        J --> K["fb(): feed kernel PCs + folded values<br/>to libFuzzer counters; GRAIN_ITER_END()"]
+        H --> I["xact() / send_only() → ksmbd over loopback 127.0.0.‹octet›"]
+        I --> J["walk df_buf TLV records: / entry(args) vs ret(0xF) → weight ctr[]"]
+        J --> K["fb(): feed kernel PCs + folded values / to libFuzzer counters, GRAIN_ITER_END()"]
     end
     K --> E
 ```
@@ -3715,9 +3724,9 @@ sequenceDiagram
     participant S as ksmbd __handle_ksmbd_work
     G->>K: df_init() + arm IP handle(octet)
     G->>K: df_buf[0] = 0 (reset)
-    G->>S: SMB2 PDU on 127.0.0.&lt;octet&gt;:445
-    Note over S: conn->kcov_handle derived from dest-IP octet
-    S->>K: kcov_df_remote_start(conn->kcov_handle)
+    G->>S: SMB2 PDU on 127.0.0.‹octet›:445
+    Note over S: conn.kcov_handle derived from dest-IP octet
+    S->>K: kcov_df_remote_start(conn.kcov_handle)
     S->>S: run handler smb2_*, fold PCs + trace-args/ret values
     S->>K: kcov_df_remote_stop() → merge into g_df_buf
     S-->>G: SMB2 response
@@ -3730,9 +3739,9 @@ Auth preamble is done; each input fuzzes exactly one endpoint op on a persistent
 
 ```mermaid
 flowchart LR
-    P["persistent fid (from preamble)"] --> B["build ONE fuzzed op:<br/>WRITE / READ / SET_INFO / QUERY_INFO /<br/>IOCTL(FSCTL) / LOCK / CREATE-ctx / …"]
+    P["persistent fid (from preamble)"] --> B["build ONE fuzzed op: / WRITE / READ / SET_INFO / QUERY_INFO / / IOCTL(FSCTL) / LOCK / CREATE-ctx / …"]
     B --> X["xact() → ksmbd handler"]
-    X --> R{"ret &lt; 0?"}
+    X --> R{"ret ‹ 0?"}
     R -- yes --> RC["smb_reconnect() + re-create fid"]
     R -- no --> FB["walk df_buf → fb()"]
     RC --> FB
@@ -3780,10 +3789,10 @@ connection down, so it re-connects before the next input (`session_setup`, `spne
 
 ```mermaid
 flowchart TD
-    A["smb_connect(): NEGOTIATE only"] --> B["build fuzzed session-level PDU:<br/>SPNEGO/NTLMSSP · transform-hdr · SMB1 · LOGOFF · framing"]
+    A["smb_connect(): NEGOTIATE only"] --> B["build fuzzed session-level PDU: / SPNEGO/NTLMSSP · transform-hdr · SMB1 · LOGOFF · framing"]
     B --> C["xact() → auth.c / transform / version / assembly path"]
     C --> D{"connection torn down?"}
-    D -- yes --> E["smb_reconnect() before next input<br/>(may trigger re-auth; heals shared pool in selftest)"]
+    D -- yes --> E["smb_reconnect() before next input / (may trigger re-auth, heals shared pool in selftest)"]
     D -- no --> F["walk df_buf → fb()"]
     E --> F
 ```
@@ -3795,21 +3804,21 @@ scored **EXCL** (not WORKS/DEAD) yet kept in the fleet for real gfuzz.
 
 ```mermaid
 flowchart LR
-    IPC["ipc grain"] --> N["SMBD_GENL netlink → transport_ipc.c<br/>(no per-conn IP handle ⇒ EXCL in selftest)"]
-    RDMA["rdma grain"] --> DP["RXE / SMBDirect data-plane<br/>(loopback TCP can't drive ⇒ EXCL in selftest)"]
+    IPC["ipc grain"] --> N["SMBD_GENL netlink → transport_ipc.c / (no per-conn IP handle ⇒ EXCL in selftest)"]
+    RDMA["rdma grain"] --> DP["RXE / SMBDirect data-plane / (loopback TCP can't drive ⇒ EXCL in selftest)"]
 ```
 
 ### 9.7 The selftest verdict (per grain, `--repeats N`, MAX pcs)
 
 ```mermaid
 flowchart TD
-    R["run grain, take MAX pcs over N tries"] --> Q1{"ret &lt; 0 every try?"}
-    Q1 -- yes --> BAIL["BAIL — prereq failed<br/>(no authed pool/fid)"]
+    R["run grain, take MAX pcs over N tries"] --> Q1{"ret ‹ 0 every try?"}
+    Q1 -- yes --> BAIL["BAIL — prereq failed / (no authed pool/fid)"]
     Q1 -- no --> Q2{"name is ipc or rdma?"}
-    Q2 -- yes --> EXCL["EXCL — architectural<br/>(non per-conn path)"]
+    Q2 -- yes --> EXCL["EXCL — architectural / (non per-conn path)"]
     Q2 -- no --> Q3{"best pcs ≥ min-pcs?"}
-    Q3 -- yes --> WORKS["WORKS — reached ksmbd<br/>pcs = depth"]
-    Q3 -- no --> DEAD["DEAD — 0 kernel PCs<br/>PDU never entered a handler"]
+    Q3 -- yes --> WORKS["WORKS — reached ksmbd / pcs = depth"]
+    Q3 -- no --> DEAD["DEAD — 0 kernel PCs / PDU never entered a handler"]
 ```
 
 ### 9.8 Archetype → grain map (all 211 placed)
