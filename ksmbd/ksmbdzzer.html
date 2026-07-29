@@ -28,7 +28,8 @@ code { color: #9f9; }
 in-kernel SMB server (ksmbd), targeting <b>write-side privilege escalation and
 non-crashing logic bugs</b>. Steered by <b>kcov-dataflow</b> — kernel function
 argument/return <i>values</i> plus <b>trace_cmp operand pairs</b>, not just edges.
-The grain fleet covers the <b>whole SMB1/2/3 procedure surface (99 grains)</b>,
+The grain fleet covers the <b>whole SMB1/2/3 procedure surface (210 active grains</b>,
+ordered by kernel data-path depth — file/VFS write first, session/auth last),
 grains are <b>combined on a shared object</b>, and a <b>set of engine arms</b>
 lets the dataflow steering be measured head-to-head against a pc-only baseline.</p>
 
@@ -79,7 +80,7 @@ ksmbdzzer.py — ORCHESTRATOR ONLY (enumerate, launch, aggregate; no per-input w
     └─ ctypes ─► libksmbdzzer.so
                    libsmbclient (NTLMv2 auth)  ── valid deep prefixes
                    kcov-dataflow mmap          ── arg/ret VALUES + trace_cmp pairs + KCOV
-                   GRAINS[] (99 scenarios)     ── whole SMB1/2/3 surface (GRAIN.md)
+                   GRAINS[] (210 scenarios)    ── whole SMB1/2/3 surface (GRAIN.md)
                    raw authed PDU injection    ── fuzz only the last target PDU
                    pfz_grain_combo2()          ── grains A+B on a SHARED fid/handle
                    librdmacm + libibverbs      ── SMBDirect / RDMA transport
@@ -105,14 +106,77 @@ five arms below for the engine comparison.</p>
 <h3>The grain (deep by construction)</h3>
 <p>Each grain runs negotiate → authenticate → tree-connect → CREATE as a <b>fixed
 valid prefix</b> (never fuzzed), then hands LibFuzzer the <b>raw target PDU</b>. Every
-input reaches deep ksmbd code on the first try. <b>99 grains</b> cover the whole
-upstream SMB surface: all 19 SMB2 commands, every FSCTL and SET_INFO/QUERY_INFO class,
-all CREATE contexts, SMB3 features (encryption/compression/multichannel/lease-v2/
-durable-v2/RDMA), SMB1 legacy opcodes (version-conflict surface), and the ksmbd blind
-spots (IPC netlink, signing crypto, deep DACL, RPC opnums). Canonical map: <code>GRAIN.md</code>.
+input reaches deep ksmbd code on the first try. <b>210 active grains</b> (211 defined —
+<code>secdesc</code> suppressed) cover the whole upstream SMB surface: all 19 SMB2
+commands, every FSCTL and SET_INFO/QUERY_INFO class, all CREATE contexts, SMB3 features
+(encryption/compression/multichannel/lease-v2/durable-v2/RDMA), SMB1 legacy opcodes
+(version-conflict surface), and the ksmbd blind spots (IPC netlink, signing crypto, deep
+DACL, RPC opnums). The registry is ordered by <b>kernel data-path depth</b> (file/VFS I/O
+grains first, session/auth last), so grain index <code>#N</code> in the doc equals
+<code>GRAINS[N-1]</code> equals <code>gen.py</code>'s compile index — one number
+everywhere. Canonical map: <code>GRAIN.md</code>.
 <b>P3 combines</b> grains pairwise on a <i>shared</i> handle/path — sequential,
 interleaved, or forked-concurrent (<code>pfz_grain_combo2</code>) — so interaction bugs
 (B abusing a lock/lease/handle A left) can surface. P3 needs <code>-procs ≥ 2</code>.</p>
+
+<h2>The orchestrator — <code>ksmbdzzer.py</code> in depth</h2>
+<p>Python is the <b>manager</b>, never the fuzzer (principle 7). It enumerates grains from
+the loaded <code>libksmbdzzer.so</code> (<code>pfz_grain_count()</code>/
+<code>pfz_grain_name(i)</code> → the 210-entry registry, in kernel-depth order), compiles
+one LibFuzzer harness per grain via <code>grain/gen.py</code>, launches them under a
+<code>-procs</code>-bounded pool, and aggregates. All per-input mutation/execution/feedback
+happens in the C harness.</p>
+
+<h3>Command surface</h3>
+<table>
+<tr><th>Command</th><th>What it does</th></tr>
+<tr><td><code>init</code></td><td>Idempotent 9-step target bring-up (logs <code>[init] N/9</code>): make share/mount dirs, load ksmbd, provision the <code>fuzz:fuzz</code> SMB user, bring up Soft-RDMA (SIW/RXE) for SMBDirect, (re)start <code>ksmbd.mountd</code>, mount the share, optional KDC. Run <b>once per boot</b> before <code>gfuzz</code>.</td></tr>
+<tr><td><code>gfuzz</code> (alias <code>fuzz</code>)</td><td>THE fuzzing command — the round-based 4-phase grain campaign (below). <code>-r</code> generations, <code>-procs</code> workers, <code>--grain-max</code>/<code>--grain-sat</code> per-grain budget, <code>-t GRAIN…</code> to focus a subset.</td></tr>
+<tr><td class="new"><code>selftest</code></td><td>Pre-P2 grain-<i>validity</i> filter: run each grain a few times, keep only those that reach ksmbd <i>kernel</i> code (produce PCs). Classifies WORKS / DEAD / BAIL and writes <code>grain/WORKING_SUBSET.txt</code>. The "is this grain meaningful" gate.</td></tr>
+<tr><td class="new"><code>build-grains</code></td><td>HOST-side pre-compile of the whole fleet so the in-guest P1 hits the compile cache and skips <code>clang</code> — turns the 11–20 min 9p rebuild into seconds. Grains are deterministic, so the cache is safe to reuse.</td></tr>
+<tr><td class="new"><code>probe-test</code></td><td>Run the <code>DataflowDirector</code> write-side oracle once and exit — a fast, standalone oracle sanity check.</td></tr>
+<tr><td><code>validate</code></td><td>Fast liveness/CVE-pattern check (for older 6.6–6.11 kernels where the bugs are unpatched).</td></tr>
+</table>
+
+<h3>The <code>gfuzz</code> round — crash-resilient control flow</h3>
+<pre>
+for rnd in 1..R:
+  try:
+    P1  generate_grains + generate_all_grains + generate_v2_grains   <span class="warn"># lib + raw-PDU + v2 hybrid</span>
+    P2  run_grains(...)  ── per-grain LibFuzzer, -procs-way, ALIGNED+PRODUCTIVE gate
+        <span class="new">STABILITY oracle</span>  ── a grain whose bare ft0 collapsed vs its baseline = ksmbd destabilized
+        <span class="new">CONTRACT oracle</span>   ── run_dataflow_director(): write-side LPE + lease + race + teardown + framing
+        feed-forward report ── ft0 should JUMP round-over-round (corpus replayed)
+    P3  all-pairs combine on a shared object (FINAL round only; KSMBDZZER_P3_MAX_COMBOS budget)
+  except: <span class="warn">degrade THIS round, log it, fall through</span>   <span class="warn"># one bad wave never aborts the campaign</span>
+  P4  corpus_save() ALWAYS ── mirror corpus+features+value_pool to the host-durable .fuzzdb (9p)
+os._exit(0)   <span class="warn"># skip atexit/daemon-join so vng sees --exec finish and powers off promptly</span>
+</pre>
+<p>Three robustness mechanisms make an unattended multi-hour campaign survivable:</p>
+<table>
+<tr><th>Mechanism</th><th>Why</th></tr>
+<tr><td class="new">Per-round <code>try/except</code> + always-run P4</td><td>Any unexpected phase failure (a raise, or a wave the watchdog had to kill) degrades <i>that round</i> and continues; the corpus + value pool are saved regardless, so the next generation still starts deeper.</td></tr>
+<tr><td class="new">Host-durable <code>.fuzzdb</code> (9p mirror)</td><td><code>corpus_save()</code> write-throughs the distilled DB to <code>ksmbd/.fuzzdb</code> on the host mount each P4, so a VM wedge/panic costs the in-flight round, not the whole campaign (<i>generational crash resilience</i>).</td></tr>
+<tr><td class="new">In-guest watchdog + host backstop</td><td>A <i>userspace</i> stall (hung grain/wave) is unstuck by killing the stuck children in-guest — no VM reboot. A true <i>kernel</i> wedge starves that thread too and falls through to the host <code>hung_task_panic</code> watchdog.</td></tr>
+<tr><td class="new">Lazy / session-reuse auth (default)</td><td>Only pool grains authenticate the shared pool; the rest reuse the session — avoiding the per-grain <code>ksmbd.mountd</code> IPC auth storm that 0-execs the fleet under <code>-procs&gt;1</code>. <code>--everytime-auth</code> restores a fresh NTLMv2 handshake per grain.</td></tr>
+</table>
+
+<h3>The dataflow contract oracle is a <i>suite</i>, not one check</h3>
+<p>Once per round <code>run_dataflow_director()</code> authenticates to the <code>[privtest]</code>
+share (safe no-op if it can't) and runs a battery of write-side / state-corruption oracles,
+each rebuilding its own clean session so ordering is independent. KASAN/lockdep from any of
+them lands on the serial console with a <code>[uaf]</code>/<code>[lease]</code>/
+<code>[race]</code>/<code>[frag]</code> marker:</p>
+<table>
+<tr><th>Oracle</th><th>Bug class it targets</th></tr>
+<tr><td class="new">cross-user LPE</td><td>The real write-side check: a <b>root-owned</b> victim, judged by <i>effect</i> — so it can only flag a genuine authorization denial, not an owner-on-own-file no-op (the earlier 5 owner-victim "findings" were false positives).</td></tr>
+<tr><td>owner CREATE sweep + <code>ksmbd_vfs_write</code> boundary sweep</td><td>Coverage / i2s mapping only (drives <code>smb2_create_open_flags</code> + <code>ksmbd_vfs_write</code> args to boundaries; OOB surfaces via KASAN).</td></tr>
+<tr><td class="new">lease-grant contract</td><td>The granted lease state vs what MS-SMB2 permits.</td></tr>
+<tr><td class="new">race integrity</td><td>Concurrent-op state divergence.</td></tr>
+<tr><td class="new">teardown UAF</td><td>Session/tree teardown with an in-flight handle (highest-yield; runs last, it's destructive).</td></tr>
+<tr><td class="new">fragmented framing</td><td>Loopback short-read / dribbled-PDU framing edge.</td></tr>
+<tr><td>arbiter <code>_distill()</code></td><td>Not an oracle — writes <code>g_fb</code> (the return-value dict + steering hints) to the durable DB so next round's C <code>mutate_i2s()</code> is steered with no recompile.</td></tr>
+</table>
 
 <h2>Phases</h2>
 <table>
@@ -214,14 +278,20 @@ vng --user root --memory 16G --rw --cpus 8 \
           python3 ../ksmbd/ksmbdzzer.py init &amp;&amp;
           python3 ../ksmbd/ksmbdzzer.py <span class="new">gfuzz -r 30 --grain-max 40</span>'
 
+  ksmbdzzer.py init                       once per boot: ksmbd + share + Soft-RDMA + KDC (9 steps)
+  ksmbdzzer.py <span class="new">selftest</span>                   optional: keep only grains that reach ksmbd → WORKING_SUBSET.txt
+  ksmbdzzer.py gfuzz -r 30 --grain-max 40 the campaign
+
   gfuzz -r N             generations (each carries strong grains + corpus forward)
         -procs N         parallel workers (default: ALL CPUs; P3 needs ≥2)
         --grain-max S    ceiling (s) per grain if it never saturates (default 60)
         --grain-sat R    LibFuzzer saturation ratio per grain (default 0.02)
         -t GRAIN...      restrict to a subset of grains (default: whole fleet)
+        --everytime-auth fresh NTLMv2 per grain (default: lazy/session-reuse)
 
-  runner:  engine_compare_campagin.sh [ROUNDS] [GRAIN_MAX] [TIMEOUT_MIN_PER_ARM] [TRIALS]
-           (env: PROCS P3_MAX_COMBOS REDO ARMS_OVERRIDE INSTRUMENT_ALL KSMBDZZER_ALIGNED)
+  host-side:  ksmbdzzer.py <span class="new">build-grains</span>    pre-compile the fleet so in-guest P1 hits the cache (min→sec)
+  runner:     engine_compare_campagin.sh [ROUNDS] [GRAIN_MAX] [TIMEOUT_MIN_PER_ARM] [TRIALS]
+              (env: PROCS P3_MAX_COMBOS REDO ARMS_OVERRIDE INSTRUMENT_ALL KSMBDZZER_ALIGNED)
 </pre>
 <p class="warn">The old <code>ksmbdzzer.py fuzz</code> (8-phase random-tactic worker +
 differential failslab) is <b>legacy</b> — retained for the failslab error-path

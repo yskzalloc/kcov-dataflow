@@ -6,7 +6,7 @@ logic bugs**. It steers with **kcov-dataflow** (kernel function argument/return
 **values** + **comparison operand pairs** from `trace_cmp`, not just edges), runs
 authenticated SMB2/3 sessions via **libsmbclient**, and exercises the SMBDirect/RDMA
 transport via **librdmacm/libibverbs**. The grain fleet covers the **whole
-SMB1/2/3 procedure surface (99 grains)**, and an **engine-comparison harness**
+SMB1/2/3 procedure surface (210 active grains)**, and an **engine-comparison harness**
 measures the dataflow steering against a pc-only + i2s/havoc baseline.
 
 > **Not a syzkaller.** syzkaller fuzzes at the *syscall* level with edge coverage and
@@ -140,8 +140,9 @@ ksmbdzzer.py  — orchestrator ONLY (enumerate, launch, aggregate; no per-input 
     └── ctypes ─→ libksmbdzzer.so  — C library
                     ├── libsmbclient (NTLMv2 auth, signing) — valid deep prefixes
                     ├── kcov-dataflow mmap — arg/ret VALUES + trace_cmp pairs + KCOV path
-                    ├── GRAINS[] registry — 99 normal scenarios, deep-by-construction
-                    │     (whole SMB1/2/3 surface; canonical map: GRAIN.md)
+                    ├── GRAINS[] registry — 210 normal scenarios, deep-by-construction,
+                    │     ordered by kernel data-path depth (write first, auth last;
+                    │     whole SMB1/2/3 surface; canonical map: GRAIN.md)
                     ├── raw authed PDU injection — fuzz only the last target PDU
                     ├── pfz_grain_combo2() — run grains A+B on a SHARED fid/handle
                     └── librdmacm + libibverbs — SMBDirect/RDMA transport
@@ -152,12 +153,15 @@ ksmbdzzer.py  — orchestrator ONLY (enumerate, launch, aggregate; no per-input 
 Each grain establishes the prerequisite kernel state (negotiate → authenticate →
 tree-connect → CREATE) as a **fixed valid prefix**, then hands LibFuzzer the **raw
 target PDU** to mutate. The prefix is never fuzzed, so every input reaches deep ksmbd
-code on the first try. **99 grains** cover the whole upstream SMB procedure surface:
-all 19 SMB2 commands, every FSCTL and SET_INFO/QUERY_INFO class, all CREATE contexts,
-the SMB3 features (encryption/compression/multichannel/lease-v2/durable-v2/
-RDMA-SMBDirect), the SMB1 legacy opcodes (deliberate version-conflict surface), and
-the ksmbd blind spots (IPC netlink, signing crypto, deep DACL, RPC opnums). The
-canonical grain↔handler map is **`GRAIN.md`**.
+code on the first try. **210 active grains** (211 defined; `secdesc` is suppressed)
+cover the whole upstream SMB procedure surface: all 19 SMB2 commands, every FSCTL and
+SET_INFO/QUERY_INFO class, all CREATE contexts, the SMB3 features
+(encryption/compression/multichannel/lease-v2/durable-v2/RDMA-SMBDirect), the SMB1
+legacy opcodes (deliberate version-conflict surface), and the ksmbd blind spots (IPC
+netlink, signing crypto, deep DACL, RPC opnums). The registry is ordered by **kernel
+data-path depth** (file/VFS I/O first, session/auth last), so grain index `#N` is the
+same number in the doc, in `GRAINS[N-1]`, and in `gen.py`'s compile order. The canonical
+grain↔handler map is **`GRAIN.md`**.
 
 **Grain combination (P3).** All grains are combined pairwise on a **shared object**:
 `pfz_grain_combo2(a,b)` runs grain A then B (or interleaved, or forked-concurrent) on
@@ -193,6 +197,27 @@ arms for the comparison (see below).
 The fuzzer is **100% guest-internal loopback** — each worker dials `127.0.0.<octet>`
 and ksmbd binds loopback, so **no `--network` flag is needed** (the `lo` interface is
 always up).
+
+### Commands at a glance
+
+`ksmbdzzer.py` is the orchestrator; run it **inside the virtme-ng guest**. The usual
+order is `init` once per boot, then `gfuzz`:
+
+| Command | When | What it does |
+|---|---|---|
+| `ksmbdzzer.py init` | once per boot, before anything | Bring up the target: share/mount dirs, load ksmbd, provision the `fuzz:fuzz` user, Soft-RDMA (SIW/RXE) for SMBDirect, `ksmbd.mountd`, mount the share, optional KDC. Idempotent; logs `[init] N/9`. |
+| `ksmbdzzer.py gfuzz -r N` | the campaign | The 4-phase round-based grain fuzzer (`fuzz` is an alias). `-r` = generations, `-procs` = workers (default all CPUs), `--grain-max` = per-grain seconds, `-t GRAIN…` = focus a subset. |
+| `ksmbdzzer.py selftest` | optional, before `gfuzz` | Keep only grains that actually reach ksmbd kernel code (WORKS / DEAD / BAIL); writes `grain/WORKING_SUBSET.txt`. |
+| `ksmbdzzer.py probe-test` | optional | Run the write-side dataflow oracle once and exit — a fast oracle sanity check. |
+| `ksmbdzzer.py build-grains` | **on the host**, optional | Pre-compile the whole fleet so the in-guest P1 hits the compile cache and skips `clang` (11–20 min 9p rebuild → seconds). |
+
+A **grain** is one SMB2/SMB3 procedure harness with a fixed valid prefix; the fleet is
+the 210-grain `GRAINS[]` registry in `libksmbdzzer.so`. `gfuzz` is **round-based, not
+time-based** — use `-r` for depth. The run is crash-resilient: each round is wrapped so
+one bad wave degrades that round (not the campaign), P4 always saves, and the corpus is
+mirrored to the host-durable `.fuzzdb` so a VM wedge costs a round, not the whole run. A
+per-round **oracle suite** (cross-user write-side LPE, lease-grant, race-integrity,
+teardown-UAF, fragmented-framing) runs alongside P2 — findings land in `findings/`.
 
 ```bash
 # The 4-phase grain fuzzer. -r = generations, -procs defaults to all CPUs. Each round
@@ -411,7 +436,7 @@ so it can only flag a *genuine* integrity/LPE denial.
 
 ```
 ksmbdzzer.py                    orchestrator — gfuzz (4-phase grain loop) + legacy fuzz
-libksmbdzzer.c / .h / .so       C library — 99-grain GRAINS[] registry, kcov-dataflow
+libksmbdzzer.c / .h / .so       C library — 210-grain GRAINS[] registry, kcov-dataflow
                                 (arg/ret + trace_cmp), combo2 shared-object, RDMA
 grain/gen.py                    LibFuzzer C harness engine — grain + combo-pool + v2;
                                 fast-bail, session-drain, fleet-union PC metric
