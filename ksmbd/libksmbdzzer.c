@@ -41,6 +41,24 @@
 #define KCOV_DF_INIT_TRACE     _IOR('d', 1, unsigned long)
 #define KCOV_DF_REMOTE_ENABLE  _IOW('d', 102, unsigned long)
 #define KCOV_DF_REMOTE_DISABLE _IO('d', 103)
+
+/* mainline kcov (KSMBDZZER_KCOV=1 — fork-free trace-pc baseline). Defined here too
+ * because this TU does not include libksmbdzzer.h (which carries the same block for
+ * the grain harnesses via common.h). Keep the two copies in sync. */
+struct kcov_remote_arg {
+    unsigned int        trace_mode;
+    unsigned int        area_size;
+    unsigned int        num_handles;
+    unsigned long long  common_handle;
+    unsigned long long  handles[0];
+};
+#define KCOV_INIT_TRACE        _IOR('c', 1, unsigned long)
+#define KCOV_ENABLE            _IO('c', 100)
+#define KCOV_DISABLE           _IO('c', 101)
+#define KCOV_REMOTE_ENABLE     _IOW('c', 102, struct kcov_remote_arg)
+#define KCOV_TRACE_PC          0
+#define KCOV_TRACE_CMP         1
+#define KCOV_COVER_WORDS       (1 << 20)   /* 1M PCs; cover[0]=count, cover[1..]=PCs */
 /*
  * 8M words = 64MB. Sized to survive an entire reset→op→get_features cycle
  * without overflowing now that each worker has a *private* buffer (one
@@ -81,11 +99,11 @@ static inline const char *pfz_dts(void)
 /*
  * Per-worker coverage routing. Each worker connects to a distinct loopback
  * address 127.0.0.<octet> and registers the handle the kernel derives from
- * that address (fs/smb/server/connection.h: KSMBD_KCOV_DF_IP_HANDLE). Keep
+ * that address (fs/smb/server/connection.h: KSMBD_KCOV_IP_HANDLE). Keep
  * this formula identical to the kernel's. octet is the low byte of the
  * host-order IPv4 address, so the low 16 bits reduce to <octet> for 127.0.0.x.
  */
-#define KSMBD_KCOV_DF_IP_HANDLE(octet)  (0x4b440000UL | ((octet) & 0xFFFFUL))
+#define KSMBD_KCOV_IP_HANDLE(octet)  (0x4b440000UL | ((octet) & 0xFFFFUL))
 
 /* ─── State ─────────────────────────────────────────────────────────────── */
 /* libsmbclient is NOT thread-safe (one global tevent/talloc context). The
@@ -114,6 +132,21 @@ static int everytime_auth(void) {
 }
 static int g_df_fd = -1;
 static uint64_t *g_df_buf = NULL;
+/* Mainline-kcov coverage source (KSMBDZZER_KCOV=1) — the fork-free baseline for the
+ * KCOV-vs-KCOV-DATAFLOW comparison. When active, g_df_buf stays NULL and coverage
+ * comes from g_kcov_cover (plain trace-pc). */
+static int g_use_kcov = 0;
+static int g_kcov_fd = -1;
+static unsigned long *g_kcov_cover = NULL;
+/* Coverage backend: one struct, selected ONCE in pfz_init(); pfz_reset()/
+ * pfz_get_features() dispatch through it so the kcov and dataflow readers stay
+ * fully separate (no per-call if on the source). */
+struct cov_ops { const char *name; void (*reset)(void); int (*features)(uint32_t *out, int max); };
+static void df_reset(void);
+static void kcov_reset(void);
+static int  df_features(uint32_t *out, int max);
+static int  kcov_features(uint32_t *out, int max);
+static struct cov_ops g_cov;
 static int g_raw_sock = -1;
 static uint64_t g_raw_mid = 1000;
 static int g_worker_octet = 1;             /* 127.0.0.<octet> for this worker */
@@ -315,33 +348,77 @@ int pfz_init(unsigned long worker_octet)
     pfz_engine_init();                 /* resolve pc-only vs value-fold vs havoc for this arm */
     atexit(pfz_report_metrics);        /* emit KERNEL_PCS/RET_TOKEN_HITS/CMP_I2S_HITS */
 
-    /* 1. kcov_dataflow — register the handle the kernel derives from our IP */
-    g_df_fd = open("/sys/kernel/debug/kcov_dataflow", O_RDWR);
-    if (g_df_fd >= 0) {
-        unsigned long handle = KSMBD_KCOV_DF_IP_HANDLE((unsigned long)g_worker_octet);
-        ioctl(g_df_fd, KCOV_DF_INIT_TRACE, (unsigned long)DF_BUF_WORDS);
-        g_df_buf = mmap(NULL, DF_BUF_WORDS * 8, PROT_READ | PROT_WRITE,
-                        MAP_SHARED, g_df_fd, 0);
-        if (g_df_buf == MAP_FAILED) g_df_buf = NULL;
-        if (g_df_buf) {
-            /*
-             * A non-zero return here means another worker already owns this
-             * handle (EEXIST) or the device rejected us — coverage would be
-             * silently dead, so make the failure loud instead.
-             */
-            if (ioctl(g_df_fd, KCOV_DF_REMOTE_ENABLE, handle) != 0) {
-                pfz_err(
-                    "[ksmbdzzer] REMOTE_ENABLE(0x%lx) failed for %s: %s — "
-                    "coverage disabled for this worker\n",
-                    handle, g_target_ip, strerror(errno));
-                munmap(g_df_buf, DF_BUF_WORDS * 8);
-                g_df_buf = NULL;
+    /* 1. Coverage source. Default = kcov_dataflow (value-sensitive). KSMBDZZER_KCOV=1
+     * (set by `fuzz --kcov`) switches to mainline /sys/kernel/debug/kcov trace-pc — the
+     * fork-free baseline. BOTH register the SAME per-worker handle
+     * (KSMBD_KCOV_IP_HANDLE) so ksmbd's remote hooks route this connection's coverage
+     * into whichever buffer we opened. */
+    {
+        const char *e = getenv("KSMBDZZER_KCOV");
+        g_use_kcov = (e && e[0] == '1');
+    }
+    if (g_use_kcov) {
+        unsigned long handle = KSMBD_KCOV_IP_HANDLE((unsigned long)g_worker_octet);
+        g_kcov_fd = open("/sys/kernel/debug/kcov", O_RDWR);
+        if (g_kcov_fd >= 0 &&
+            ioctl(g_kcov_fd, KCOV_INIT_TRACE, (unsigned long)KCOV_COVER_WORDS) == 0) {
+            g_kcov_cover = mmap(NULL, KCOV_COVER_WORDS * sizeof(unsigned long),
+                                PROT_READ | PROT_WRITE, MAP_SHARED, g_kcov_fd, 0);
+            if (g_kcov_cover == MAP_FAILED) g_kcov_cover = NULL;
+        }
+        if (g_kcov_cover) {
+            /* Route ksmbd's remote coverage (kcov_remote_start_common) to us via the
+             * per-worker common_handle. A non-zero return = handle taken / rejected. */
+            struct kcov_remote_arg arg = {
+                .trace_mode    = KCOV_TRACE_PC,
+                .area_size     = KCOV_COVER_WORDS,
+                .num_handles   = 0,
+                .common_handle = handle,
+            };
+            if (ioctl(g_kcov_fd, KCOV_REMOTE_ENABLE, &arg) != 0) {
+                pfz_err("[ksmbdzzer] KCOV_REMOTE_ENABLE(0x%lx) failed for %s: %s — "
+                        "coverage disabled for this worker\n",
+                        handle, g_target_ip, strerror(errno));
+                munmap(g_kcov_cover, KCOV_COVER_WORDS * sizeof(unsigned long));
+                g_kcov_cover = NULL;
             }
+        } else {
+            pfz_err("[ksmbdzzer] open(/sys/kernel/debug/kcov) failed: %s — "
+                    "running without coverage feedback\n", strerror(errno));
         }
     } else {
-        pfz_err("[ksmbdzzer] open(kcov_dataflow) failed: %s — "
-                "running without coverage feedback\n", strerror(errno));
+        /* 1b. kcov_dataflow — register the handle the kernel derives from our IP */
+        g_df_fd = open("/sys/kernel/debug/kcov_dataflow", O_RDWR);
+        if (g_df_fd >= 0) {
+            unsigned long handle = KSMBD_KCOV_IP_HANDLE((unsigned long)g_worker_octet);
+            ioctl(g_df_fd, KCOV_DF_INIT_TRACE, (unsigned long)DF_BUF_WORDS);
+            g_df_buf = mmap(NULL, DF_BUF_WORDS * 8, PROT_READ | PROT_WRITE,
+                            MAP_SHARED, g_df_fd, 0);
+            if (g_df_buf == MAP_FAILED) g_df_buf = NULL;
+            if (g_df_buf) {
+                /*
+                 * A non-zero return here means another worker already owns this
+                 * handle (EEXIST) or the device rejected us — coverage would be
+                 * silently dead, so make the failure loud instead.
+                 */
+                if (ioctl(g_df_fd, KCOV_DF_REMOTE_ENABLE, handle) != 0) {
+                    pfz_err(
+                        "[ksmbdzzer] REMOTE_ENABLE(0x%lx) failed for %s: %s — "
+                        "coverage disabled for this worker\n",
+                        handle, g_target_ip, strerror(errno));
+                    munmap(g_df_buf, DF_BUF_WORDS * 8);
+                    g_df_buf = NULL;
+                }
+            }
+        } else {
+            pfz_err("[ksmbdzzer] open(kcov_dataflow) failed: %s — "
+                    "running without coverage feedback\n", strerror(errno));
+        }
     }
+
+    /* Bind the coverage backend to the source opened above (single selection). */
+    g_cov = g_use_kcov ? (struct cov_ops){ "kcov",     kcov_reset, kcov_features }
+                       : (struct cov_ops){ "dataflow", df_reset,   df_features };
 
     /* 2. libsmbclient session (dials this worker's IP).
      * Use the context API (smbc_init() is deprecated). smbc_set_context() installs
@@ -420,10 +497,9 @@ int pfz_init(unsigned long worker_octet)
 /**
  * pfz_reset - Reset coverage buffer (call before each operation).
  */
-void pfz_reset(void)
-{
-    if (g_df_buf) g_df_buf[0] = 0;
-}
+static void df_reset(void)   { if (g_df_buf) g_df_buf[0] = 0; }
+static void kcov_reset(void) { if (g_kcov_cover) g_kcov_cover[0] = 0; }
+void pfz_reset(void) { if (g_cov.reset) g_cov.reset(); }
 
 /**
  * pfz_write - Write data via libsmbclient at offset.
@@ -601,7 +677,21 @@ int pfz_raw_pdu(const void *pdu, int len, void *resp, int resp_max)
  * pfz_get_features - Extract coverage features from kcov_df buffer.
  * Returns number of features written to out[].
  */
-int pfz_get_features(uint32_t *out, int max)
+static int kcov_features(uint32_t *out, int max)
+{
+    if (!g_kcov_cover) return 0;
+    unsigned long n = g_kcov_cover[0];
+    if (n == 0) return 0;
+    if (n > (unsigned long)KCOV_COVER_WORDS - 1) n = KCOV_COVER_WORDS - 1;
+    int count = 0;
+    for (unsigned long i = 1; i <= n && count < max; i++) {
+        uint64_t pc = (uint64_t)g_kcov_cover[i];
+        out[count++] = (uint32_t)(pc ^ (pc >> 32));
+    }
+    return count;
+}
+
+static int df_features(uint32_t *out, int max)
 {
     if (!g_df_buf) return 0;
     uint64_t n = g_df_buf[0];
@@ -703,6 +793,11 @@ int pfz_get_features(uint32_t *out, int max)
     if (++_emit_ctr == 1 || (_emit_ctr & 7u) == 0)
         pfz_report_metrics();
     return count;
+}
+
+int pfz_get_features(uint32_t *out, int max)
+{
+    return g_cov.features ? g_cov.features(out, max) : 0;
 }
 
 

@@ -4,8 +4,9 @@ ksmbdzzer.py — KSMBD write-side LPE fuzzer.
 
 Usage:
   ksmbdzzer.py init [--install-deps]
-  ksmbdzzer.py gfuzz -r 5 --grain-max 25                 # whole-fleet, round-based
-  ksmbdzzer.py gfuzz -r 5 -t write copychunk reparse       # only these grains
+  ksmbdzzer.py fuzz -r 5 --grain-max 25                  # whole-fleet, round-based
+  ksmbdzzer.py fuzz -r 5 -t write copychunk reparse        # only these grains
+  ksmbdzzer.py fuzz -r 5 --kcov                           # mainline KCOV (vs kcov-dataflow)
   ksmbdzzer.py validate -time 10
 """
 from __future__ import annotations
@@ -655,7 +656,7 @@ _persistent_lib = None
 
 # Per-worker coverage identity. Each pool worker dials 127.0.0.<octet> and the
 # kernel routes that connection's kcov-dataflow into the worker's private
-# buffer (see KSMBD_KCOV_DF_IP_HANDLE in fs/smb/server/connection.h). The
+# buffer (see KSMBD_KCOV_IP_HANDLE in fs/smb/server/connection.h). The
 # parent / sequential path keeps octet 1 (127.0.0.1); pool workers get 2,3,...
 _WORKER_OCTET = 1
 
@@ -674,8 +675,13 @@ def _pool_init(counter):
     # with THIS worker's octet and registers its own private coverage handle.
     _persistent_lib = None
 
-def _get_lib():
-    """Get or create the persistent libksmbdzzer handle."""
+def _get_lib(init=True):
+    """Get or create the persistent libksmbdzzer handle.
+
+    init=True (default): also run pfz_init() — open the coverage handle + SMB session.
+    init=False: registry-only (pfz_grain_count/pfz_grain_name). build-grains uses this —
+    it only COMPILES grains on the host and needs neither coverage nor a live ksmbd, so it
+    must not trigger the spurious open(kcov)/connection-refused churn there."""
     global _persistent_lib
     if _persistent_lib is None:
         _persistent_lib = ctypes.CDLL(str(SCRIPT_DIR / 'libksmbdzzer.so'))
@@ -726,10 +732,11 @@ def _get_lib():
         _persistent_lib.pfz_probe_send_frag.argtypes = [ctypes.c_uint16, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
         _persistent_lib.pfz_probe_send_frag.restype = ctypes.c_int
         _persistent_lib.pfz_probe_get_fid.argtypes = [ctypes.c_char_p]
-        if _persistent_lib.pfz_init(_WORKER_OCTET) < 0:
-            print(f"  [!] libksmbdzzer init failed (octet {_WORKER_OCTET}), reconnecting...", flush=True)
-            _persistent_lib.pfz_reconnect()
-        _persistent_lib._initialized = True
+        if init:
+            if _persistent_lib.pfz_init(_WORKER_OCTET) < 0:
+                print(f"  [!] libksmbdzzer init failed (octet {_WORKER_OCTET}), reconnecting...", flush=True)
+                _persistent_lib.pfz_reconnect()
+        _persistent_lib._initialized = init
     return _persistent_lib
 
 
@@ -1739,8 +1746,8 @@ def cmd_selftest(args):
     # Per-grain RAW-pool re-establisher. The batch-10+ grains use the raw-socket g_pool[]
     # (pool_ensure_fid / pool_lazy), and the conn-disrupting grains (encrypt, session_setup,
     # smb1_*, sign, oplock_ack, logoff*, tdis*) tear that pool DOWN — and pool_lazy's _tried_n
-    # guard deliberately won't re-auth a dead-but-present pool (a throughput choice for gfuzz).
-    # In a real gfuzz run each grain is its OWN process with a fresh pool, so this contamination
+    # guard deliberately won't re-auth a dead-but-present pool (a throughput choice for fuzz).
+    # In a real fuzz run each grain is its OWN process with a fresh pool, so this contamination
     # can't happen; here all grains share ONE process, so a disruptor makes every pool grain
     # AFTER it false-BAIL. Re-establish g_pool[] (pfz_pool_init → pool_connect_one, the raw
     # authed pool these grains actually use) before EACH grain to reproduce the fresh-process
@@ -1760,7 +1767,7 @@ def cmd_selftest(args):
     sel = set(args.target) if getattr(args, 'target', None) else None
     # Architectural exclusions — grains that CANNOT produce per-SMB-connection kcov coverage,
     # so the selftest can't measure them (they are NOT broken and STAY in the GRAINS[] registry
-    # for real gfuzz, which reaches ksmbd via these paths a different way):
+    # for real fuzz, which reaches ksmbd via these paths a different way):
     #   ipc  — SMBD_GENL netlink, not an SMB connection → the IP-handle remote hook never fires
     #   rdma — needs the RXE/SMBDirect data-plane, which the loopback selftest can't drive
     # Reported as EXCL and left OUT of the WORKS/DEAD verdict (deactivated from the map's
@@ -1793,10 +1800,10 @@ def cmd_selftest(args):
             continue
         if name in EXCLUDE:
             # architectural — measurable coverage impossible in the loopback selftest, but the
-            # grain stays live for real gfuzz. Report and skip the WORKS/DEAD verdict entirely.
+            # grain stays live for real fuzz. Report and skip the WORKS/DEAD verdict entirely.
             excl.append(name)
             print(f"{_dts()}   [EXCL ] {name:30} (architectural — no per-conn kcov in selftest; "
-                  f"stays in fleet for gfuzz)", flush=True)
+                  f"stays in fleet for fuzz)", flush=True)
             continue
         best_pcs, best_ret, ran = 0, -99, False
         for k in range(repeats):
@@ -1898,13 +1905,23 @@ def cmd_grain_fuzz(args):
     sat = getattr(args, 'grain_sat', 0.02)
     smax = getattr(args, 'grain_max', 60)
 
+    # Coverage SOURCE — MUST be set before _get_lib() below, because _get_lib() calls
+    # pfz_init() which reads KSMBDZZER_KCOV to pick the backend (kcov vs kcov-dataflow).
+    # Setting it later left pfz_init opening kcov_dataflow on a kcov-only kernel. Grain
+    # workers inherit it via os.environ. (engine_compare/kcov_campagin also export it in
+    # the guest env so `init` — a separate process — sees it too.)
+    if getattr(args, 'kcov', False):
+        os.environ['KSMBDZZER_KCOV'] = '1'
+    else:
+        os.environ.pop('KSMBDZZER_KCOV', None)
+
     seed_corpus, global_features, value_pool = corpus_load()   # P4 feed-forward
     vpool = list(value_pool) or [0, 64, 4096, 0x1000, 0xFFFF, 0x40000116]
     lib = _get_lib()
     n = lib.pfz_grain_count()
     grains = [(i, lib.pfz_grain_name(i).decode()) for i in range(n)]
     # Focused testing (-t/--target GRAIN ...): run ONLY the named grains instead of the
-    # whole fleet — e.g. `gfuzz -t write copychunk` to iterate on specific procedures.
+    # whole fleet — e.g. `fuzz -t write copychunk` to iterate on specific procedures.
     # Default (no -t) runs everything. Unknown names are warned and ignored.
     _targets = getattr(args, 'target', None)
     if _targets:
@@ -1927,11 +1944,17 @@ def cmd_grain_fuzz(args):
     # combined multi-arm log. Re-teal (_LOG_COLOR) after the name so the trailing key stays
     # in this module's colour; the print override appends the final reset.
     _eng = os.environ.get('KSMBDZZER_ENGINE', 'dataflow')
-    print(f"  [ENGINE] gfuzz coverage/mutator engine = {_PINK_BOLD}{_eng}{_LOG_RESET}{_LOG_COLOR}"
+    print(f"  [ENGINE] fuzz coverage/mutator engine = {_PINK_BOLD}{_eng}{_LOG_RESET}{_LOG_COLOR}"
           f"   (dataflow = pc⊕val coverage + i2s · dataflow-vec = whole-arg vector, "
           f"value-class-normalized (pointer/scalar) + i2s · dataflow-rel = dataflow-vec + "
           f"within-record pairwise cmp3 · pc-i2s = pc-only + i2s · pc-havoc = pc-only + havoc)",
           flush=True)
+    # Coverage SOURCE banner (KSMBDZZER_KCOV was already set above, before _get_lib(), so
+    # pfz_init picked the right backend; the grain workers inherit it via os.environ).
+    if os.environ.get('KSMBDZZER_KCOV') == '1':
+        print(f"  [COV] coverage source = {_PINK_BOLD}mainline KCOV{_LOG_RESET}{_LOG_COLOR} "
+              f"(/sys/kernel/debug/kcov, trace-pc) — kcov-dataflow disabled for this run",
+              flush=True)
     # Auth policy → grain env (grains are launched with os.environ). --everytime-auth restores
     # the original per-grain fresh-NTLMv2 pool handshake; default is lazy/session-reuse.
     if getattr(args, 'everytime_auth', False):
@@ -2145,7 +2168,7 @@ def cmd_grain_fuzz(args):
     print("=== 4-phase grain campaign done ===", flush=True)
     # Force immediate exit. After the campaign, lingering daemons (ksmbd.mountd, the KDC)
     # and the daemon watchdog thread keep the process/serial pipe open, so a plain return
-    # leaves gfuzz "done" but not exited — vng never sees the --exec command finish and the
+    # leaves fuzz "done" but not exited — vng never sees the --exec command finish and the
     # host STALL watchdog burns 420s per arm before killing the idle VM. os._exit(0) skips
     # atexit/thread-join and terminates now; all output is already flushed, and the shell's
     # trailing `poweroff -f` then powers the guest off cleanly.
@@ -2177,8 +2200,8 @@ def main():
         epilog=(
             'typical workflow (run inside the virtme-ng guest):\n'
             '  ksmbdzzer.py init                        # bring up ksmbd + share + RDMA + KDC\n'
-            '  ksmbdzzer.py gfuzz -r 5 --grain-max 25 # 5 rounds over the whole grain fleet\n'
-            '  ksmbdzzer.py gfuzz -r 5 -t write copychunk reparse   # focus a few grains\n'
+            '  ksmbdzzer.py fuzz -r 5 --grain-max 25 # 5 rounds over the whole grain fleet\n'
+            '  ksmbdzzer.py fuzz -r 5 -t write copychunk reparse   # focus a few grains\n'
             '  ksmbdzzer.py probe-test                  # one-shot write-side oracle check\n'
             '\n'
             "run 'ksmbdzzer.py <command> -h' for per-command options.\n"
@@ -2195,7 +2218,7 @@ def main():
             'RDMA (SIW/RXE) for SMBDirect, (re)start ksmbd.mountd, mount //127.0.0.1/share,\n'
             'and start an optional KDC for the Kerberos path. Each step logs [init] N/9 so a\n'
             'stall is attributable. Safe to re-run (idempotent). Run this ONCE per boot\n'
-            'before gfuzz.'))
+            'before fuzz.'))
     ip.add_argument('--install-deps', action='store_true',
                     help='apt-get install the runtime deps first (ksmbd-tools, cifs-utils, '
                          'smbclient, krb5, rdma-core). Usually already present in the image.')
@@ -2206,11 +2229,11 @@ def main():
     sub.add_parser('probe-test', help='Run the dataflow director once and exit (fast oracle check)')
 
     gp = sub.add_parser(
-        'gfuzz', aliases=['fuzz'],
+        'fuzz',
         help='Run the fuzzer: 4-phase round-based GRAIN campaign',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
-            'Round-based GRAIN fuzzer (this is THE fuzzing command; `fuzz` is an alias).\n'
+            'Round-based GRAIN fuzzer (this is THE fuzzing command).\n'
             'Each round runs 4 phases:\n'
             '  P1 enumerate — build one libFuzzer harness per grain (the normal-scenario library)\n'
             '  P2 saturate  — fuzz each grain to coverage plateau, kcov-dataflow-directed, N-way\n'
@@ -2221,9 +2244,9 @@ def main():
             'campaign. NOTE: this is round-based — there is no time budget; use -r for depth.'),
         epilog=(
             'examples:\n'
-            '  ksmbdzzer.py gfuzz -r 5 --grain-max 25         # whole fleet, 5 rounds\n'
-            '  ksmbdzzer.py gfuzz -r 3 -t write copychunk       # only the write + copychunk grains\n'
-            '  ksmbdzzer.py fuzz  -r 1 --grain-max 15 --verbose   # quick smoke run (alias)\n'
+            '  ksmbdzzer.py fuzz -r 5 --grain-max 25          # whole fleet, 5 rounds\n'
+            '  ksmbdzzer.py fuzz -r 3 -t write copychunk        # only the write + copychunk grains\n'
+            '  ksmbdzzer.py fuzz -r 1 --kcov --verbose          # mainline KCOV coverage source\n'
             '\n'
             'a "grain" is one SMB2/SMB3 procedure harness; -t/--target restricts the run to a\n'
             'subset for focused testing (default: all grains in libksmbdzzer.so).'))
@@ -2249,6 +2272,10 @@ def main():
                          'For focused/targeted testing of specific procedures.')
     gp.add_argument('--verbose', action='store_true',
                     help='Extra per-grain diagnostics (i2s hits, kernel-PC counts).')
+    gp.add_argument('--kcov', dest='kcov', action='store_true',
+                    help='Use mainline /sys/kernel/debug/kcov (trace-pc) as the coverage source '
+                         'instead of kcov-dataflow — the fork-free baseline for the KCOV vs '
+                         'KCOV-DATAFLOW comparison. Sets KSMBDZZER_KCOV=1 for the grain workers.')
 
     stp = sub.add_parser(
         'selftest',
@@ -2282,7 +2309,7 @@ def main():
 
     args = parser.parse_args()
     if args.cmd == 'init': cmd_init(install_deps=args.install_deps)
-    elif args.cmd in ('gfuzz', 'fuzz'): cmd_grain_fuzz(args)
+    elif args.cmd == 'fuzz': cmd_grain_fuzz(args)
     elif args.cmd == 'selftest': cmd_selftest(args)
     elif args.cmd == 'validate': cmd_validate(args)
     elif args.cmd == 'probe-test': cmd_probe_test()
@@ -2315,7 +2342,7 @@ def cmd_build_grains(args):
         os.environ['KSMBDZZER_STATIC'] = '1'
         print("  [build-grains] STATIC-embed build (libksmbdzzer.c compiled into each "
               "grain; only system .so remain dynamic — robust over 9p)", flush=True)
-    lib = _get_lib()
+    lib = _get_lib(init=False)   # registry-only: build-grains just compiles (no coverage/SMB)
     if lib is None:
         print("  [build-grains] libksmbdzzer.so failed to load — build the .so first "
               "(cc -shared ... libksmbdzzer.c). Aborting.", flush=True)

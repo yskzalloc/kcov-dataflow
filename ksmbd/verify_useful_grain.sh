@@ -10,7 +10,7 @@
 #   BAIL  = returned <0 every run               → bailed at a prereq (pool/fid/auth/config)
 #
 # It writes the meaningful set to ksmbd/grain/WORKING_SUBSET.txt (coverage-desc, usable as a
-# gfuzz `-t` list) and the full run to a timestamped log. This is a seconds-scale filter over
+# fuzz `-t` list) and the full run to a timestamped log. This is a seconds-scale filter over
 # the WHOLE fleet — the cheap answer to "which of our grains are meaningful", run BEFORE any
 # fuzzing campaign spends budget on dead weight.
 #

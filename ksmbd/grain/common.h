@@ -184,17 +184,17 @@ static int cov_mode = -1;                    /* 0 = path+bounded-value (default)
  * `mutate_i2s()` which reads only memory (g_fb + df_buf) per-exec. The Python
  * arbiter (ksmbdzzer.py Arbiter._distill) writes FUZZDB/fb.bin; grains load it at
  * LLVMFuzzerInitialize via $GRAIN_FB. g_fb = distilled cross-round; df_buf = live. */
-static void fb(void) {
-    if (cov_mode < 0) {
-        grain_engine();
-        const char *e = getenv("GRAIN_DATAFLOW"); cov_mode = (e && e[0]=='1');
-        /* #5 tuning: sweep the path/value split against a real run with no
-         * recompile — smaller path_n => more value buckets (RedQueen-heavy),
-         * larger => more path bulk. Bounds keep both regions non-degenerate. */
-        const char *p = getenv("GRAIN_PATH_N");
-        if (p && p[0]) { int v = atoi(p); if (v >= 256 && v <= CTR_N - 64) { path_n = v; val_n = CTR_N - v; } }
-    }
-    __builtin_memset((void *)ctr, 0, sizeof(ctr));
+/* ── Coverage backend ─────────────────────────────────────────────────
+ * dataflow (value-sensitive kcov_dataflow) vs kcov (stock trace-pc). The backend is
+ * chosen ONCE in df_init() from KSMBDZZER_KCOV, so the hot path (fb()) just calls
+ * cov->fold() — no per-record branch on the coverage source. Add a source by adding
+ * one struct cov_ops, not by sprinkling if()s through the fold. */
+static int kcov_fd = -1;
+static volatile unsigned long *kcov_cover;
+
+/* dataflow fold: rich (pc,val) records → ctr[] (path bulk + first-seen value buckets,
+ * plus dataflow-vec/-rel) — the historical fb() body, moved verbatim. */
+static void df_fold(void) {
     uint64_t n = df_buf[0], pos = 1;
     while (pos + 3 <= 1 + n && pos < BUF_WORDS) {
         uint64_t pc = df_buf[pos+1], val = df_buf[pos+3];
@@ -258,6 +258,56 @@ static void fb(void) {
         }
         pos += 3 + nf;
     }
+}
+/* kcov fold: stock trace-pc carries no values — PC-only (path bulk + pc_mark), i.e.
+ * exactly what an edge fuzzer sees. */
+static void kcov_fold(void) {
+    unsigned long n = kcov_cover ? kcov_cover[0] : 0;
+    if (n > (unsigned long)KCOV_COVER_WORDS - 1) n = KCOV_COVER_WORDS - 1;
+    for (unsigned long i = 1; i <= n; i++) {
+        uint64_t pc = (uint64_t)kcov_cover[i];
+        pc_mark(pc);
+        uint64_t h = pc * 0x517cc1b727220a95ULL;
+        ctr[(h>>12) % path_n]++;
+    }
+}
+static void df_dev_init(unsigned long h) {
+    df_fd = open("/sys/kernel/debug/kcov_dataflow", O_RDWR);
+    if (df_fd < 0) _exit(1);
+    ioctl(df_fd, KCOV_DF_INIT, (unsigned long)BUF_WORDS);
+    df_buf = mmap(0, BUF_WORDS*8, PROT_READ|PROT_WRITE, MAP_SHARED, df_fd, 0);
+    ioctl(df_fd, KCOV_DF_REMOTE_ENABLE, h);
+}
+static void df_dev_reset(void) { if (df_buf) df_buf[0] = 0; }
+static void kcov_dev_init(unsigned long h) {
+    kcov_fd = open("/sys/kernel/debug/kcov", O_RDWR);
+    if (kcov_fd < 0) _exit(1);
+    ioctl(kcov_fd, KCOV_INIT_TRACE, (unsigned long)KCOV_COVER_WORDS);
+    kcov_cover = mmap(0, KCOV_COVER_WORDS*sizeof(unsigned long),
+                      PROT_READ|PROT_WRITE, MAP_SHARED, kcov_fd, 0);
+    struct kcov_remote_arg arg = { .trace_mode = KCOV_TRACE_PC, .area_size = KCOV_COVER_WORDS,
+                                   .num_handles = 0, .common_handle = h };
+    ioctl(kcov_fd, KCOV_REMOTE_ENABLE, &arg);
+}
+static void kcov_dev_reset(void) { if (kcov_cover) kcov_cover[0] = 0; }
+struct cov_ops { const char *name; void (*init)(unsigned long); void (*reset)(void); void (*fold)(void); };
+static const struct cov_ops COV_DF   = { "dataflow", df_dev_init,   df_dev_reset,   df_fold  };
+static const struct cov_ops COV_KCOV = { "kcov",     kcov_dev_init, kcov_dev_reset, kcov_fold };
+static const struct cov_ops *cov = &COV_DF;
+
+
+static void fb(void) {
+    if (cov_mode < 0) {
+        grain_engine();
+        const char *e = getenv("GRAIN_DATAFLOW"); cov_mode = (e && e[0]=='1');
+        /* #5 tuning: sweep the path/value split against a real run with no
+         * recompile — smaller path_n => more value buckets (RedQueen-heavy),
+         * larger => more path bulk. Bounds keep both regions non-degenerate. */
+        const char *p = getenv("GRAIN_PATH_N");
+        if (p && p[0]) { int v = atoi(p); if (v >= 256 && v <= CTR_N - 64) { path_n = v; val_n = CTR_N - v; } }
+    }
+    __builtin_memset((void *)ctr, 0, sizeof(ctr));
+    cov->fold();
     /* Periodic metric emission: grain_atexit() is bypassed by the saturation SIGKILL
      * teardown, so KERNEL_PCS/RET_TOKEN_HITS/CMP_I2S_HITS were always 0 in the engine
      * table. Re-emit on the first fb() call and every 64 thereafter so gen.py's reader
@@ -458,7 +508,7 @@ static const char *grain_ip(void) {
     const char *e = getenv("GRAIN_IP");
     return (e && e[0]) ? e : "127.0.0.1";
 }
-/* Mirror of kernel KSMBD_KCOV_DF_IP_HANDLE for 127.0.0.<octet>. */
+/* Mirror of kernel KSMBD_KCOV_IP_HANDLE for 127.0.0.<octet>. */
 static unsigned long grain_handle(void) {
     const char *ip = grain_ip();
     const char *dot = strrchr(ip, '.');
@@ -469,14 +519,11 @@ static unsigned long grain_handle(void) {
 static void df_init(void) {
     setvbuf(stderr, NULL, _IOLBF, 0);   /* line-buffer: metric emits survive the
                                          * saturation SIGKILL (pipe = block-buffered). */
-    df_fd = open("/sys/kernel/debug/kcov_dataflow", O_RDWR);
-    if (df_fd < 0) _exit(1);
-    ioctl(df_fd, KCOV_DF_INIT, (unsigned long)BUF_WORDS);
-    df_buf = mmap(0, BUF_WORDS*8, PROT_READ|PROT_WRITE, MAP_SHARED, df_fd, 0);
-    /* Register the handle the kernel derives from our connection's local IP.
-     * Handle 0 was -EINVAL → the grain received NO kernel coverage and
-     * libFuzzer was guided only by its own userspace edges. */
-    ioctl(df_fd, KCOV_DF_REMOTE_ENABLE, grain_handle());
+    /* Select the coverage backend ONCE (KSMBDZZER_KCOV=1 → stock trace-pc, else
+     * kcov-dataflow) and open its device with the per-connection IP handle. */
+    const char *k = getenv("KSMBDZZER_KCOV");
+    cov = (k && k[0] == '1') ? &COV_KCOV : &COV_DF;
+    cov->init(grain_handle());
     atexit(grain_atexit);
 }
 
@@ -951,7 +998,7 @@ static int spec_run(struct pdu_spec *s, const uint8_t *data, size_t size) {
             if (has_file && o->off + 16 <= sizeof(s->skel)) memcpy(b + o->off, file_id, 16);
         }
     }
-    if (df_buf) df_buf[0] = 0;
+    cov->reset();
     return xact(pdu, 64 + s->body_len, resp, sizeof(resp));
 }
 

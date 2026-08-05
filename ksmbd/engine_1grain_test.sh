@@ -29,7 +29,7 @@ for eng in "${ENGINES[@]}"; do
   echo "===== ENGINE=${eng} grain=${GRAIN} (${GMAX}s) $(date +%T) ====="
   timeout -s SIGKILL 15m vng --user root --memory 8G --rw --cpus 4 \
     --append "nokaslr" \
-    --exec "sysctl -w kernel.kptr_restrict=0 2>/dev/null; rm -rf /tmp/ksmbdzzer_corpus_persistent /tmp/ksmbdzzer_stability.json; export KSMBDZZER_ENGINE=${eng}; export KSMBDZZER_P3_MAX_COMBOS=0; python3 ../ksmbd/ksmbdzzer.py init && python3 ../ksmbd/ksmbdzzer.py gfuzz -r 1 --grain-max ${GMAX} -t ${GRAIN}; sync; poweroff -f 2>/dev/null" \
+    --exec "sysctl -w kernel.kptr_restrict=0 2>/dev/null; rm -rf /tmp/ksmbdzzer_corpus_persistent /tmp/ksmbdzzer_stability.json; export KSMBDZZER_ENGINE=${eng}; export KSMBDZZER_P3_MAX_COMBOS=0; python3 ../ksmbd/ksmbdzzer.py init && python3 ../ksmbd/ksmbdzzer.py fuzz -r 1 --grain-max ${GMAX} -t ${GRAIN}; sync; poweroff -f 2>/dev/null" \
     < /dev/null > "$LOG" 2>&1
   echo "--- ${eng} metric lines ---"
   grep -aoE '(KERNEL_PCS|RET_TOKEN_HITS|CMP_I2S_HITS|DF_CMP_RECS|DF_ENT_RECS|DF_RET_RECS)=[0-9]+' "$LOG" | tail -14

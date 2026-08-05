@@ -1,5 +1,5 @@
 #!/bin/bash
-# ksmbd gfuzz ENGINE COMPARISON runner.
+# ksmbd fuzz ENGINE COMPARISON runner.
 #
 # Runs the SAME grains, on the SAME kernel, under three fuzzing engines and diffs
 # them head-to-head (a controlled ablation via KSMBDZZER_ENGINE — identical
@@ -13,7 +13,7 @@
 # pc-havoc isolates what trace_cmp i2s adds over blind havoc.
 #
 # Usage:  engine_compare_campagin.sh [ROUNDS] [GRAIN_MAX] [TIMEOUT_MIN_PER_ARM] [TRIALS]
-#   ROUNDS   gfuzz rounds PER ARM PER TRIAL (default 5)
+#   ROUNDS   fuzz rounds PER ARM PER TRIAL (default 5)
 #   GRAIN_MAX  per-grain cap (default 25)
 #   TIMEOUT_MIN_PER_ARM  hard-cap MINUTES per (arm,trial). Default derived from the MEASURED
 #            workload (cold P1 ~15m + ROUNDS x ~18m P2 + final-round P3 all-pairs tail),
@@ -30,7 +30,7 @@
 # replaced by hyphens so the path is a valid filename), holding
 # engine-<arm>-t<trial>.log per run plus summary.txt (the final table).
 #
-# RESUME-ON-WEDGE: gfuzz saves the corpus to the host-durable mirror (.fuzzdb, 9p
+# RESUME-ON-WEDGE: fuzz saves the corpus to the host-durable mirror (.fuzzdb, 9p
 # repo mount — NOT guest /tmp) after EVERY round, atomically. So if a run hangs
 # (→ hung_task_panic) or panics the kernel, its accumulated generations survive.
 # Each (arm,trial) is retried up to REDO+1 attempts; the COLD wipe happens ONLY on
@@ -41,7 +41,7 @@ set -o pipefail
 
 usage() {
   cat <<'EOF'
-engine_compare_campagin.sh — ksmbd gfuzz ENGINE COMPARISON runner
+engine_compare_campagin.sh — ksmbd fuzz ENGINE COMPARISON runner
 
 Builds ONE kernel + lib, then fuzzes the SAME grains under three engines (a
 controlled ablation via KSMBDZZER_ENGINE) and prints a head-to-head table.
@@ -55,9 +55,9 @@ USAGE
   engine_compare_campagin.sh -h | --help
 
 POSITIONAL ARGUMENTS  (all optional; shown with their defaults)
-  ROUNDS               5   gfuzz generations per (arm,trial). More = deeper feed-forward
+  ROUNDS               5   fuzz generations per (arm,trial). More = deeper feed-forward
                            corpus but longer runtime.
-  GRAIN_MAX          25  per-grain time cap (seconds), passed to gfuzz --grain-max.
+  GRAIN_MAX          25  per-grain time cap (seconds), passed to fuzz --grain-max.
                            Higher = each grain fuzzes deeper before moving on (needed for
                            i2s to actually fire; too low and pc-i2s≈pc-havoc means nothing).
   TIMEOUT_MIN_PER_ARM  hard-cap MINUTES per run. DEFAULT is derived from the measured
@@ -92,9 +92,9 @@ ENVIRONMENT OVERRIDES
              so `INSTRUMENT_ALL=1 vs 0` is a clean A/B of "what whole-kernel VALUE folding adds":
                INSTRUMENT_ALL=1 REDO=0 ARMS_OVERRIDE=dataflow-vec bash engine_compare_campagin.sh 1 20 "" 1
                INSTRUMENT_ALL=0 REDO=0 ARMS_OVERRIDE=dataflow-vec bash engine_compare_campagin.sh 1 20 "" 1
-  GFUZZ_ARGS   (unset)   extra args appended VERBATIM to the guest `ksmbdzzer.py gfuzz` command
+  GFUZZ_ARGS   (unset)   extra args appended VERBATIM to the guest `ksmbdzzer.py fuzz` command
              (after `-r ROUNDS --grain-max GRAIN_MAX`). Use it to scope the fleet with the
-             gfuzz `-t/--target` list — e.g. run ONLY the suspect SET_INFO/delete grains to
+             fuzz `-t/--target` list — e.g. run ONLY the suspect SET_INFO/delete grains to
              repro a wedge and capture its hung-task stack, or run a hang-free safe subset to
              validate metrics without fighting a kernel deadlock:
                GFUZZ_ARGS='-t set_disposition del_reparse set_eof offload_write offload_read' \
@@ -167,7 +167,7 @@ case "$INSTRUMENT_ALL" in 0|1) ;; *) echo "!!! INSTRUMENT_ALL must be 0 or 1"; e
 _IA_YN=$( [ "$INSTRUMENT_ALL" = 1 ] && echo y || echo n )
 
 _g="$GRAIN_MAX"; (( _g < 1 )) && _g=1
-# The P2 wall is FLEET-driven: gfuzz runs one wave per grain, ceil(FLEET/procs) waves per
+# The P2 wall is FLEET-driven: fuzz runs one wave per grain, ceil(FLEET/procs) waves per
 # round — it is NOT scaled by --grain-max (which only caps per-grain execs). The old model
 # scaled P2 by grain-max and badly underestimated once the fleet grew 25→112 grains: a g=20
 # run auto-derived 94m but needed ~100m and died at wave 108/112. Model per fleet size.
@@ -459,7 +459,7 @@ for trial in $(seq 1 "$TRIALS"); do
       # even when vng is blocked on a wedged qemu; CUR_PID = the `timeout` to tree-kill.
       timeout -s SIGKILL "${TIMEOUT_MIN}m" vng --verbose --user root --memory 16G --rw --cpus 8 \
         --append "nokaslr hung_task_panic=1 hung_task_timeout_secs=60 softlockup_panic=1" \
-        --exec "mount -t debugfs none /sys/kernel/debug 2>/dev/null; sysctl -w kernel.kptr_restrict=0; rm -rf /tmp/ksmbdzzer_corpus_persistent /tmp/ksmbdzzer_stability.json; export KSMBDZZER_ENGINE=${arm}; export KSMBDZZER_SEED=${trial}; export KSMBDZZER_AUTH_DEBUG=1; export KSMBDZZER_P3_MAX_COMBOS=${P3_MAX_COMBOS}; python3 ../ksmbd/ksmbdzzer.py init && python3 ../ksmbd/ksmbdzzer.py gfuzz -r ${ROUNDS} --grain-max ${GRAIN_MAX} -procs ${PROCS:-2} ${GFUZZ_ARGS:-}; timeout 12 sync 2>/dev/null; poweroff -f 2>/dev/null" \
+        --exec "mount -t debugfs none /sys/kernel/debug 2>/dev/null; sysctl -w kernel.kptr_restrict=0; rm -rf /tmp/ksmbdzzer_corpus_persistent /tmp/ksmbdzzer_stability.json; export KSMBDZZER_ENGINE=${arm}; export KSMBDZZER_SEED=${trial}; export KSMBDZZER_AUTH_DEBUG=1; export KSMBDZZER_P3_MAX_COMBOS=${P3_MAX_COMBOS}; python3 ../ksmbd/ksmbdzzer.py init && python3 ../ksmbd/ksmbdzzer.py fuzz -r ${ROUNDS} --grain-max ${GRAIN_MAX} -procs ${PROCS:-2} ${GFUZZ_ARGS:-}; timeout 12 sync 2>/dev/null; poweroff -f 2>/dev/null" \
         < /dev/null > >(tee -a "$LOG") 2>&1 &
       CUR_PID=$!
       # PROGRESS WATCHDOG: a wedged guest (kernel livelock / exit-storm) leaves the

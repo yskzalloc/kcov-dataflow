@@ -59,6 +59,41 @@ extern "C" {
 #define DF_BUF_WORDS           (1 << 23)
 #endif
 
+/* ─── Mainline kcov (fork-free coverage baseline; --kcov / KSMBDZZER_KCOV=1) ──────
+ * The fork-free control for the KCOV-vs-KCOV-DATAFLOW comparison: read plain
+ * trace-pc coverage from /sys/kernel/debug/kcov instead of the kcov_dataflow
+ * buffer. We reuse the SAME per-worker handle scheme (KSMBD_KCOV_IP_HANDLE)
+ * as the common_handle, so ksmbd's kcov_remote_start_common(conn->kcov_handle)
+ * routes this connection's PCs into this buffer — one routing formula, two
+ * coverage sources. NOTE: this collects only once the kernel actually assigns
+ * conn->kcov_handle to that handle (see the routing prerequisite). */
+struct kcov_remote_arg {
+    unsigned int        trace_mode;      /* KCOV_TRACE_PC / KCOV_TRACE_CMP */
+    unsigned int        area_size;       /* buffer size in unsigned-long words */
+    unsigned int        num_handles;     /* length of handles[] (we use 0) */
+    unsigned long long  common_handle;   /* per-worker remote handle */
+    unsigned long long  handles[0];
+};
+#ifndef KCOV_INIT_TRACE
+#define KCOV_INIT_TRACE        _IOR('c', 1, unsigned long)
+#endif
+#ifndef KCOV_ENABLE
+#define KCOV_ENABLE            _IO('c', 100)
+#endif
+#ifndef KCOV_DISABLE
+#define KCOV_DISABLE           _IO('c', 101)
+#endif
+#ifndef KCOV_REMOTE_ENABLE
+#define KCOV_REMOTE_ENABLE     _IOW('c', 102, struct kcov_remote_arg)
+#endif
+#ifndef KCOV_TRACE_PC
+#define KCOV_TRACE_PC          0
+#define KCOV_TRACE_CMP         1
+#endif
+#ifndef KCOV_COVER_WORDS
+#define KCOV_COVER_WORDS       (1 << 20)   /* 1M PCs; cover[0]=count, cover[1..]=PCs */
+#endif
+
 /* ─── SMB2 header helper (for elements building raw PDUs) ─────────────────── */
 static inline void smb2_hdr_build(uint8_t *h, uint16_t cmd,
                                   uint64_t mid, uint32_t tid, uint64_t sid)

@@ -48,7 +48,7 @@ the PDU never entered a handler.
 The bridge, per connection (see `[[ksmbd-remote-hooks-rebase-drop]]`):
 
 1. On init each grain opens `/sys/kernel/debug/kcov_dataflow`, mmaps a per-worker buffer
-   `g_df_buf`, and arms a **remote handle** `KSMBD_KCOV_DF_IP_HANDLE(octet)` keyed to its
+   `g_df_buf`, and arms a **remote handle** `KSMBD_KCOV_IP_HANDLE(octet)` keyed to its
    own loopback octet (`127.0.0.<octet>`).
 2. ksmbd's `__handle_ksmbd_work()` wraps every request in
    `kcov_df_remote_start(conn->kcov_handle)` … `kcov_df_remote_stop()`
@@ -3697,7 +3697,7 @@ places all 211.
 ```mermaid
 flowchart TD
     subgraph INIT["LLVMFuzzerInitialize — once per process"]
-        A["df_init(): open kcov_dataflow, / mmap g_df_buf, arm remote handle / KSMBD_KCOV_DF_IP_HANDLE(octet)"] --> B["smb_setup(SHARE): / NEGOTIATE → SESSION_SETUP (NTLM) → TREE_CONNECT"]
+        A["df_init(): open kcov_dataflow, / mmap g_df_buf, arm remote handle / KSMBD_KCOV_IP_HANDLE(octet)"] --> B["smb_setup(SHARE): / NEGOTIATE → SESSION_SETUP (NTLM) → TREE_CONNECT"]
         B --> C{"preamble ok?"}
         C -- no --> Z["_exit(1) ⇒ BAIL"]
         C -- yes --> D["create_targets(): CREATE persistent fid(s)"]
