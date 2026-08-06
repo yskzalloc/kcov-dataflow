@@ -81,7 +81,7 @@ GTAGS
 
 # paper
 *.pdf
-arxiv.zip
+*.zip
 
 # Build artifacts
 *.ko

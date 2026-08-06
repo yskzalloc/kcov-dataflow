@@ -1,2 +1,0 @@
-obj-m := crash_ffi.o
-KCOV_DATAFLOW_crash_ffi.o := n
