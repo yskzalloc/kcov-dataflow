@@ -1012,7 +1012,7 @@ sequenceDiagram
     participant G as grain
     participant S as ksmbd
     Note over G,S: raw connect :445 (own socket, no pool)
-    G->>S: NEGOTIATE (SMB2_SIGNING_CAPABILITIES ctx, SigningAlgorithmCount + fuzzed algo[] loop)
+    G->>S: NEGOTIATE (SMB2_SIGNING_CAPABILITIES ctx, SigningAlgorithmCount and fuzzed algo array loop)
     S-->>G: NEGOTIATE resp (read into resp)
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
@@ -1025,7 +1025,7 @@ sequenceDiagram
     participant G as grain
     participant S as ksmbd
     Note over G,S: raw TCP connect :445
-    loop 2× (1st dialect 0x0311, 2nd fuzzed)
+    loop 2 times (1st dialect 0x0311, 2nd fuzzed)
         G->>S: NEGOTIATE(0x00) re-negotiate on same conn
         S-->>G: reply (read)
     end
