@@ -1481,9 +1481,9 @@ _Fuzzes IOCTL input/output offset+count fields (InputOffset/Count, OutputOffset/
 sequenceDiagram
     participant G as grain
     participant S as ksmbd
-    Note over G,S: pool_lazy(1) + pool_ensure_fid("iov_v") → CREATE if no fid
-    Note over G: fuzzed CtlCode + overlapping/exceeding In/Out offsets & counts
-    G->>S: IOCTL (0x0B) IS_FSCTL, fuzzed In/Out layout
+    Note over G,S: pool_lazy(1), pool_ensure_fid("iov_v") → CREATE if no fid
+    Note over G: fuzzed CtlCode, overlapping/exceeding In-Out offsets and counts
+    G->>S: IOCTL (0x0B) IS_FSCTL, fuzzed In-Out layout
     S-->>G: reply
     Note over G,S: walk df_buf → fb() (coverage feed)
 ```
