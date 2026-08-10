@@ -1,0 +1,74 @@
+# Curated aligned-grain subset (#7) — grains that RELIABLY reach ksmbd kernel code.
+#
+# Derived from the 2026-07-19_20-30-53 engine-comparison campaign: every grain that was
+# tagged ALIGNED (libFuzzer ft >= 100, i.e. its input penetrated past the SMB parser into
+# real ksmbd logic) in >= 6 of the 9 runs. The ~50 grains NOT listed here stayed
+# consistently shallow or free-ran without establishing a session, so fuzzing them spends
+# budget without reaching the kernel — exactly the waste the fast-bail (#2) also targets.
+#
+# Usage:
+#   KSMBDZZER_ALIGNED=1 ... bash engine_compare_campagin.sh ...      (campaign preset)
+#   python3 ksmbdzzer.py gfuzz -r 1 --grain-max 40 -t $(grep -v '^#' grain/ALIGNED_SUBSET.txt)
+#
+# One grain name per line (the `-t` target name = the grain_<name> without the prefix).
+# Re-derive after fleet changes; this is a snapshot, not a hard-coded contract.
+setxattr
+rmxattr
+ndr
+cancel
+rename
+pipe
+unicode
+setattr
+session_bind
+mkrmdir
+create_alsi
+write_ext
+write
+truncate
+tdis
+tcon
+stream_write
+sign
+shadow_copy
+set_integrity
+session_setup
+sequence
+rpc_opnum
+resume_key
+resiliency
+race
+pipe_wait
+offload_write
+offload_read
+negotiate
+lease_v2
+get_reparse
+get_compression
+fsctl_valneg
+fsctl_sweep
+fsctl_sparse
+fsctl_setcomp
+fsctl_qar
+fsctl_objid
+fsctl_netif
+fsctl_dfs_ex
+fsctl_dfs
+echo
+dosattr
+dh2c
+del_reparse
+create_sd
+create_qfid
+create_posix
+create_mxac
+create_ea
+create_dh2
+create_appinst
+create_aapl
+copychunk_write
+compress
+append
+unlink
+durable
+query_dir
