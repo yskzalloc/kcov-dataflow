@@ -336,7 +336,8 @@ KCONFIG=(
   # ksmbd + RDMA transport. CONFIG_UNICODE = utf8_casefold path (case-insensitive share/file
   # names in ksmbd_casefold_sharename); without it that path falls back to ASCII and the
   # casefold_share_name grain's deep surface is unreachable.
-  CONFIG_NETWORK_FILESYSTEMS=y CONFIG_SMB_SERVER=y CONFIG_SMB_SERVER_SMBDIRECT=y CONFIG_UNICODE=y
+  CONFIG_NETWORK_FILESYSTEMS=y CONFIG_CIFS=y
+  CONFIG_SMB_SERVER=y CONFIG_SMB_SERVER_SMBDIRECT=y CONFIG_UNICODE=y
   CONFIG_SMBDIRECT=y CONFIG_SMB_SERVER_KERBEROS5=y
   CONFIG_INFINIBAND=y CONFIG_INFINIBAND_USER_ACCESS=y CONFIG_RDMA_RXE=y CONFIG_RDMA_SIW=y CONFIG_DUMMY=y
   # memory safety / UB / locking / lists

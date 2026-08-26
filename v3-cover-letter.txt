@@ -1,0 +1,337 @@
+kcov: add per-task dataflow tracking for function arguments/return values
+
+This series adds kcov_dataflow, a per-task mechanism that records the
+argument values a kernel function is called with and the value it
+returns, at instrumented function boundaries. Where KCOV tells you which
+code ran, kcov_dataflow tells you what values flowed through it.
+
+It is built on a SanitizerCoverage pass that inserts two callbacks,
+__sanitizer_cov_trace_args() at entry and __sanitizer_cov_trace_ret() at
+exit, so it needs a clang/rustc built with that pass [1][2]. When a task
+has no session enabled the cost is one boolean check.
+
+This is still an RFC: The compiler-side review is ongoing [2]. I am posting
+it to get the kernel-side design and the uapi reviewed in parallel with
+the LLVM work.
+
+Motivation
+==========
+
+Coverage-guided kernel fuzzers use KCOV edge coverage as their only
+feedback signal, which cannot distinguish two executions of the same
+function called with different argument values. Fuzzers plateau on
+stateful subsystems whose security-relevant behaviour depends on runtime
+values rather than control-flow topology.
+
+The existing tracing tools each miss part of this:
+
+- ftrace / kprobes / eBPF patch global kernel text, so a probe fires on
+  every task on every CPU; per-task selection is a post-trigger filter,
+  not a property of the instrumentation.
+
+- FTRACE_REGS_MAX_ARGS is limited to 6, but many functions still take
+  more than 7th+ arguments, even after inlining.
+
+- Rust is only partially reachable: rustc emits -mfentry stubs, but
+  idiomatic types (generics, slices) do not lower to the repr(C) shapes
+  that pahole/BTF-based argument printing expects.
+
+- Inlined code has no function boundary to trace at all without an
+  explicit noinline / #[inline(never)].
+
+kcov_dataflow is per-task, follows the task through execve, works
+uniformly for C and Rust, and (with CONFIG_KCOV_DATAFLOW_NO_INLINE) can
+keep the boundaries of otherwise-inlined functions.
+
+This idea originated from post-mortem auditing of reproducible exploit PoCs,
+such as those used in kCTF.
+
+Approach
+========
+
+The pass inserts a callback at each function entry that reports every
+argument and one at each return that reports the returned value. For a
+a struct, the kernel expands it field by field using the offsets
+the compiler emits from DWARF, so a struct argument is recorded
+as its individual members rather than an opaque address. The kernel
+backend reads the traced memory with copy_from_kernel_nofault() (a typed
+get_kernel_nofault() for the 1/2/4/8-byte scalar cases), so a NULL or
+ERR_PTR the callee received is recorded as a poison marker instead of
+faulting.
+
+Records go into a per-task mmap'd buffer over a dedicated debugfs device
+/sys/kernel/debug/kcov_dataflow, in execution order.
+
+Example
+=======
+
+eight_struct_args_c calls sft_1()..sft_8(), where sft_N takes N struct
+whose fields are 0x11, 0x22, ...; the viewer prints one call per
+line, source location on the left, and shows each expanded struct and the
+return value:
+
+  eight_struct_args_c.c:228     0x11 = stf_1(0x11)
+  eight_struct_args_c.c:232     0x33 = stf_2({0x22, 0x11})
+  eight_struct_args_c.c:238     0x77 = stf_3({0x33, 0x11, 0x22})
+  eight_struct_args_c.c:244     0xff = stf_4({0x44, 0x11, 0x22, 0x33})
+  eight_struct_args_c.c:251     0x20f = stf_5({0x55, 0x11, 0x22, 0x33, 0x44})
+  eight_struct_args_c.c:258     0x42f = stf_6({0x66, 0x11, 0x22, 0x33, 0x44, 0x55})
+  eight_struct_args_c.c:265     0x86f = stf_7({0x77, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66})
+  eight_struct_args_c.c:273     0x10ef = stf_8({0x88, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77})
+
+The same works for Rust modules.
+
+  eight_struct_args_rust.rs:101               0x11 = rstf_1(0x11)
+  eight_struct_args_rust.rs:130               0x33 = rstf_2({0x22, 0x11})
+  eight_struct_args_rust.rs:136             0x77 = rstf_3({0x33, 0x11, 0x22})
+  eight_struct_args_rust.rs:142           0xff = rstf_4({0x44, 0x11, 0x22, 0x33})
+  eight_struct_args_rust.rs:151         0x20f = rstf_5({0x55, 0x11, 0x22, 0x33, 0x44})
+  eight_struct_args_rust.rs:160       0x42f = rstf_6({0x66, 0x11, 0x22, 0x33, 0x44, 0x55})
+  eight_struct_args_rust.rs:169     0x86f = rstf_7({0x77, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66})
+  eight_struct_args_rust.rs:179   0x10ef = rstf_8({0x88, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77})
+
+Because the values cross the function boundary, kcov_dataflow can catch
+an FFI/contract violation that leaves no crash and no KASAN report. In
+rust_ffi_contract, ffi_alloc_buf() returns success (0) but leaves
+out->buffer == NULL; the caller then trusts the broken postcondition:
+
+  rust_ffi_contract.c:47   0x0 = ffi_alloc_buf({0x0, 0x0, 0x0, 0x0}, 0x100, 0x10, 0x1)
+  rust_ffi_contract.c:70   0xfffffff2 = ffi_check_result({0x0, 0x110, 0x0, 0x0})
+                                                          ^ buffer still NULL
+
+The {0x0, ...} first field at the second boundary is the NULL buffer the
+contract said could not happen after a 0 return.
+
+Global enablement (INSTRUMENT_ALL): records captured during single
+copy.fail exploit reproduction:
+
+  https://github.com/yskzalloc/kcov-dataflow/blob/main/copy.fail/origin/converted.txt
+
+Design
+======
+
+- Independent from /sys/kernel/debug/kcov: its own device, ioctl
+  namespace ('d') and per-task buffer, so it can run alongside KCOV.
+  Core lives in kernel/kcov_dataflow.c (split out of kcov.c on request).
+- Session lifetime mirrors mainline kcov: a refcounted object with a
+  back-pointer from the task, so fd close from a sibling thread, a forked
+  child, and task exit cannot race into a use-after-free.
+- Local (KCOV_DF_ENABLE) writes reserve buffer space with a plain
+  area[0] update; remote (KCOV_DF_REMOTE_ENABLE) writes merge with a
+  bounded atomic64_try_cmpxchg() loop. The two paths are mutually
+  exclusive on one buffer, so they never both touch area[0].
+- Safe reads via copy_from_kernel_nofault() / typed get_kernel_nofault().
+- kcov_df_inert_context() (in_task() and !pagefault_disabled()) rejects
+  interrupt/NMI context and, crucially, any nofault region: the trace-cmp
+  callback is reachable from the ORC unwinder that KASAN runs on every
+  slab free, and without this a live session turns one stack walk into a
+  self-instrumentation storm that trips the soft-lockup watchdog.
+- uapi record format (include/uapi/linux/kcov_dataflow.h): area[0] counts
+  the record words that follow; each record is a header word (sequence,
+  type, value count, size, argument index), the instrumented PC with the
+  KASLR offset removed like mainline kcov, the traced pointer (or the
+  comparison type for CMP records), then the value words.
+- Build: -fsanitize-coverage=trace-args,trace-ret, per-file opt-in
+  (KCOV_DATAFLOW_file.o := y) or CONFIG_KCOV_DATAFLOW_INSTRUMENT_ALL,
+  honouring KCOV_INSTRUMENT := n. kcov_dataflow.o is excluded from KCOV,
+  KASAN, KCSAN, UBSAN and KMSAN to avoid recursion. objtool lists
+  kcov_df_trace_cmp() in uaccess_safe_builtin[] next to its mainline peer
+  write_comp_data(), since the compiler emits the cmp callbacks inside
+  user_access_begin()/end() regions.
+
+Remote coverage
+===============
+
+Work a task queues to a kworker can be attributed back to it:
+kcov_df_remote_start(handle) / kcov_df_remote_stop() bracket a region in
+kernel code (kcov_df_remote_start_common() takes the common handle), and
+user space publishes a buffer for that handle with KCOV_DF_REMOTE_ENABLE
+(the handle is passed by pointer, so the full 64-bit value survives
+compat callers). rust_kworker_remote exercises this from RBTree work on
+system_wq.
+
+Rust kworker coverage is also captured through remote coverage,
+as shown by the rust_kworker_remote module test:
+
+  rust_kworker_remote.rs:58   <rust_kworker_remote[...]::CompositeStore>::populate({0x0, 0x0, 0x0})
+  rust_kworker_remote.rs:73   <rust_kworker_remote[...]::CompositeStore>::update({0xffff0000055f09c0, ...)
+  rust_kworker_remote.rs:92   <rust_kworker_remote[...]::CompositeStore>::drain({0xffff0000055f09c0, ...)
+
+Findings
+========
+
+The following commits fix issues found by ksmbdzzer, a KCOV data-flow-based
+fuzzing engine for ksmbd and SMB Direct. The issues include one CVE with
+a CVSS score of 8.8.
+
+  e7188199eff4 ksmbd: fix use-after-free in __close_file_table_ids() (CVE-2026-74522)
+  7405d0ba2943 ksmbd: fix slab-out-of-bounds read in ksmbd_alloc_user()
+  fe2c0cacbcff smb: smbdirect: free completion queues with ib_free_cq()
+  383a9480f5f4 smb: smbdirect: destroy QP before mem pools on accept failure
+  76fa42c004eb smb: smbdirect: avoid recursive listen.lock during cleanup
+  db82fbe4bb68 smb: smbdirect: release pending child sockets outside the handler lock
+  e9b33376bd07 ksmbd: validate ipc response length before dereferencing its fields
+  b0148dc5625d ksmbd: serialize oplock close with pending break ownership
+
+Performance
+===========
+
+Numbers from the v2 measurement [7]; the fast paths are unchanged in v3.
+
+Per-module instrumentation, recording active:
+  +8.3% on instrumented paths, ~27 ns per callback.
+
+Global instrumentation (INSTRUMENT_ALL), recording disabled:
+  .text +9.5%, .data +44%, boot +71%, syscall latency +133%.
+
+INSTRUMENT_ALL is a debugging/fuzzing configuration; per-module opt-in is
+the intended production use.
+
+Toolchain
+=========
+
+Requires a clang built with the trace-args/trace-ret passes:
+
+  git clone --recursive --depth 1 --shallow-submodules \
+    --jobs $(nproc) https://github.com/yskzalloc/kcov-dataflow.git
+  cd kcov-dataflow/llvm-project
+  cmake -S llvm -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DLLVM_ENABLE_PROJECTS="clang;lld" \
+    -DLLVM_TARGETS_TO_BUILD="X86;AArch64"
+  ninja -C build
+
+  export PATH=$PWD/../llvm-project/build/bin:$PATH
+  cd ../linux
+  vng --build LLVM=1 CC=clang
+    --configitem CONFIG_KCOV=y \
+    --configitem CONFIG_KCOV_DATAFLOW_ARGS=y \
+    --configitem CONFIG_KCOV_DATAFLOW_RET=y \
+    --configitem CONFIG_KCOV_DATAFLOW_INSTRUMENT_ALL=y \
+    --configitem CONFIG_DEBUG_INFO_DWARF5=y
+
+For the Rust modules also build a rustc against that LLVM [4] and add
+CONFIG_RUST=y with RUSTC=<.../stage1/bin/rustc> RUST_LIB_SRC=<.../library>.
+The Kconfig options gate on $(cc-option,-fsanitize-coverage=trace-args),
+so a stock clang simply leaves them unset rather than failing to build.
+
+Testing
+=======
+
+Built with clang/LLVM and rustc from the fork above, on x86_64 (Intel)
+under virtme-ng; arm64 has had lighter testing. The selftests build as a
+normal kselftest target (make -C tools/testing/selftests
+TARGETS=kcov_dataflow) and run under run_kselftest.sh:
+
+- user_ioctl: 9 kselftest_harness cases (init, mmap, enable/disable,
+  double-enable -EBUSY, record validity).
+- test_modules.py: loads each module, triggers it with recording active,
+  and checks the captured arguments, struct fields and return values
+  against the values the module uses (not merely that records appeared)
+  for eight_struct_args_{c,rust}, rust_ffi_contract and, from kworker
+  context, rust_kworker_remote.
+- binderfs: argument records at the binder ioctl boundaries.
+
+The compiler-side arguments/return values need review too; I would
+appreciate a second pair of eyes on the arm64 runs in particular.
+
+Links
+=====
+
+[1] LLVM RFC: https://discourse.llvm.org/t/rfc-sanitizercoverage-add-fsanitize-coverage-trace-args-trace-ret/91026
+[2] LLVM stacked PR:
+    1. [sancov] Add -fsanitize-coverage=trace-args,trace-ret
+       https://github.com/llvm/llvm-project/pull/201410
+    2. [Clang][SanitizerCoverage] Add trace-args and trace-ret instrumentation modes
+       https://github.com/llvm/llvm-project/pull/218254
+    3. [compiler-rt][SanitizerCoverage] Add userspace runtime for trace-args/ret 
+       https://github.com/llvm/llvm-project/pull/218265 
+[3] Repo:     https://github.com/yskzalloc/kcov-dataflow/
+[4] rustc:    https://github.com/yskzalloc/rust
+[5] CI:       https://github.com/yskzalloc/kcov-dataflow/actions
+[6] Paper:    https://arxiv.org/pdf/2606.00455
+[7] RFC v2: https://lore.kernel.org/all/20260611-b4-kcov-dataflow-v2-v2-0-0a261da3987c@est.tech/
+[8] LPC 2026: https://lpc.events/event/20/contributions/2402/
+
+Changes
+=======
+
+RFC v2 -> RFC v3:
+
+Core / review feedback (from the v2 posting):
+* Convert the spinlock-with-IRQ-disabled design to a mutex-based mechanism,
+  focusing on reproducible future LPE PoC tracking. (Yeoreum)
+* Rework the session lifetime into a refcounted object mirroring mainline
+  kcov (kcov_get/put), with a back-pointer from the task, so close() from
+  a sibling thread or a forked child, and task exit, can no longer race
+  into a use-after-free; the v2 fork/exit cleanup was ad-hoc.
+* Make the barriers real: v2 documented "paired barriers" that were only
+  comments. Enable/disable and the sequence guard now use actual
+  barriers, and buffer-space reservation uses a bounded
+  atomic64_try_cmpxchg() loop so the local and remote write paths never
+  both update area[0].
+* Add kcov_df_inert_context() (also bailing on pagefault_disabled()) to
+  contain the KASAN-unwinder self-instrumentation storm, instead of
+  excluding files in mm/ and arch/.
+* Typed get_kernel_nofault() fast path for 1/2/4/8-byte scalar reads.
+* objtool: list kcov_df_trace_cmp() in uaccess_safe_builtin[] and make
+  its helper __always_inline (fixes the "call ... with UACCESS enabled"
+  warning under INSTRUMENT_ALL).
+
+Support Remote kcov dataflow collection:
+* Add kcov_df_remote_start()/stop() and kcov_df_remote_start_common() for
+  kworker attribution, with a new kselftest with rust_kworker_remote.
+
+New record ABI:
+* include/uapi/linux/kcov_dataflow.h is now a real uapi header. Each
+  record carries its type, value count, size and argument index in the
+  header word, followed by the traced pointer and the value words; PCs
+  are stored KASLR-canonical, like mainline kcov. Documented in
+  kcov-dataflow.rst. KCOV_DF_REMOTE_ENABLE now takes the handle by
+  pointer.
+
+kselftest restructuring:
+* Restructure as a standard kselftest target (Kbuild + per-module
+  directories built against KDIR) driven by one KTAP runner
+  (test_modules.py) that checks captured argument/return values rather
+  than record counts; trigger-view.py is split out as the interactive
+  viewer.
+* Change the scalar arguments basic test from eight_args_{c,rust}
+  -> eight_struct_args_{c,rust} and drop the ad-hoc scripts.
+
+Series:
+* Split into core / Documentation / one selftest per patch (8 patches;
+  v1 was 14, v2 was 6).
+
+* RFC v2: https://lore.kernel.org/all/20260611-b4-kcov-dataflow-v2-v2-0-0a261da3987c@est.tech/
+
+RFC v1 -> RFC v2:
+
+Apply feedback from Sashiko’s code review:
+* Fix INIT_TRACK race, fork cleanup, task exit cleanup
+* Add recursion guard barriers (Peter)
+* Reject concurrent enable on multiple fds
+
+kselftest refinements (Alexander):
+* Move from tools to kselftest adding:
+  user_ioctl, eight_args_c, eight_args_rust, rust_ffi_contract, binderfs_test
+* Separate patch regarding kcov-dataflow Documentation
+ 
+* RFC v1 (I mistakenly referred to it as RFC v2):
+  https://lore.kernel.org/all/20260603-kcov-dataflow-next-20260603-v2-0-fee0939de2c4@est.tech/
+
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Andrey Konovalov <andreyknvl@gmail.com>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Marco Elver <elver@google.com>
+Cc: Nick Desaulniers <ndesaulniers@google.com>
+Cc: Jose E. Marchesi <jemarch@gnu.org>
+Cc: Nathan Chancellor <nathan@kernel.org>
+Cc: Matt Arsenault <arsenm2@gmail.com>
+Cc: Nikita Popov <nikic@php.net>
+Cc: Vitaly Buka <vitalybuka@google.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Josh Poimboeuf <jpoimboe@kernel.org>
+Cc: Masahiro Yamada <masahiroy@kernel.org>
+Cc: Nicolas Schier <nsc@kernel.org>
+Cc: Miguel Ojeda <ojeda@kernel.org>
+Cc: Yeoreum Yun <yeoreum.yun@arm.com>

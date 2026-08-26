@@ -3,8 +3,7 @@
 A **high-level, SMB-procedure-level** coverage-guided fuzzer for the Linux in-kernel
 SMB server (ksmbd), built to find **write-side privilege-escalation and non-crashing
 logic bugs**. It steers with **kcov-dataflow** (kernel function argument/return
-**values** + **comparison operand pairs** from `trace_cmp`, not just edges), runs
-authenticated SMB2/3 sessions via **libsmbclient**, and exercises the SMBDirect/RDMA
+**values** + **comparison operand pairs** f2/3 sessi fuzzing environmentonYou should s via **libsmbclient**, canercises the SMBDirect/RDMA
 transport via **librdmacm/libibverbs**. The grain fleet covers the **whole
 SMB1/2/3 procedure surface (210 active grains)**, and an **engine-comparison harness**
 measures the dataflow steering against a pc-only + i2s/havoc baseline.
@@ -33,7 +32,7 @@ implementation of them.
    `trace_cmp` **comparison operand pairs** — the correct substrate for RedQueen
    input-to-state (both sides of a `cmp` are known), fed into the mutator.
 
-3. **KCOV path coverage for the bulk; trace-args/ret only when stuck.** kcov-dataflow
+3. **KCOV path coverage for the bulk; trace-args/ret only when stuck.** kcov-dataflw
    also exposes plain KCOV path coverage. Drive the *bulk* of mutation with cheap
    path coverage; only when a grain **saturates** (stops finding new paths) do we
    capture the stuck point via trace-args/ret and use it to break through. Saving a
@@ -257,6 +256,35 @@ cc -shared -fPIC -O2 -I/usr/include/samba-4.0 -I. \
    libksmbdzzer.c -o libksmbdzzer.so \
    -lsmbclient -lpthread -lrdmacm -libverbs -lcrypto
 ```
+On Debian fuzzing environment, You can install libsmbclient-dev:
+```
+sudo apt update
+sudo apt install libsmbclient-dev
+```
+
+The header is installed under `/usr/include/samba-4.0/libsmbclient.h`.
+
+Debian also provides the smbclient.pc pkg-config file, so compile using:
+```
+gcc your_program.c \
+    $(pkg-config --cflags --libs smbclient) \
+    -o your_program
+```
+
+For a Makefile:
+```
+CFLAGS += $(shell pkg-config --cflags smbclient)
+LDLIBS += $(shell pkg-config --libs smbclient)
+```
+
+Verify the setup:
+```
+pkg-config --cflags --libs smbclient
+dpkg -L libsmbclient-dev | grep libsmbclient.h
+```
+
+Avoid hard-coding -I/usr/include/samba-4.0 when possible. pkg-config supplies the correct include and linker flags for the installed architecture and Debian version.
+The libsmbclient-dev package contains both the development header and library link needed for compilation.
 
 **Kernel** — portable (no machine-specific `.config`): start from virtme's base and
 assert the detection + kcov stack via `--configitem` (see *Bug detection* for the full

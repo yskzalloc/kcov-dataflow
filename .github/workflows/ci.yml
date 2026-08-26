@@ -231,95 +231,22 @@ jobs:
 
         MAKE_ARGS="LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC"
 
-        # Build user_ioctl and binderfs (native)
-        make -C tools/testing/selftests/kcov_dataflow
-        make -C tools/testing/selftests/kcov_dataflow/binderfs
+        # Install the uapi headers (the C tests include <linux/kcov_dataflow.h>),
+        # then let kselftest build the programs and, via Kbuild against this
+        # tree, the test modules (the Rust ones only with CONFIG_RUST=y), and
+        # install everything next to a generated run_kselftest.sh.
+        make $MAKE_ARGS headers
+        make -C tools/testing/selftests TARGETS=kcov_dataflow $MAKE_ARGS \
+          install INSTALL_PATH=$PWD/kselftest-install
+        ls -l kselftest-install/kcov_dataflow
 
-        # C struct args module
-        make $MAKE_ARGS M=tools/testing/selftests/kcov_dataflow/eight_struct_args_c modules
-
-        # Rust modules (non-RT only)
-        if [ "${{ matrix.rt }}" != "true" ] && \
-           make $MAKE_ARGS rustavailable 2>/dev/null; then
-          make $MAKE_ARGS M=tools/testing/selftests/kcov_dataflow/rust_ffi_contract modules
-          make $MAKE_ARGS M=tools/testing/selftests/kcov_dataflow/eight_struct_args_rust modules
-          make $MAKE_ARGS M=tools/testing/selftests/kcov_dataflow/rust_kworker_remote modules
-        fi
-
-    # --- Test execution (native on both arches) ---
-
-    - name: Run user_ioctl selftest
+    - name: Run selftests
       run: |
         source venv-virtme/bin/activate
         cd linux
-        SELFTEST=tools/testing/selftests/kcov_dataflow
-        vng --user root --exec $SELFTEST/user_ioctl/user_ioctl \
-          | tee /tmp/user_ioctl_result.txt
-
-
-
-    - name: Run rust_ffi_contract selftest
-      run: |
-        source venv-virtme/bin/activate
-        cd linux
-        SELFTEST=tools/testing/selftests/kcov_dataflow
-        if [ ! -f $SELFTEST/rust_ffi_contract/rust_ffi_contract.ko ]; then
-          echo "# Captured 0 records (rustc not available, skipped)" \
-            > /tmp/rust_ffi_result.txt
-          exit 0
-        fi
         vng --user root \
-          --exec "python3 $SELFTEST/trigger-view.py \
-            rust_ffi_contract -C 64 --ko $SELFTEST/rust_ffi_contract/rust_ffi_contract.ko" \
-          | tee /tmp/rust_ffi_result.txt
-
-    - name: Run binderfs selftest
-      run: |
-        source venv-virtme/bin/activate
-        cd linux
-        SELFTEST=tools/testing/selftests/kcov_dataflow
-        vng --user root --exec $SELFTEST/binderfs/binderfs_test \
-          | tee /tmp/binderfs_result.txt
-
-    - name: Run eight_struct_args_c selftest
-      run: |
-        source venv-virtme/bin/activate
-        cd linux
-        SELFTEST=tools/testing/selftests/kcov_dataflow
-        vng --user root \
-          --exec "python3 $SELFTEST/trigger-view.py \
-            eight_struct_args_c -C 64 --ko $SELFTEST/eight_struct_args_c/eight_struct_args_c.ko" \
-          | tee /tmp/eight_struct_args_c_result.txt
-
-    - name: Run eight_struct_args_rust selftest
-      run: |
-        source venv-virtme/bin/activate
-        cd linux
-        SELFTEST=tools/testing/selftests/kcov_dataflow
-        if [ ! -f $SELFTEST/eight_struct_args_rust/eight_struct_args_rust.ko ]; then
-          echo "# Captured 0 records (rustc not available, skipped)" \
-            > /tmp/eight_struct_args_rust_result.txt
-          exit 0
-        fi
-        vng --user root \
-          --exec "python3 $SELFTEST/trigger-view.py \
-            eight_struct_args_rust -C 64 --ko $SELFTEST/eight_struct_args_rust/eight_struct_args_rust.ko" \
-          | tee /tmp/eight_struct_args_rust_result.txt
-
-    - name: Run rust_kworker_remote selftest
-      run: |
-        source venv-virtme/bin/activate
-        cd linux
-        SELFTEST=tools/testing/selftests/kcov_dataflow
-        if [ ! -f $SELFTEST/rust_kworker_remote/rust_kworker_remote.ko ]; then
-          echo "# Captured 0 records (rustc not available, skipped)" \
-            > /tmp/rust_kworker_remote_result.txt
-          exit 0
-        fi
-        vng --user root \
-          --exec "python3 $SELFTEST/trigger-view.py \
-            rust_kworker_remote --ko $SELFTEST/rust_kworker_remote/rust_kworker_remote.ko --remote" \
-          | tee /tmp/rust_kworker_remote_result.txt
+          --exec "$PWD/kselftest-install/run_kselftest.sh -c kcov_dataflow" \
+          | tee /tmp/kselftest_result.txt
 
     # --- Results ---
 
@@ -329,42 +256,21 @@ jobs:
         echo "============================================"
         echo "  KCOV-DATAFLOW RESULTS: ${{ matrix.name }}"
         echo "============================================"
-        echo ""
-        echo "--- user_ioctl (TAP) ---"
-        grep -E "^(ok|not ok|#|PASSED|FAILED|TAP)" /tmp/user_ioctl_result.txt 2>/dev/null || echo "MISSING"
-        echo ""
-        echo ""
-        echo ""
-        echo "--- rust_ffi_contract ---"
-        cat /tmp/rust_ffi_result.txt 2>/dev/null || echo "MISSING"
-        echo ""
-        echo "--- binderfs ---"
-        cat /tmp/binderfs_result.txt 2>/dev/null || echo "MISSING"
-        echo ""
-        echo "--- eight_struct_args_c ---"
-        cat /tmp/eight_struct_args_c_result.txt 2>/dev/null || echo "MISSING"
-        echo ""
-        echo "--- eight_struct_args_rust ---"
-        cat /tmp/eight_struct_args_rust_result.txt 2>/dev/null || echo "MISSING"
-        echo ""
-        echo "--- rust_kworker_remote ---"
-        cat /tmp/rust_kworker_remote_result.txt 2>/dev/null || echo "MISSING"
-        echo ""
+        grep -E "^(ok|not ok|# (ok|not ok|Totals|FAIL|selftests:))" \
+          /tmp/kselftest_result.txt 2>/dev/null || echo "MISSING"
         echo "============================================"
 
     - name: Verify pass
       run: |
-        # Verify each test produced expected output
-        grep -qiE "PASSED|ok [0-9]" /tmp/user_ioctl_result.txt || \
-          { echo "FAIL: user_ioctl did not pass"; exit 1; }
-        grep -qE "Captured|skipped" /tmp/rust_ffi_result.txt || \
-          { echo "FAIL: rust_ffi_contract"; exit 1; }
-        grep -qE "ok [1-9]|SKIP" /tmp/binderfs_result.txt || \
-          { echo "FAIL: binderfs"; exit 1; }
-        grep -qE "Captured|skipped" /tmp/eight_struct_args_c_result.txt || \
-          { echo "FAIL: eight_struct_args_c"; exit 1; }
-        grep -qE "Captured|skipped" /tmp/eight_struct_args_rust_result.txt || \
-          { echo "FAIL: eight_struct_args_rust"; exit 1; }
-        grep -qE "Captured|skipped" /tmp/rust_kworker_remote_result.txt || \
-          { echo "FAIL: rust_kworker_remote"; exit 1; }
+        R=/tmp/kselftest_result.txt
+        for t in user_ioctl binderfs_test test_modules.py; do
+          grep -qE "^ok [0-9]+ selftests: kcov_dataflow: $t\$" $R || \
+            { echo "FAIL: $t"; exit 1; }
+        done
+        ! grep -qE "^(# )?not ok" $R || { echo "FAIL: failing test case"; exit 1; }
+        # Every module must have run when the kernel has Rust (non-RT builds).
+        if grep -q "^CONFIG_RUST=y" linux/.config; then
+          ! grep -qE "^# ok [0-9]+ .*# SKIP" $R || \
+            { echo "FAIL: a module test was skipped"; exit 1; }
+        fi
         echo "All tests passed (${{ matrix.name }})"
