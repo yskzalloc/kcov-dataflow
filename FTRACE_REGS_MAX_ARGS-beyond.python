@@ -48,15 +48,33 @@ METHODOLOGY NOTES / CAVEATS (this is why the script is not a one-liner):
 
 Usage:
     cd /path/to/linux
+
+    # 0. INDEX FIRST.  `semcode -q` only *queries*; it never indexes, so on a
+    #    fresh/empty database dump-functions silently writes 0 functions.  You
+    #    must populate the database with the separate `semcode-index` binary.
+    #    (semcode is git-aware: it answers queries for the current HEAD SHA, so
+    #    index the same commit you have checked out.)
+    semcode-index -s . --clear            # populates ./.semcode.db (slow, GBs)
+
+    # 1. dump every indexed function to JSON
     semcode -q "dump-functions /tmp/funcs.json"
+
+    # 2. list the blobs that make up the current HEAD tree
     git ls-tree -r HEAD | awk '$2=="blob"{print $3}' > /tmp/head_blobs.txt
+
+    # 3. run the census
     python3 FTRACE_REGS_MAX_ARGS-beyond.python /tmp/funcs.json /tmp/head_blobs.txt
+
+Run `python3 FTRACE_REGS_MAX_ARGS-beyond.python -h` for argument help.
+
+Sanity check the database is populated before step 1:
+    semcode -q "tables"    # Functions: 0  => you skipped step 0 (semcode-index)
 """
+import argparse
 import json
 import os
 import re
 import subprocess
-import sys
 from collections import Counter
 
 FTRACE_MAX = 6
@@ -102,8 +120,29 @@ def kernel_version_block():
     return "\n".join(l for l in lines if l) + "\n\n"
 
 def main():
-    funcs_path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/funcs.json"
-    blobs_path = sys.argv[2] if len(sys.argv) > 2 else "/tmp/head_blobs.txt"
+    parser = argparse.ArgumentParser(
+        prog="FTRACE_REGS_MAX_ARGS-beyond.python",
+        description=(
+            "Census of distinct kernel functions in the current HEAD tree with "
+            f">{FTRACE_MAX} parameters (FTRACE_REGS_MAX_ARGS), whose 7th+ argument "
+            "the ftrace function-args feature truncates."),
+        epilog=(
+            "Prerequisite: the semcode database must already be indexed with "
+            "`semcode-index -s . --clear` (semcode -q only queries, it does not "
+            "index). Then: `semcode -q \"dump-functions FUNCS_JSON\"` and "
+            "`git ls-tree -r HEAD | awk '$2==\"blob\"{print $3}' > HEAD_BLOBS`. "
+            f"Writes the report to {OUT}. LINUX_DIR env var overrides the tree "
+            f"path (default {LINUX_DIR})."),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("funcs_json", nargs="?", default="/tmp/funcs.json",
+                        help="JSON from `semcode -q \"dump-functions <file>\"`")
+    parser.add_argument("head_blobs", nargs="?", default="/tmp/head_blobs.txt",
+                        help="blob hashes of the HEAD tree "
+                             "(git ls-tree -r HEAD | awk '$2==\"blob\"{print $3}')")
+    args = parser.parse_args()
+
+    funcs_path = args.funcs_json
+    blobs_path = args.head_blobs
 
     head_blobs = set(l.strip() for l in open(blobs_path) if l.strip())
     with open(funcs_path) as f:
