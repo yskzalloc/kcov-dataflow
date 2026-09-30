@@ -12,6 +12,23 @@
 #   - arm64:  ubuntu-24.04-arm (TCG only, no KVM on GitHub arm64 runners)
 #
 # Rust kernel modules only build on non-RT (CONFIG_PREEMPT_RT conflicts with CONFIG_RUST)
+#
+# What each job is expected to prove:
+#   non-RT (CONFIG_RUST=y): all four test modules run and pass, and binderfs
+#     too -- the binder driver in this tree is ANDROID_BINDER_IPC_RUST, which
+#     "depends on RUST" (drivers/android/Kconfig), so binderfs exists only here.
+#   RT (CONFIG_RUST unset): the kernel builds and boots, the ioctl interface
+#     passes, and the two C modules (rust_ffi_contract, eight_struct_args_c --
+#     both unconditional obj-m) run and pass. The two Rust modules and
+#     binderfs legitimately SKIP. An RT job going green therefore does NOT
+#     mean the Rust side works; only the non-RT jobs can say that.
+#
+# Timeouts: the kcov_dataflow "settings" file asks for 300s per target, which
+# is sized for KVM. The arm64 runners have no KVM, so everything runs under
+# TCG and the heaviest target (test_modules.py: four module load/trigger/
+# unload cycles against an INSTRUMENT_ALL kernel) runs several times longer.
+# Each job therefore overrides the timeout explicitly rather than inheriting a
+# value that silently kills a test mid-run.
 
 name: kcov-dataflow kselftest
 
@@ -126,22 +143,32 @@ jobs:
             runner: ubuntu-latest
             rust-target: x86_64-unknown-linux-gnu
             rt: false
+            # KVM: the 300s in the kselftest settings file is adequate, but be
+            # explicit so the value does not depend on the runner image.
+            timeout: 600
           - name: x86_64-rt
             arch: x86_64
             runner: ubuntu-latest
             rust-target: x86_64-unknown-linux-gnu
             rt: true
+            timeout: 600
           - name: arm64
             arch: arm64
             runner: ubuntu-24.04-arm
             rust-target: aarch64-unknown-linux-gnu
             rt: false
+            # No KVM on GitHub arm64 runners, so this is TCG. Measured under
+            # KVM the three targets take ~70s of guest time; give TCG room
+            # rather than have test_modules.py killed on its last module.
+            timeout: 1800
           - name: arm64-rt
             arch: arm64
             runner: ubuntu-24.04-arm
             rust-target: aarch64-unknown-linux-gnu
             rt: true
+            timeout: 1800
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
 
     steps:
     - uses: actions/checkout@v4
@@ -200,11 +227,17 @@ jobs:
           EXTRA_CONFIGS="$EXTRA_CONFIGS --configitem CONFIG_COMPAT=n"
         fi
 
-        # Only enable Rust for non-RT
+        # Rust only on non-RT. The binder driver in this tree is Rust-only
+        # (config ANDROID_BINDER_IPC_RUST, drivers/android/Kconfig) and
+        # "depends on RUST", so it is enabled here and nowhere else. There is
+        # no ANDROID_BINDER_IPC or ANDROID_BINDERFS symbol in this tree; asking
+        # for those is silently ignored by vng, which is how the binderfs
+        # selftest came to SKIP in every job.
         RUST_CONFIGS=""
         if [ "${{ matrix.rt }}" != "true" ] && \
            make LLVM=1 RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC rustavailable 2>/dev/null; then
           RUST_CONFIGS="--configitem CONFIG_RUST=y"
+          RUST_CONFIGS="$RUST_CONFIGS --configitem CONFIG_ANDROID_BINDER_IPC_RUST=y"
         fi
 
         vng --build \
@@ -216,11 +249,42 @@ jobs:
           --configitem CONFIG_DEBUG_INFO=y \
           --configitem CONFIG_DEBUG_INFO_DWARF5=y \
           --configitem CONFIG_DEBUG_INFO_REDUCED=n \
-          --configitem CONFIG_ANDROID_BINDER_IPC=y \
-          --configitem CONFIG_ANDROID_BINDERFS=y \
+          --configitem CONFIG_WERROR=y \
           $RUST_CONFIGS \
           $EXTRA_CONFIGS \
           LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC
+
+    # CONFIG_KCOV_DATAFLOW_* carry
+    #   depends on !RUST || $(rustc-option,-Cllvm-args=-sanitizer-coverage-...)
+    # which fails open: a make that does not see RUSTC in its environment
+    # probes the default rustc, the dependency goes unmet, and every symbol is
+    # dropped from .config with no diagnostic. Read them back rather than
+    # trusting that --configitem took effect.
+    - name: Verify kernel config
+      run: |
+        cd linux
+        rc=0
+        for s in CONFIG_KCOV CONFIG_KCOV_DATAFLOW_ARGS CONFIG_KCOV_DATAFLOW_RET \
+                 CONFIG_KCOV_DATAFLOW_INSTRUMENT_ALL CONFIG_KCOV_DATAFLOW_NO_INLINE \
+                 CONFIG_DEBUG_INFO; do
+          if grep -q "^$s=y" .config; then
+            echo "ok      $s=y"
+          else
+            echo "MISSING $s"
+            rc=1
+          fi
+        done
+        if [ "${{ matrix.rt }}" != "true" ]; then
+          for s in CONFIG_RUST CONFIG_ANDROID_BINDER_IPC_RUST; do
+            if grep -q "^$s=y" .config; then
+              echo "ok      $s=y"
+            else
+              echo "MISSING $s (expected on a non-RT build)"
+              rc=1
+            fi
+          done
+        fi
+        exit $rc
 
     - name: Build selftests
       run: |
@@ -245,7 +309,7 @@ jobs:
         source venv-virtme/bin/activate
         cd linux
         vng --user root \
-          --exec "$PWD/kselftest-install/run_kselftest.sh -c kcov_dataflow" \
+          --exec "$PWD/kselftest-install/run_kselftest.sh -o ${{ matrix.timeout }} -c kcov_dataflow" \
           | tee /tmp/kselftest_result.txt
 
     # --- Results ---
@@ -256,21 +320,65 @@ jobs:
         echo "============================================"
         echo "  KCOV-DATAFLOW RESULTS: ${{ matrix.name }}"
         echo "============================================"
-        grep -E "^(ok|not ok|# (ok|not ok|Totals|FAIL|selftests:))" \
+        grep -E "^(ok|not ok|# (ok|not ok|Totals|FAIL|TIMEOUT|selftests:))|# TIMEOUT" \
           /tmp/kselftest_result.txt 2>/dev/null || echo "MISSING"
         echo "============================================"
 
+    # Note on matching: a kernel printk can land in the middle of a TAP line,
+    # e.g. "# ok 2 k[   18.3] workqueue: ... deprecated workqueue". Patterns
+    # here are therefore anchored at the start only -- never with a trailing
+    # $ -- so console noise cannot turn a passing run into a reported failure.
     - name: Verify pass
       run: |
         R=/tmp/kselftest_result.txt
-        for t in user_ioctl binderfs_test test_modules.py; do
-          grep -qE "^ok [0-9]+ selftests: kcov_dataflow: $t\$" $R || \
-            { echo "FAIL: $t"; exit 1; }
-        done
-        ! grep -qE "^(# )?not ok" $R || { echo "FAIL: failing test case"; exit 1; }
-        # Every module must have run when the kernel has Rust (non-RT builds).
-        if grep -q "^CONFIG_RUST=y" linux/.config; then
-          ! grep -qE "^# ok [0-9]+ .*# SKIP" $R || \
-            { echo "FAIL: a module test was skipped"; exit 1; }
+
+        fail() { echo "FAIL: $*"; exit 1; }
+
+        # A killed target reports TIMEOUT and leaves its remaining subtests
+        # with no result at all; say so instead of blaming the subtest.
+        if grep -qE "# TIMEOUT [0-9]+ seconds" $R; then
+          echo "--- timed out ---"
+          grep -E "# TIMEOUT" $R
+          fail "a test target exceeded the ${{ matrix.timeout }}s timeout"
         fi
+
+        for t in user_ioctl binderfs_test test_modules.py; do
+          grep -qE "^ok [0-9]+ selftests: kcov_dataflow: $t" $R || \
+            fail "$t did not report ok"
+        done
+
+        if grep -qE "^(# )?not ok" $R; then
+          echo "--- failing cases ---"
+          grep -E "^(# )?not ok" $R
+          fail "failing test case"
+        fi
+
+        # Modules that are unconditional obj-m (both are C) must run in every
+        # configuration, RT included.
+        for m in rust_ffi_contract eight_struct_args_c; do
+          grep -qE "^# ok [0-9]+ $m" $R || fail "module $m did not report ok"
+          if grep -qE "^# ok [0-9]+ $m.*# SKIP" $R; then
+            fail "module $m was skipped"
+          fi
+        done
+
+        # The Rust modules are obj-$(CONFIG_RUST), so they are only required
+        # where Rust is enabled. Scoped to module names on purpose: binderfs
+        # SKIPping is legitimate on an RT build, and the old blanket
+        # "no SKIP anywhere" check matched those lines and failed every job.
+        if grep -q "^CONFIG_RUST=y" linux/.config; then
+          for m in eight_struct_args_rust rust_kworker_remote; do
+            grep -qE "^# ok [0-9]+ $m" $R || fail "module $m did not report ok"
+            if grep -qE "^# ok [0-9]+ $m.*# SKIP" $R; then
+              fail "module $m was skipped on a CONFIG_RUST=y build"
+            fi
+          done
+          grep -qE "^# ok [0-9]+ kcov_dataflow.binderfs_setup" $R || \
+            fail "binderfs did not run on a CONFIG_ANDROID_BINDER_IPC_RUST=y build"
+        else
+          echo "note: CONFIG_RUST unset (RT build) -- Rust modules and"
+          echo "      binderfs are expected to SKIP; this job does not"
+          echo "      validate the Rust side."
+        fi
+
         echo "All tests passed (${{ matrix.name }})"

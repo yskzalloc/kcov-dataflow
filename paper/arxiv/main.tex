@@ -21,7 +21,7 @@
 \usepackage{pifont}
 \usepackage{amssymb}
 \usepackage{xspace}
-\usepackage[text=PREPRINT,color=gray!25,scale=3]{draftwatermark}
+% \usepackage[text=PREPRINT,color=gray!25,scale=3]{draftwatermark}
 \graphicspath{{media/}}
 
 \newcommand{\cmark}{\ding{51}}
@@ -55,20 +55,28 @@ example, two invocations of \texttt{copy\_from\_user()} with different size
 parameters hit identical basic blocks yet have vastly different security
 implications. I present \toolname{}, an LLVM-based instrumentation framework
 that extends Linux KCOV with data-flow extraction of function arguments and
-return values. A compiler pass emits lightweight callbacks capturing structured
-tuples of program counter, argument metadata, and field values at function
-entry and return. Composite types are automatically decomposed via DWARF
-\texttt{DICompositeType} metadata with zero source annotation. A lock-free
-per-task ring buffer delivers records to user space with no interference to
-existing KCOV or syzkaller infrastructure. I demonstrate dual utility:
+return values. A compiler pass emits lightweight callbacks that report one
+source-level parameter per call, passing the value itself in a register
+together with its index and byte size. A composite is instead reported by the
+address of the object holding it, paired with a constant table of field
+(offset, size) pairs derived from DWARF \texttt{DICompositeType} metadata, with
+zero source annotation. The callbacks carry no program counter---the kernel
+derives it from the return address, which also attributes records the compiler
+emitted from inside an inlined body to the callee that was inlined. A lock-free
+per-task record buffer delivers variable-length records to user space with no
+interference to existing KCOV or syzkaller infrastructure, carrying entry,
+return, and comparison-operand records in one unified stream. I demonstrate dual utility:
 (1)~fuzzers gain state-aware feedback for mutation guidance into
 value-dependent state transitions, and (2)~security analysts obtain
 deterministic argument records for root-cause analysis without
 \texttt{printk} or kprobe overhead. Two Rust instrumentation paths are
 provided: a post-compilation pipeline requiring no rustc modification, and
-native instrumentation via rustc built against the custom LLVM---both the
-only runtime methods for capturing Rust function arguments given that
-\texttt{drgn}/vmcore fails under \texttt{-O2} DWARF elision.
+native instrumentation via rustc built against the custom LLVM. Both decode
+idiomatic Rust arguments, which \texttt{ftrace} cannot---it can place a probe,
+since rustc does emit \texttt{\_\_fentry\_\_} stubs, but its BTF-based argument
+printing expects \texttt{repr(C)} shapes Rust types need not have, and is
+capped at six parameters---and which \texttt{drgn}/vmcore cannot either, as
+\texttt{-O2} elides the DWARF variable locations it reads.
 \end{abstract}
 
 \keywords{Kernel Fuzzing \and Data-Flow Extraction \and LLVM Instrumentation \and KCOV \and Rust for Linux}
@@ -76,7 +84,9 @@ only runtime methods for capturing Rust function arguments given that
 
 \section{Introduction}\label{sec:intro}
 
-The Linux kernel exceeds 40 million lines of code, integrates Rust(($\sim$397k Lines) Lines) as a second
+The Linux kernel exceeds 44 million lines of tracked source (38.4M of it C,
+headers, and assembly), integrates Rust ($\sim$199k lines, 160k of them in
+\texttt{rust/}) as a second
 systems language, and implements complex locking hierarchies
 (\texttt{rwsem}, \texttt{mutex}, RCU) that create deep state spaces unreachable
 by coverage-guided fuzzing alone. syzkaller~\cite{vyukov2015syzkaller} has
@@ -86,7 +96,8 @@ where security-critical behavior depends on runtime argument values rather than
 control-flow topology.
 
 The fundamental limitation is a \emph{semantic gap}: KCOV's \tracepc reports
-\emph{which} basic blocks executed but not \emph{with what values}. Two
+\emph{which} basic blocks executed but not \emph{with what values}
+(Figure~\ref{fig:blind-spot}). Two
 executions of \texttt{vfs\_open()} with different access-mode flags traverse
 identical edges yet have entirely different security implications. Fuzzers
 cannot distinguish these without data-flow context, leading to coverage
@@ -107,14 +118,19 @@ encode the \emph{intent} of a call; return values encode the \emph{outcome}.
 Capturing these at compile time with a lock-free kernel transport gives both
 fuzzers and analysts a new dimension of observability without source annotation.
 
-\toolname{} is an automated LLVM IR instrumentation framework that captures the
-data-flow tuple $\dftuple{\callerid}{\mathit{arg\_idx} \times
-\mathit{arg\_size}}{\mathit{ptr}}{\mathit{offsets}[]}$ at every function
-boundary. It operates through three layers:
+\toolname{} is an automated LLVM IR instrumentation framework that reports every
+function boundary with a five-operand callback
+$\langle \mathit{arg\_idx}, \mathit{size}, \mathit{val},
+\mathit{offsets}, \mathit{num\_fields} \rangle$,
+which the kernel turns into a record
+$\langle \mathit{PC}, \mathit{arg\_idx}, \mathit{size},
+\mathit{address}, \mathit{values}[\,] \rangle$.
+It operates through three layers:
 \begin{enumerate}[nosep]
-  \item A compiler pass that emits callbacks with struct field expansion via
-        DWARF metadata.
-  \item A kernel-resident lock-free per-task ring buffer delivered through a
+  \item A compiler pass that emits callbacks reporting a register-resident
+        value directly, and a composite by address plus a DWARF-derived field
+        table.
+  \item A kernel-resident lock-free per-task record buffer delivered through a
         separate \texttt{/sys/kernel/debug/kcov\_dataflow} dedicated debugfs interface.
   \item A user-space consumer interface for both fuzzer executors and human
         analysts.
@@ -122,19 +138,23 @@ boundary. It operates through three layers:
 
 My contributions are:
 \begin{itemize}[nosep]
-  \item An LLVM \sancov extension\footnote{\url{https://github.com/llvm/llvm-project/pull/201410}} that captures function arguments and return
-        values with automatic struct field expansion via \texttt{DICompositeType}
-        metadata, requiring zero source annotation.
+  \item An LLVM \sancov extension\footnote{\url{https://github.com/llvm/llvm-project/pull/201410}} that reports function arguments and return
+        values as \emph{source-level} parameters---one call per declared
+        parameter, including the parameters of callees the inliner merged
+        away---with automatic struct field expansion via
+        \texttt{DICompositeType} metadata and zero source annotation.
   \item A lock-free, per-task kernel transport mechanism that operates safely in
-        process context with explicit interrupt rejection, without interfering
-        with existing KCOV or syzkaller infrastructure.
+        sleepable task context, rejecting interrupt and nofault contexts, and
+        collecting from kernel threads through a remote-handle path, without
+        interfering with existing KCOV or syzkaller infrastructure.
   \item A post-compilation pipeline enabling Rust kernel module instrumentation
         without modifying the Rust compiler toolchain, and a native path via
         rustc built against the custom LLVM.
-  \item Empirical demonstration on five vulnerability classes showing that
-        boundary data-flow context provides information unavailable through any
-        combination of existing tools (coverage + sanitizers + post-mortem
-        debuggers).
+  \item A self-checking in-tree selftest suite---four kernel modules (two C,
+        two Rust) and two user-space tests---that pins down what the
+        instrumentation reports and, equally, where it stops: the eight-deep
+        value-nested and pointer-linked struct towers assert the shallow-capture
+        boundary rather than leaving it as an assumption.
 \end{itemize}
 
 
@@ -187,13 +207,13 @@ guidance.
 \draw[msg] ([yshift=-5.2cm]server.south) -- node[lbl] {file handle} ([yshift=-5.2cm]client.south);
 
 % Annotations
-\node[note, anchor=west] at ([xshift=0.5cm, yshift=-4.6cm]server.south) {$\to$ vfs\_open(flags)};
+\node[note, anchor=west] at ([xshift=0.5cm, yshift=-4.6cm]server.south) {$\to$ smb2\_open(work)};
 \node[note, anchor=east] at ([xshift=-0.3cm, yshift=-1.1cm]client.south) {coverage saturates here};
 \draw[decorate, decoration={brace, amplitude=3pt, mirror, raise=2pt}, gray]
   ([xshift=0.2cm, yshift=-0.6cm]client.south) -- ([xshift=0.2cm, yshift=-3.9cm]client.south)
   node[midway, left=5pt, note] {same edges};
 \end{tikzpicture}
-\caption{SMB2 protocol stages required before reaching \texttt{vfs\_open()}.
+\caption{SMB2 protocol stages required before reaching the file-create path.
 Edge coverage saturates after discovering the handshake sequence; the
 security-relevant \texttt{DesiredAccess} field inside SMB2\_CREATE is
 invisible to control-flow feedback.}\label{fig:ksmbd}
@@ -208,8 +228,27 @@ coverage of this multi-stage sequence saturates, all subsequent CREATE requests
 traverse identical edges regardless of \texttt{DesiredAccess}---the fuzzer
 cannot distinguish \texttt{FILE\_READ\_DATA} from
 \texttt{FILE\_WRITE\_DATA|FILE\_DELETE\_ON\_CLOSE}. With \toolname{}, the
-\texttt{DesiredAccess} field is captured at the \texttt{smb2\_open()} boundary,
-enabling value-aware mutation guidance at deep protocol stages.
+\texttt{DesiredAccess} value becomes visible---though not, as it happens, at
+the \texttt{smb2\_open()} boundary. That function takes a single
+\texttt{struct ksmbd\_work *}, and the request lives two levels down, behind
+that struct's \texttt{void *request\_buf}: an opaque pointer, whose pointee
+layout the compiler cannot describe, followed by the request struct itself.
+One level of dereference reaches \texttt{request\_buf}'s \emph{value} and stops
+(Section~\ref{sec:deref}). The field is instead captured where a callee
+receives it as a value---\texttt{smb\_map\_generic\_desired\_access(\_\_le32
+daccess)}, and \texttt{smb\_check\_perm\_dacl()}, which takes
+\texttt{req->DesiredAccess} as its fourth argument. Both are on the CREATE
+path, so the value is recorded on every request; it is simply recorded one
+frame deeper than the handler. This is the motivating example and also the
+clearest case of why the one-level rule matters in practice.
+
+Reaching those boundaries requires the remote path rather than plain per-task
+collection: ksmbd processes requests on kernel work queues, not in the syscall
+context of the client, so \texttt{fs/smb/server/} annotates its connection
+handler and request dispatcher with
+\texttt{kcov\_df\_remote\_start\_common()} /
+\texttt{kcov\_df\_remote\_stop()} (Section~\ref{sec:device}). That is the
+reason the transport cannot be per-task only.
 
 A second example arises at Rust-to-C FFI boundaries. A Rust wrapper calls a C
 function with a struct pointer whose fields determine kernel behavior. Edge
@@ -226,58 +265,68 @@ privilege check is bypassed---are invisible.
 ]
 % Left side: Edge Coverage
 \node[font=\footnotesize\bfseries] (t1) {Edge Coverage (KCOV)};
-\node[block, below=0.3cm of t1] (a1) {syscall()};
-\node[block, below=of a1] (b1) {vfs\_open()};
-\node[block, below=of b1] (c1) {do\_open()};
+\node[block, below=0.3cm of t1] (a1) {path\_openat()};
+\node[block, below=of a1] (b1) {do\_open()};
+\node[block, below=of b1] (c1) {vfs\_open\_consume()};
 \draw[arrow] (a1) -- (b1);
 \draw[arrow] (b1) -- (c1);
-\node[label, right=0.1cm of b1] {flags=?};
+\node[label, right=0.1cm of b1] {op=?};
 \node[label, below=0.1cm of c1] {Sees: A$\to$B$\to$C};
 
 % Right side: Data-Flow Extraction
 \node[font=\footnotesize\bfseries, right=3.5cm of t1] (t2) {+ Data-Flow Extraction};
-\node[block, below=0.3cm of t2] (a2) {syscall()};
-\node[block, below=of a2, fill=green!10] (b2) {vfs\_open()};
-\node[block, below=of b2] (c2) {do\_open()};
+\node[block, below=0.3cm of t2] (a2) {path\_openat()};
+\node[block, below=of a2, fill=green!10] (b2) {do\_open()};
+\node[block, below=of b2] (c2) {vfs\_open\_consume()};
 \draw[arrow] (a2) -- (b2);
 \draw[arrow] (b2) -- (c2);
-\node[label, right=0.1cm of b2, text=black] {flags=O\_WRONLY|O\_TRUNC};
-\node[label, below=0.1cm of c2] {Sees: A$\to$B(flags=0x241)$\to$C};
+\node[label, right=0.1cm of b2, text=black] {op$\to$\{0x8201,0,0x2,..\}};
+\node[label, below=0.1cm of c2] {Sees: A$\to$B(open\_flag=0x8201)$\to$C};
 \end{tikzpicture}
 \caption{Edge coverage reports identical paths for different argument values.
-Data-flow extraction reveals the security-relevant difference.}\label{fig:blind-spot}
+Data-flow extraction reveals the security-relevant difference: \texttt{do\_open()}
+receives a \texttt{const struct open\_flags *}, whose fields are expanded at the
+boundary. Nodes and values are from the capture in
+Figure~\ref{fig:calltree}.}\label{fig:blind-spot}
 \end{figure}
 
 \begin{figure}[t]
 \centering
 \begin{tikzpicture}[
   node distance=0.15cm,
-  rec/.style={font=\ttfamily\scriptsize, anchor=west},
-  entry/.style={rec, text=black!80},
+  rec/.style={font=\ttfamily\tiny, anchor=west},
+  entry/.style={rec, text=black!85},
   ret/.style={rec, text=black!60},
-  hl/.style={fill=yellow!30, rounded corners=1pt, inner sep=1pt},
 ]
-\node[entry] (l1) at (0,0) {do\_sys\_openat2(0xffffff9c, \colorbox{yellow!30}{"/etc/shadow"}, 0x241)};
-\node[entry] (l2) at (0.4,-0.4) {build\_open\_flags(\colorbox{yellow!30}{O\_WRONLY|O\_TRUNC})};
-\node[ret]   (l3) at (0.4,-0.8) {0x0 = build\_open\_flags()};
-\node[entry] (l4) at (0.4,-1.2) {getname\_flags(\colorbox{yellow!30}{"/etc/shadow"}, 0x0)};
-\node[ret]   (l5) at (0.4,-1.6) {0xffff8880... = getname\_flags()};
-\node[entry] (l6) at (0.4,-2.0) {vfs\_open(path, \colorbox{yellow!30}{\{.flags=0x241, .mode=0x1b6\}})};
-\node[entry] (l7) at (0.8,-2.4) {do\_dentry\_open(file, inode, 0x0)};
-\node[entry] (l8) at (1.2,-2.8) {security\_file\_open(\colorbox{yellow!30}{file, 0x241})};
-\node[ret]   (l9) at (1.2,-3.2) {0x0 = security\_file\_open()};
-\node[ret]   (la) at (0.8,-3.6) {0x0 = do\_dentry\_open()};
-\node[ret]   (lb) at (0.4,-4.0) {\colorbox{green!20}{0x4} = vfs\_open()};
-\node[ret]   (lc) at (0,-4.4) {\colorbox{green!20}{0x4} = do\_sys\_openat2()};
+\node[entry] (l1) at (0,0)     {ENTRY do\_sys\_openat2\ \ arg[0] sz=4\ \ \{0xffffff9c\}\quad\textrm{\itshape AT\_FDCWD}};
+\node[entry] (l2) at (0,-0.34) {ENTRY do\_sys\_openat2\ \ arg[1] sz=8\ \ \{0x7fff3eeaceb8\}\quad\textrm{\itshape user pathname}};
+\node[entry] (l3) at (0,-0.68) {ENTRY do\_sys\_openat2\ \ arg[2] sz=24 @0xffff888008797ea0 \colorbox{yellow!30}{\{0x8201, 0, 0\}}};
+\node[entry] (l4) at (0.4,-1.02) {ENTRY build\_open\_flags arg[0] sz=24 @0xffff888008797ea0 \colorbox{yellow!30}{\{0x8201, 0, 0\}}};
+\node[entry] (l5) at (0.4,-1.36) {ENTRY build\_open\_flags arg[1] sz=20 \colorbox{orange!25}{@0xffff888008797e54} \{0, 0, 0, 0, 0\}};
+\node[ret]   (l6) at (0.4,-1.70) {RET\ \ build\_open\_flags\ \ \ \ \ \ \ \ sz=4\ \ \{0\}};
+\node[entry] (l7) at (0.4,-2.04) {ENTRY getname\_flags\ \ \ \ arg[0] sz=8\ \ \{0x7fff3eeaceb8\}};
+\node[ret]   (l8) at (0.4,-2.38) {RET\ \ getname\_flags\ \ \ \ \ \ \ \ \ \ \ sz=192 @0xffff888008a847c0 \{0x..7d8, \colorbox{green!25}{0x2d66642f706d742f}\}};
+\node[entry] (l9) at (0.4,-2.72) {ENTRY path\_openat\ \ \ \ \ \ arg[1] sz=20 \colorbox{orange!25}{@0xffff888008797e54} \{0x8201, 0, 0x2, 0x10000, 0x1\}};
+\node[ret]   (la) at (0.8,-3.06) {RET\ \ vfs\_open\ \ \ \ \ \ \ \ \ \ \ \ \ \ \ sz=4\ \ \{0\}};
+\node[ret]   (lb) at (0.4,-3.40) {RET\ \ path\_openat\ \ \ \ \ \ \ \ \ \ \ \ \ sz=255 @0xffff8880063044c0 \{...\}};
+\node[ret]   (lc) at (0,-3.74)   {RET\ \ do\_sys\_openat2\ \ \ \ \ \ \ \ \ sz=4\ \ \colorbox{green!25}{\{0x4\}}\quad\textrm{\itshape the returned fd}};
 
-% Annotation
-\draw[decorate, decoration={brace, amplitude=4pt, raise=3pt}]
-  (8.5,0.1) -- (8.5,-4.5)
-  node[midway, right=7pt, font=\scriptsize\itshape, align=left] {Captured\\per-task\\at runtime};
+\node[font=\tiny\itshape, anchor=west, text=black!65] at (0,-4.2)
+  {\colorbox{yellow!30}{0x8201} = O\_WRONLY$|$O\_TRUNC$|$O\_LARGEFILE\quad
+   \colorbox{green!25}{0x2d66642f706d742f} = \texttt{"/tmp/df-"}};
+\node[font=\tiny\itshape, anchor=west, text=black!65] at (0,-4.5)
+  {\colorbox{orange!25}{same address} at two boundaries: the \texttt{struct open\_flags}
+   output parameter, empty at entry and filled later};
 \end{tikzpicture}
-\caption{Actual \toolname{} output for \texttt{open("/etc/shadow", O\_WRONLY|O\_TRUNC)}.
-Each line is a captured record showing function arguments (ENTRY) and return values (RET)
-with automatic struct field expansion. Indentation reflects call depth.}\label{fig:calltree}
+\caption{A real \toolname{} capture of one
+\texttt{open("/tmp/df-target", O\_WRONLY|O\_TRUNC)}, excerpted from 8{,}881
+records, with PCs resolved through \texttt{/proc/kallsyms}. Composite arguments
+are expanded field by field; register-resident ones are recorded as they come.
+Two things are visible that edge coverage cannot show: the requested flags
+reaching the VFS as \texttt{open\_how.flags}, and the same
+\texttt{struct open\_flags} object observed empty at
+\texttt{build\_open\_flags} entry and populated by the time
+\texttt{path\_openat} receives it.}\label{fig:calltree}
 \end{figure}
 
 \subsection{Threat Model and Assumptions}
@@ -286,9 +335,15 @@ I assume a standard kernel fuzzing threat model: an unprivileged user-space
 process with access to the syscall interface attempts to trigger memory
 corruption in kernel subsystems. KASAN/KMSAN detect the corruption once
 triggered; my tool provides the \emph{path to triggering} it and the
-\emph{data for triaging} it. I assume the kernel is compiled with debug
-information for full struct field expansion, though the system
-degrades gracefully to scalar-only capture without it.
+\emph{data for triaging} it. Debug information is not optional on the kernel
+side: \texttt{CONFIG\_KCOV\_DATAFLOW\_ARGS} and \texttt{\_RET} both
+\texttt{depend on DEBUG\_INFO}, so any kernel that can enable the feature can
+expand struct fields. The graceful degradation to register-value-only capture
+applies to the compiler pass in general---a translation unit built without
+\texttt{-g} still reports scalars---not to a kernel configuration. The Kconfig
+options additionally depend on \texttt{CC\_IS\_CLANG} and on
+\texttt{cc-option}/\texttt{rustc-option} probes for the two flags, so they do
+not appear at all on a toolchain lacking the pass.
 
 
 \section{System Design \& Architecture}\label{sec:design}
@@ -298,8 +353,8 @@ degrades gracefully to scalar-only capture without it.
 \toolname{} operates as a three-layer pipeline: (1)~compile-time
 instrumentation inserts data-flow callbacks into kernel object files,
 (2)~a runtime transport layer delivers records to user-space via a lock-free
-per-task ring buffer, and (3)~user-space consumers (fuzzer executors or analyst
-tools) read the buffer via \texttt{mmap()}. The system is activated by the
+per-task record buffer, and (3)~user-space consumers (fuzzer executors or analyst
+tools) read the buffer via \texttt{mmap()} (Figure~\ref{fig:arch}). The system is activated by the
 compiler flags \texttt{-fsanitize-coverage=trace-args,trace-ret} and
 requires no source-level annotation.
 
@@ -321,7 +376,7 @@ requires no source-level annotation.
 \node[layer, fill=orange!10, below=0.5cm of l1] (l2) {};
 \node[font=\scriptsize\bfseries, anchor=north west] at ([xshift=3pt,yshift=-3pt]l2.north west) {Kernel Runtime};
 \node[comp, fill=orange!15] at ([xshift=-2cm,yshift=-0.2cm]l2.center) (cb) {\_\_sanitizer\_cov\\\_trace\_args/ret};
-\node[comp, fill=orange!15] at ([xshift=2cm,yshift=-0.2cm]l2.center) (buf) {Per-Task\\Ring Buffer};
+\node[comp, fill=orange!15] at ([xshift=2cm,yshift=-0.2cm]l2.center) (buf) {Per-Task\\Record Buffer};
 
 % Layer 3: User space
 \node[layer, fill=green!10, below=0.5cm of l2] (l3) {};
@@ -330,7 +385,7 @@ requires no source-level annotation.
 
 % Arrows
 \draw[arrow] (pass) -- node[left, label, pos=0.35] {inserts callbacks} (cb);
-\draw[arrow] (cb) -- node[above, label] {atomic write} (buf);
+\draw[arrow] (cb) -- node[above, label] {reserve + write} (buf);
 \draw[arrow] (buf) -- node[left, label, pos=0.35] {shared memory} (user);
 \end{tikzpicture}
 \caption{Three-layer architecture: compile-time instrumentation, kernel-resident
@@ -340,111 +395,273 @@ lock-free buffer, and user-space consumption via \texttt{mmap()}.}\label{fig:arc
 \subsection{LLVM IR Boundary Instrumentation}\label{sec:llvm-pass}
 
 The instrumentation pass resides in LLVM's existing \sancov framework
-(\texttt{SanitizerCoverage.cpp}). For each function~$F$ with a
-\texttt{DISubprogram} debug info attachment:
+(\texttt{SanitizerCoverage.cpp}). It reports \emph{source-level} parameters, not
+IR arguments: for each function~$F$ carrying a \texttt{DISubprogram}, the pass
+recovers the declared parameter list from debug info and reports one callback
+per declared parameter.
 
-\paragraph{Argument Capture.} At function entry, for each parameter~$i$:
+\paragraph{Argument Capture.} At each frame's first legal insertion point, for
+each declared parameter~$i$:
 \begin{enumerate}[nosep]
-  \item Resolve the parameter's \texttt{DILocalVariable} $\to$ \texttt{DIType}.
-  \item If the type is a \texttt{DICompositeType} (struct/union): walk its
-        \texttt{DIDerivedType} members to extract field byte-offsets and sizes.
-        Compute an FNV-1a hash of the type name for deduplication.
-  \item Emit a compile-time constant global array:
-        \texttt{[hash, off$_0$, sz$_0$, off$_1$, sz$_1$, \ldots, off$_N$, sz$_N$]}.
-  \item Insert a call to \texttt{\_\_sanitizer\_cov\_trace\_args(pc, arg\_idx,
-        arg\_size, ptr, offsets\_ptr, num\_fields)} where \texttt{offsets\_ptr}
-        points past the hash element (GEP index~1).
+  \item Resolve the parameter's \texttt{DILocalVariable} to the IR value (or
+        values, when a \texttt{DW\_OP\_LLVM\_fragment} split it across
+        registers) that holds it, and to its \texttt{DIType}.
+  \item If that type is a pointer to a \texttt{DICompositeType}, or the
+        composite itself, walk the composite's \texttt{DW\_TAG\_member} list
+        and emit a private constant global
+        \texttt{[off$_0$, sz$_0$, off$_1$, sz$_1$, \ldots]}---a flat array of
+        $2N$ 64-bit words, one \emph{(offset, size)} pair per field, in bytes.
+        A bitfield is widened to the bytes that hold it rather than reported as
+        zero-sized. Tables are cached per \texttt{DICompositeType}, so one
+        global is shared by every parameter of that type in the module.
+  \item Insert a call to
+        \texttt{\_\_sanitizer\_cov\_trace\_args(arg\_idx, size, val,
+        offsets, num\_fields)} (Figure~\ref{fig:abi}).
 \end{enumerate}
-For scalar arguments, \texttt{offsets\_ptr} is \texttt{null} and
-\texttt{num\_fields} is~0. Pointer arguments are passed directly; scalars are
-spilled to an \texttt{alloca} so the kernel callback receives a uniform pointer
-interface.
 
-\paragraph{Return Value Capture.} Using LLVM's \texttt{EscapeEnumerator}, the
-pass locates every \texttt{ReturnInst} in~$F$ and inserts a call to
-\texttt{\_\_sanitizer\_cov\_trace\_ret(pc, ret\_size, ptr, offsets\_ptr,
-num\_fields)} before each return.
+\paragraph{Values remain values.} The callback's \texttt{val} operand is an
+\texttt{i64} passed \emph{in a register}. A value that fits in one---an
+integer, a pointer, a floating-point value---is widened in place
+(\texttt{zext}, \texttt{ptrtoint}, or \texttt{bitcast} of the bit pattern) and
+reported as it comes, with \texttt{offsets} null and \texttt{num\_fields}
+zero. No \texttt{alloca} is introduced and no memory is touched, so the pass
+does not force a value onto the stack that the ABI kept in a register. Only a
+composite whose fields are described is reported indirectly, and then
+\texttt{val} is the \emph{address} of the object and \texttt{size} is the
+object's size in bytes. A parameter the compiler cannot report at all is sent
+with \texttt{size}~0, which the kernel records as an explicit
+``no value'' marker rather than silently omitting the parameter.
 
-\paragraph{Edge Cases.} Functions without debug info, variadic functions, and
-\texttt{naked} functions are skipped gracefully. The pass is controlled by two
-\texttt{cl::opt} flags: \texttt{-sanitizer-coverage-trace-args} and
-\texttt{-sanitizer-coverage-trace-ret}.
+\paragraph{Inlined frames.} Because the pass keys on debug info rather than on
+IR arguments, it also reports the parameters of callees the inliner merged
+into~$F$, each from inside the inlined body, so inlining does not blind the
+tool. The callbacks therefore pass no program counter: the kernel takes the
+return address instead, which distinguishes the inlined bodies from each other
+(Section~\ref{sec:ringbuf}).
 
-\subsection{Lock-Free Per-Task Ring Buffer}\label{sec:ringbuf}
+\paragraph{Return Value Capture.} The pass scans~$F$'s blocks for
+\texttt{ReturnInst} terminators and inserts
+\texttt{\_\_sanitizer\_cov\_trace\_ret(size, val, offsets, num\_fields)}
+before each. A \texttt{musttail} call must stay adjacent to the return that
+forwards it, so those returns are skipped. A struct returned by value that the
+ABI lowered to an indirect return---the IR function returns \texttt{void} and
+writes through a hidden \texttt{sret} pointer---is reported by that buffer's
+address, so an indirect return is not dropped; a struct the ABI returned in
+registers has no address and is reported as its separate elements. Only~$F$'s
+own frame is reported: an inlined callee has no return instruction left, and no
+debug record describes a return value the way \texttt{DILocalVariable}
+describes a parameter.
 
-The kernel backend adds three fields to \texttt{task\_struct}:
-\texttt{kcov\_df\_area} (pointer to \texttt{u64} buffer),
-\texttt{kcov\_df\_size} (buffer capacity), and \texttt{kcov\_df\_seq}
-(monotonic sequence counter).
+\paragraph{Edge Cases.} Functions without debug info, variadic parameters
+beyond the declared list, and \texttt{naked} functions are skipped gracefully.
+Argument indices are 0-based and follow the source parameter list; the hidden
+\texttt{sret} pointer consumes no index. The pass is controlled by two
+\texttt{cl::opt} flags, \texttt{-sanitizer-coverage-trace-args} and
+\texttt{-sanitizer-coverage-trace-ret}, surfaced in the driver as
+\texttt{-fsanitize-coverage=trace-args,trace-ret}.
 
-\paragraph{Write Path.} The callback implementation uses
-\texttt{READ\_ONCE}/\texttt{WRITE\_ONCE} to reserve a contiguous slot in
-the buffer (portable to ARM64 without architecture-specific atomics).
-If the reserved offset exceeds
-\texttt{kcov\_df\_size}, the event is silently dropped---no blocking, no
-allocation, no spinlock. All pointer dereferences use
-\texttt{copy\_from\_kernel\_nofault()} to safely handle unmapped or poisoned
-memory (e.g., KASAN red zones, freed slabs). Values in the
-\texttt{IS\_ERR\_VALUE} range ($[-4095, -1]$) are detected and skipped.
+\begin{figure}[t]
+\centering
+\begin{lstlisting}[language=,numbers=none,columns=fullflexible,keepspaces=true,basicstyle=\ttfamily\tiny,caption={Emitted IR for \texttt{submit(struct S *, int, void *)} (void return) and \texttt{make\_big(int)} (24-byte \texttt{sret} return), from \texttt{clang -O1 -g -fno-inline -fsanitize-coverage=trace-args,trace-ret}. \texttt{\_\_sanitizer\_cov\_} prefixes and \texttt{unnamed\_addr} elided.},label=lst:abi]
+@__sancov_offsets_   = private constant [4 x i64] [i64 0, i64 4, i64 8, i64 8]
+@__sancov_offsets_.3 = private constant [6 x i64] [i64 0, i64 8, i64 8,
+                                                   i64 8, i64 16, i64 8]
 
-\paragraph{Record Format.} Each record is a variable-length sequence of
-\texttt{u64} words starting with a 3-word header: \texttt{[type\_and\_seq | pc | meta | field\_val$_0$ | \ldots | field\_val$_N$]} (or a single scalar value if \texttt{num\_fields} is 0). Here, \texttt{type\_and\_seq} packs the type marker (\texttt{0xE0000000} for entry, \texttt{0xF0000000} for return) and the 24-bit sequence number. The \texttt{meta} word packs the 8-bit argument index (for entry, 0 for return), 8-bit argument or return size in bytes, and the lower 48 bits of the raw pointer value.
+; void submit(struct S *s, int flags, void *token)
+call void @trace_args(i32 0, i32 16, i64 %4, ptr @__sancov_offsets_, i32 2)
+call void @trace_args(i32 1, i32  4, i64 %5, ptr null, i32 0)
+call void @trace_args(i32 2, i32  8, i64 %6, ptr null, i32 0)
+call void @trace_ret (        i32  0, i64  0, ptr null, i32 0)
+
+; struct Big make_big(int seed)  -- lowered to an sret pointer
+call void @trace_args(i32 0, i32  4, i64 %3, ptr null, i32 0)
+call void @trace_ret (        i32 24, i64 %7, ptr @__sancov_offsets_.3, i32 3)
+\end{lstlisting}
+\end{figure}
 
 \begin{figure}[t]
 \centering
 \begin{tikzpicture}[
-  cell/.style={rectangle, draw, minimum width=1.4cm, minimum height=0.5cm, font=\tiny, align=center},
+  node distance=0.35cm,
+  sig/.style={rectangle, draw, thick, rounded corners, fill=blue!8, minimum width=8.2cm, minimum height=0.55cm, font=\ttfamily\scriptsize, align=left, inner sep=4pt},
+  cell/.style={rectangle, draw, minimum width=1.5cm, minimum height=0.5cm, font=\tiny, align=center},
+  tbl/.style={cell, fill=yellow!15},
+  note/.style={font=\tiny\itshape, text=black!65},
+]
+\node[sig] (a) {trace\_args(arg\_idx, size, \colorbox{green!18}{val}, offsets, num\_fields)};
+\node[sig, below=0.3cm of a] (r) {trace\_ret(\phantom{arg\_idx, }size, \colorbox{green!18}{val}, offsets, num\_fields)};
+
+\node[note, below=0.35cm of r.west, anchor=north west] (n1)
+  {num\_fields = 0: \texttt{val} \emph{is} the value, \texttt{offsets} = null};
+\node[note, below=0.08cm of n1.west, anchor=north west] (n2)
+  {num\_fields = N: \texttt{val} is the object's address, \texttt{size} its byte size};
+
+% offsets table
+\node[tbl, below=0.5cm of n2.west, anchor=north west] (t0) {off$_0$};
+\node[tbl, right=0pt of t0] (t1) {sz$_0$};
+\node[tbl, right=0pt of t1] (t2) {off$_1$};
+\node[tbl, right=0pt of t2] (t3) {sz$_1$};
+\node[cell, right=0pt of t3, draw=none] (t4) {\ldots};
+\node[note, right=0.1cm of t4] {2N words, \texttt{.rodata}, no type tag};
+\node[note, left=0.1cm of t0] {offsets:};
+\end{tikzpicture}
+\caption{The callback ABI. \texttt{trace\_ret} is \texttt{trace\_args} without
+the argument index; neither takes a program counter. \texttt{val} is a single
+register-width operand: the value itself, or the address of the object whose
+fields the \texttt{offsets} table describes.}\label{fig:abi}
+\end{figure}
+
+\subsection{Lock-Free Per-Task Record Buffer}\label{sec:ringbuf}
+
+The buffer is append-only rather than circular, which is worth stating plainly
+because ``ring'' would imply the opposite failure mode: records accumulate from
+\texttt{area[1]} upward, \texttt{area[0]} counts the words committed so far,
+and once a record no longer fits it is dropped. A trace that outgrows the
+buffer therefore loses its \emph{tail}, not its head---the beginning of an
+execution is preserved, which is what a consumer reconstructing a call sequence
+needs. This matches mainline \texttt{kcov}'s buffer discipline.
+
+The kernel backend adds per-task fields to \texttt{task\_struct}:
+\texttt{kcov\_df\_area} (pointer to the \texttt{u64} buffer),
+\texttt{kcov\_df\_size} (capacity in words), \texttt{kcov\_df\_enabled},
+\texttt{kcov\_df\_seq} (sequence counter plus recursion guard), and, for the
+remote path, \texttt{kcov\_df} and \texttt{kcov\_df\_remote\_depth}.
+
+\paragraph{Write Path.} The callback implementation uses
+\texttt{READ\_ONCE}/\texttt{WRITE\_ONCE} to reserve a contiguous slot in
+the buffer (portable to ARM64 without architecture-specific atomics), under the
+same single-writer discipline as mainline \texttt{kcov.c}: the record length is
+validated first and the word count at \texttt{area[0]} is committed only once
+the record fits, so \texttt{area[0]} is always an exact high-water mark of
+written words. If the record does not fit, the event is silently
+dropped---no blocking, no allocation, no spinlock. The callbacks take no
+program counter; the recorded PC is the callback's return address minus one
+byte, so it lands inside the call instruction rather than on the instruction
+after it. That matters because the compiler also reports the arguments of
+inlined callees from inside each inlined body: an address one past the end of
+such a body would name the next frame. The PC is then canonicalized by
+subtracting the KASLR offset, as mainline \kcov{} does.
+
+When \texttt{num\_fields} is zero the value arrived in a register and is stored
+as it came---nothing is dereferenced. When it is non-zero, \texttt{val} is an
+address and each field is read as
+$\mathit{field\_addr} = \mathit{val} + \mathit{offsets}[2i]$ for
+$\mathit{offsets}[2i+1]$ bytes, clamped to 8, via
+\texttt{copy\_from\_kernel\_nofault()}. A \texttt{NULL} or
+\texttt{IS\_ERR\_VALUE} address ($[-4095,-1]$), a field that cannot be read,
+and a parameter the compiler reported with size~0 all store the sentinel
+\texttt{KCOV\_DF\_MAGIC\_BAD}, so a missing value is distinguishable from a
+genuine zero. The callbacks are bracketed by
+\texttt{user\_access\_save()}/\texttt{restore()} so that a record written from
+a function with SMAP/PAN user access enabled neither trips objtool nor leaves
+user access open across the collector.
+
+\paragraph{Record Format.} Each record is a variable-length run of
+\texttt{u64} words: a three-word header followed by $\mathit{nvals}$ value
+words, where $\mathit{nvals}$ is the number of expanded fields, or~1 when the
+record carries the value itself. Word~[0] packs the sequence number
+(bits 0--23), the record type (bits 28--31: \texttt{0xE} entry, \texttt{0xF}
+return, \texttt{0xC} comparison), $\mathit{nvals}$ (bits 32--47), the argument
+or return size in bytes (bits 48--55, clamped to 255), and the argument index
+(bits 56--63, clamped to 255; zero for a return). Word~[1] is the PC. Word~[2]
+is the address the field values were read from, and zero when the record
+carries the value itself---so word~[2] also tells a consumer which of the two
+shapes it is looking at (Figure~\ref{fig:record}). The field table itself never
+reaches user space: it stays in \texttt{.rodata}, and the record carries only
+the resulting values.
+
+\paragraph{Unified stream.} When \texttt{CONFIG\_KCOV\_ENABLE\_COMPARISONS} is
+also set, the shared \texttt{\_\_sanitizer\_cov\_trace\_cmp*()} callbacks fan
+out into the same buffer as \texttt{0xC} records carrying both operands and the
+\texttt{KCOV\_CMP\_SIZE()}/\texttt{KCOV\_CMP\_CONST} type bits, so
+input-to-state operand pairs and boundary arguments arrive interleaved in one
+sequence-numbered stream rather than in two buffers that must be correlated
+afterwards.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  cell/.style={rectangle, draw, minimum width=1.55cm, minimum height=0.5cm, font=\tiny, align=center},
   hdr/.style={cell, fill=blue!12},
   dat/.style={cell, fill=green!12},
   cnt/.style={cell, fill=gray!15},
+  bit/.style={rectangle, draw, minimum height=0.42cm, font=\tiny, align=center, fill=blue!6},
 ]
-\node[cnt] (c0) {area[0]\\count};
-\node[hdr, right=0pt of c0] (h1) {type|seq};
-\node[hdr, right=0pt of h1] (h2) {PC};
-\node[hdr, right=0pt of h2] (h3) {meta};
-\node[dat, right=0pt of h3] (d1) {field$_0$};
-\node[dat, right=0pt of d1] (d2) {field$_1$};
+\node[cnt] (c0) {area[0]\\word count};
+\node[hdr, right=0pt of c0] (h1) {[0] header};
+\node[hdr, right=0pt of h1] (h2) {[1] pc};
+\node[hdr, right=0pt of h2] (h3) {[2] address};
+\node[dat, right=0pt of h3] (d1) {val$_0$};
+\node[dat, right=0pt of d1] (d2) {val$_1$};
 \node[cell, right=0pt of d2, draw=none] (dots) {\ldots};
 
-\node[font=\tiny, below=0.2cm of c0] {u64};
-\node[font=\tiny\itshape, above=0.15cm of h1] {3-word header};
-\node[font=\tiny\itshape, above=0.15cm of d1] {N fields};
+\node[font=\tiny, below=0.15cm of c0] {u64};
+\node[font=\tiny\itshape, above=0.15cm of h2] {3-word header};
+\node[font=\tiny\itshape, above=0.15cm of d1] {nvals words};
 
 \draw[decorate, decoration={brace, amplitude=3pt, raise=2pt}]
   (h1.north west) -- (h3.north east);
 \draw[decorate, decoration={brace, amplitude=3pt, raise=2pt}]
   (d1.north west) -- (d2.north east);
+
+% header bit layout
+\node[bit, minimum width=1.5cm, below=0.75cm of c0.west, anchor=north west] (b0) {seq\\{}[23:0]};
+\node[bit, minimum width=0.9cm, right=0pt of b0] (b1) {type\\{}[31:28]};
+\node[bit, minimum width=1.2cm, right=0pt of b1] (b2) {nvals\\{}[47:32]};
+\node[bit, minimum width=1.1cm, right=0pt of b2] (b3) {size\\{}[55:48]};
+\node[bit, minimum width=1.3cm, right=0pt of b3] (b4) {arg\_idx\\{}[63:56]};
+\node[font=\tiny\itshape, right=0.15cm of b4] {word [0]};
 \end{tikzpicture}
-\caption{Ring buffer layout: area[0] holds the atomic write counter;
-each record has a 3-word header followed by field values.}\label{fig:record}
+\caption{Buffer layout: \texttt{area[0]} holds the committed word count; each
+record is a three-word header followed by \emph{nvals} value words. Word~[2] is
+the address fields were read from, or zero when the record carries the value
+itself.}\label{fig:record}
 \end{figure}
 
 \paragraph{Safety.} Callbacks are marked \texttt{notrace},
-\texttt{\_\_no\_sanitize\_coverage}, and \texttt{noinline} to prevent recursion.
-No \texttt{printk} or allocation occurs in the data path. An
-\texttt{in\_task()} guard at the top of the write path rejects all calls from
-non-process contexts (softirq, hardirq, and NMI), eliminating the risk of
-reentrant corruption when a hardware or software interrupt preempts a task
-that is already inside the callback.
+\texttt{\_\_no\_sanitize\_coverage}, and \texttt{noinline} to prevent recursion,
+and bit~31 of \texttt{kcov\_df\_seq} is a per-task guard held for the duration
+of a record so that instrumentation reached from inside the collector cannot
+re-enter it. No \texttt{printk} or allocation occurs in the data path. The write
+path bails out when \texttt{!in\_task() || pagefault\_disabled()}: the first
+rejects softirq, hardirq, and NMI, and the second contains the
+self-instrumentation storm that otherwise results when an instrumented leaf is
+reached from inside a \texttt{copy\_from\_kernel\_nofault()} region---a single
+KASAN stack walk would otherwise issue a callback per load.
 
 \subsection{Separate Device Interface}\label{sec:device}
 
 \toolname{} exposes \texttt{/sys/kernel/debug/kcov\_dataflow} as a device
-\emph{completely independent} from the exsiting \texttt{/sys/kernel/debug/kcov}.
+\emph{completely independent} from the existing \texttt{/sys/kernel/debug/kcov}.
 This ensures zero interference with syzkaller's existing KCOV usage.
 
 The ioctl namespace uses magic~\texttt{'d'}:
 \begin{itemize}[nosep]
-  \item \texttt{KCOV\_DF\_INIT\_TRACK} (\texttt{0x80086401}): allocate buffer
-  \item \texttt{KCOV\_DF\_ENABLE} (\texttt{0x6464}): start recording
-  \item \texttt{KCOV\_DF\_DISABLE} (\texttt{0x6465}): stop recording
+  \item \texttt{KCOV\_DF\_INIT\_TRACK} (\texttt{\_IOR('d', 1, unsigned long)}):
+        set the buffer size in \texttt{u64} words, by value, as
+        \texttt{KCOV\_INIT\_TRACE} does
+  \item \texttt{KCOV\_DF\_ENABLE} (\texttt{\_IO('d', 100)}): start recording
+        into the calling task's own buffer
+  \item \texttt{KCOV\_DF\_DISABLE} (\texttt{\_IO('d', 101)}): stop recording
+  \item \texttt{KCOV\_DF\_REMOTE\_ENABLE} (\texttt{\_IOW('d', 102, \_\_u64)}):
+        publish a \texttt{kcov\_remote\_handle()}-encoded handle so that kernel
+        threads and other tasks annotated with
+        \texttt{kcov\_df\_remote\_start()} record into this buffer; passed by
+        pointer so the full 64-bit handle survives 32-bit and compat callers
+  \item \texttt{KCOV\_DF\_REMOTE\_DISABLE} (\texttt{\_IO('d', 103)}): withdraw
+        the handle
 \end{itemize}
-User-space maps the buffer via \texttt{mmap()} for zero-copy reads.
+User-space maps the buffer via \texttt{mmap()} for zero-copy reads and walks it
+as \texttt{pos += KCOV\_DF\_RECORD\_WORDS(nvals)} while
+\texttt{pos < 1 + area[0]}. Remote writers assemble records in a private
+per-worker scratch buffer and publish them into the shared area with a single
+\texttt{atomic64\_try\_cmpxchg()} cursor update, so many kworkers can merge
+without a lock.
 
 \subsection{Rust Module Support}\label{sec:rust}
 
-The Rust compiler (\texttt{rustc}) bundles its own LLVM (v22 for rustc~1.95)
-which lacks my custom flags. Two instrumentation paths exist:
+The Rust compiler (\texttt{rustc}) bundles its own LLVM (v23 for
+rustc~1.101), which lacks my custom flags. Two instrumentation paths exist:
 
 \paragraph{Path A: Post-compilation pipeline (no rustc modification).}
 For environments using an unmodified rustc:
@@ -455,9 +672,19 @@ For environments using an unmodified rustc:
   \item \texttt{llc -filetype=obj}: compile to object code
   \item Standard module linking produces the instrumented \texttt{.ko}
 \end{enumerate}
+Step~2 needs no coverage level. It used to: the module pass returned
+immediately when the coverage type was \texttt{SCK\_None}, so a direct
+invocation without \texttt{-sanitizer-coverage-level} produced a cleanly
+linking but entirely uninstrumented module, with no diagnostic. The driver
+supplies a level when it parses \texttt{-fsanitize-coverage=}, which is why the
+failure only appeared through \texttt{opt}. Since argument and return tracing
+instrument function boundaries rather than blocks or edges, they are complete
+without a level, so the pass now admits them under \texttt{SCK\_None}; every
+block-level emission remains guarded by its own option, so nothing extra is
+inserted.
 This works because LLVM IR is language-agnostic: my pass operates identically
-on Rust-generated IR. The text format (\texttt{.ll}) avoids bitcode version
-incompatibilities between LLVM~22 and~23. Struct field expansion works on Rust
+on Rust-generated IR (Figure~\ref{fig:rust-pipeline}). The text format (\texttt{.ll}) avoids bitcode version
+incompatibilities between LLVM~23 and~24. Struct field expansion works on Rust
 \texttt{\#[repr(C)]} types whose \texttt{DICompositeType} metadata is preserved
 by \texttt{rustc} with debug info enabled.
 
@@ -478,16 +705,16 @@ by \texttt{rustc} with debug info enabled.
 \draw[arrow] (opt) -- node[above, label] {.ll} (llc);
 \draw[arrow] (llc) -- node[above, label] {.o} (ld);
 
-\node[label, below=0.15cm of rustc] {Rust LLVM 22};
-\node[label, below=0.15cm of opt] {Custom LLVM 23};
-\node[label, below=0.15cm of llc] {Custom LLVM 23};
+\node[label, below=0.15cm of rustc] {Rust LLVM 23};
+\node[label, below=0.15cm of opt] {Custom LLVM 24};
+\node[label, below=0.15cm of llc] {Custom LLVM 24};
 \end{tikzpicture}
 \caption{Rust post-compilation pipeline: text-format IR avoids bitcode version
 incompatibility between rustc's bundled LLVM and my custom pass.}\label{fig:rust-pipeline}
 \end{figure}
 
 \paragraph{Path B: Native instrumentation (custom rustc).}
-Building \texttt{rustc} against the custom LLVM~23 (via
+Building \texttt{rustc} against the custom LLVM~24 (via
 \texttt{llvm-config} in \texttt{config.toml}) gives rustc native support for
 \texttt{-Cllvm-args=-sanitizer-coverage-trace-args/ret}. The kernel build
 system then passes these flags transparently via
@@ -507,9 +734,11 @@ runtime.
 
 \paragraph{Mechanism.} When a function parameter is a pointer to a struct
 (e.g., \texttt{struct session\_data *sd} where \texttt{sd} was
-\texttt{kmalloc}'d), the LLVM pass emits the pointer value and the compile-time
-offset array. At runtime, the callback computes each field address as
-$\mathit{field\_addr} = \mathit{ptr} + \mathit{offset}[i]$ and reads via
+\texttt{kmalloc}'d), the LLVM pass emits the pointer value as the callback's
+\texttt{val} operand together with the compile-time offset table. At runtime,
+the callback computes each field address as
+$\mathit{field\_addr} = \mathit{val} + \mathit{offsets}[2i]$ and reads
+$\mathit{offsets}[2i+1]$ bytes via
 \texttt{copy\_from\_kernel\_nofault()}. This works regardless of whether the
 struct resides on the heap, stack, or in static memory.
 
@@ -518,12 +747,13 @@ struct resides on the heap, stack, or in static memory.
   \item \textbf{Freed slab (KASAN poison):} Safely reads poison bytes
         (\texttt{0xfd}/\texttt{0xff})---revealing the object was freed.
   \item \textbf{Unmapped page:} \texttt{copy\_from\_kernel\_nofault()} returns
-        error; field stored as~0.
-  \item \textbf{ERR\_PTR:} Detected via \texttt{IS\_ERR\_VALUE} range check;
-        pointer not dereferenced.
-  \item \textbf{NULL:} Detected and skipped (no crash).
-  \item \textbf{Nested structs:} Flattened---\texttt{DICompositeType} includes
-        nested fields with correct absolute offsets.
+        error; the field word is set to \texttt{KCOV\_DF\_MAGIC\_BAD}.
+  \item \textbf{ERR\_PTR:} Detected via the \texttt{IS\_ERR\_VALUE} range check;
+        the pointer is not dereferenced and every field word is
+        \texttt{KCOV\_DF\_MAGIC\_BAD}.
+  \item \textbf{NULL:} Same---detected, not dereferenced, marked.
+  \item \textbf{Field wider than a word:} A field larger than 8 bytes is
+        clamped to its low 8 bytes rather than skipped.
 \end{itemize}
 
 \paragraph{Design choice: shallow capture.} I perform exactly one level of
@@ -535,50 +765,107 @@ The pointer value itself is informative: NULL indicates freed/uninitialized,
 \texttt{0xffff888...} indicates valid kernel heap, and KASAN poison patterns
 indicate use-after-free.
 
+\paragraph{Nested objects are not followed.} The field table is flat and
+carries no types: a member that is itself a struct contributes a single
+\emph{(offset, size)} pair for the bytes it occupies, and a member that is a
+pointer to a struct contributes the 8 bytes holding the pointer. The compiler
+unwraps exactly one \texttt{DW\_TAG\_pointer\_type} level, and only at the top:
+a \texttt{struct inner *} member of a traced \texttt{struct outer} is reported
+as an address, not expanded, even when the module already contains a field
+table for \texttt{struct inner} because some other parameter had that type.
+Combined with the 8-byte clamp, a nested composite member is therefore visible
+only as its first word. Capturing a second level would require both a compiler
+change (a table shape that can express nesting) and a kernel change (a bounded
+recursive read), and the record format would have to grow a way to say which
+table a run of value words belongs to.
+
 \section{Implementation}\label{sec:impl}
 
-\subsection{LLVM Pass (270~LOC)}
+\subsection{LLVM Pass ($\sim$710~LOC)}
 
-The pass extends \texttt{SanitizerCoverage.cpp} with two new methods:
+The pass extends \texttt{SanitizerCoverage.cpp} with two entry points and a
+set of debug-info helpers.
 
-\texttt{InjectTraceForArgs(Function \&F)} iterates the function's formal
-parameters, resolving each to its \texttt{DILocalVariable} via the
-\texttt{DISubprogram} attached to~$F$. For each parameter whose type resolves
-(through \texttt{stripDITypedefs()}) to a \texttt{DICompositeType}, the pass
-calls \texttt{getStructFieldOffsets()} which:
-\begin{enumerate}[nosep,label=(\alph*)]
-  \item Walks the composite's member list extracting byte offsets and sizes.
-  \item Computes an FNV-1a hash of the struct's name (stored at index~0 of the
-        offsets array for type deduplication).
-  \item Creates a module-level \texttt{ConstantArray} global.
-\end{enumerate}
+\texttt{InjectTraceForArgs(Function \&F, const DominatorTree \&DT)} first calls
+\texttt{collectInlineFrames()}, which splits~$F$'s code into source-level
+frames---$F$'s own, plus one per callee the inliner merged in---and, for each,
+maps every \texttt{DILocalVariable} marked as a parameter back to the IR
+value(s) holding it, respecting \texttt{DW\_OP\_LLVM\_fragment} splits. Each
+frame is then reported by \texttt{injectTraceForFrame()}, which places the
+calls at the frame's start, pushed down past the definition of every reported
+value so each call is dominated by its operands and clamped back to a legal
+insertion point.
 
-\texttt{InjectTraceForRet(Function \&F)} uses \texttt{EscapeEnumerator} to find
-all function exit points and inserts the return-value callback before each
-\texttt{ReturnInst}.
+Type resolution goes through three helpers:
+\texttt{getDeclaredParamType()} and \texttt{getDeclaredReturnType()} read the
+declared types out of the subprogram's type array
+(\texttt{SP->getType()->getTypeArray()}), and
+\texttt{getTracedStructType()} unwraps a single
+\texttt{DW\_TAG\_pointer\_type} level to reach a \texttt{DICompositeType}.
+\texttt{getFieldOffsets()} then walks that composite's \texttt{DW\_TAG\_member}
+list, skipping static members and zero-sized members (a flexible array member
+or an empty base class), widening a bitfield to the bytes that hold it, and
+emits a private unnamed-address constant \texttt{\_\_sancov\_offsets\_} global
+of $2N$ words. Results are memoized in \texttt{FieldOffsetsCache} keyed on the
+\texttt{DICompositeType}, so one global serves every use of that type in the
+module---there is no name hash and no type tag in the table.
+
+\texttt{getReportedValue()} performs the widening to the callback's single
+\texttt{i64} operand; \texttt{getReportedValues()} splits a first-class
+aggregate the ABI passed in registers into its elements, each reported on its
+own.
+
+\texttt{InjectTraceForRet(Function \&F)} scans~$F$'s basic blocks for
+\texttt{ReturnInst} terminators, skipping those that forward a
+\texttt{musttail} call, and reports either the returned value, the pointee
+fields of a returned pointer, or the \texttt{sret} buffer of an indirect
+struct return.
 
 Integration into the clang driver required changes to:
 \begin{itemize}[nosep]
-  \item \texttt{CodeGenOptions.def}: two new \texttt{CODEGENOPT} flags
+  \item \texttt{CodeGenOptions.def}: \texttt{SanitizeCoverageTraceArgs} and
+        \texttt{SanitizeCoverageTraceRet} flags
   \item \texttt{SanitizerArgs.cpp}: parse \texttt{"trace-args"}/\texttt{"trace-ret"}
-        (enum values $1\ll20$ and $1\ll21$)
+        (enum values $1\ll20$ and $1\ll21$), and the corresponding
+        \texttt{-fsanitize-coverage-trace-args}/\texttt{-trace-ret} cc1 flags
   \item \texttt{BackendUtil.cpp}: wire to \texttt{SanitizerCoverageOptions}
-  \item \texttt{Instrumentation.h}: add \texttt{DataflowArgs}/\texttt{DataflowRet}
+  \item \texttt{Instrumentation.h}: add \texttt{TraceArgs}/\texttt{TraceRet}
         booleans
 \end{itemize}
+Unlike the other \sancov{} modes, \traceargs{} and \traceret{} satisfy the
+``some mode was requested'' check on their own, so neither implies
+\tracepc{}-guard instrumentation.
 
-\subsection{Kernel Backend (350~LOC)}
+\subsection{Kernel Backend ($\sim$1170~LOC)}
 
 The kernel implementation in \texttt{kernel/kcov\_dataflow.c} (a separate file
 from the existing \texttt{kcov.c}, per reviewer request) adds:
 \begin{itemize}[nosep]
-  \item \texttt{struct kcov\_dataflow}: owns buffer, size, sequence counter,
-        and \texttt{file\_operations}.
-  \item \texttt{\_\_sanitizer\_cov\_trace\_args()}: marked \texttt{notrace},
-        reads struct fields via \texttt{copy\_from\_kernel\_nofault()}, writes
-        the record using \texttt{READ\_ONCE}/\texttt{WRITE\_ONCE} slot reservation.
-  \item \texttt{\_\_sanitizer\_cov\_trace\_ret()}: same pattern for return values.
+  \item \texttt{struct kcov\_dataflow}: owns buffer, size, refcount, remote
+        handle, and \texttt{file\_operations}.
+  \item \texttt{\_\_sanitizer\_cov\_trace\_args(u32 arg\_idx, u32 arg\_size,
+        u64 val, u64 *offsets, u32 num\_fields)}: marked \texttt{notrace},
+        \texttt{\_\_no\_sanitize\_coverage}, \texttt{noinline}; wraps
+        \texttt{kcov\_df\_write()} in
+        \texttt{user\_access\_save()}/\texttt{restore()} and derives the PC
+        from \texttt{\_RET\_IP\_ - 1}.
+  \item \texttt{\_\_sanitizer\_cov\_trace\_ret(u32 ret\_size, u64 val,
+        u64 *offsets, u32 num\_fields)}: same pattern with argument index~0.
+  \item \texttt{kcov\_df\_write()}: the shared collector---context guard,
+        per-task recursion guard, slot reservation, header packing, and either
+        the single register value or the \texttt{num\_fields} nofault field
+        reads.
+  \item \texttt{kcov\_df\_trace\_cmp()}: reached from the shared
+        \texttt{\_\_sanitizer\_cov\_trace\_cmp*()} callbacks when
+        \texttt{CONFIG\_KCOV\_ENABLE\_COMPARISONS} is set, writing
+        \texttt{0xC} records into the same buffer behind a static key.
+  \item \texttt{kcov\_df\_remote\_start()}/\texttt{stop()} and
+        \texttt{kcov\_df\_merge()}: per-worker scratch collection published
+        into the shared area with an atomic cursor.
 \end{itemize}
+
+Both callbacks are added to objtool's \texttt{uaccess\_safe\_builtin[]} list,
+like the existing \texttt{\_\_sanitizer\_cov\_trace\_cmp*()} entries.
 
 Kconfig options \texttt{CONFIG\_KCOV\_DATAFLOW\_ARGS} and
 \texttt{CONFIG\_KCOV\_DATAFLOW\_RET} (both depending on \texttt{CONFIG\_KCOV})
@@ -587,11 +874,15 @@ gate compilation.
 \subsection{Build System Integration}
 
 \texttt{scripts/Makefile.kcov} exports \texttt{CFLAGS\_KCOV\_DATAFLOW}
-containing the sanitizer coverage flags. \texttt{scripts/Makefile.lib} applies
-these flags when a module's Makefile declares:
+containing the sanitizer coverage flags, \texttt{RUSTFLAGS\_KCOV\_DATAFLOW}
+containing the \texttt{-Cllvm-args=} equivalents for rustc, and
+\texttt{CFLAGS\_KCOV\_DATAFLOW\_NO\_INLINE} separately.
+\texttt{scripts/Makefile.lib} applies them when a module's Makefile declares:
 \begin{lstlisting}
 KCOV_DATAFLOW_my_module.o := y
 \end{lstlisting}
+The same per-file switch covers C and Rust objects, so a Rust module needs no
+separate opt-in mechanism.
 
 \paragraph{Global Enablement.}
 \texttt{CONFIG\_KCOV\_DATAFLOW\_INSTRUMENT\_ALL} mirrors
@@ -603,50 +894,114 @@ extraction for comprehensive fuzzing campaigns.
 
 \paragraph{Optional Inlining Control.}
 \texttt{CONFIG\_KCOV\_DATAFLOW\_NO\_INLINE} (default \texttt{n}) adds
-\texttt{-fno-inline} to instrumented files for complete argument visibility.
-Setting it to \texttt{y} provides full function boundary coverage at the cost
-of increased stack depth and code size---suitable for targeted investigation
-sessions but not continuous fuzzing.
+\texttt{-fno-inline} to files that opted in explicitly. It is not needed for
+argument visibility---the pass reports the parameters of inlined callees from
+inside each inlined body---but it keeps every frame a real call, which makes
+the recorded PCs resolvable by \texttt{kallsyms} alone and keeps records
+one-to-one with source call sites. The cost is increased stack depth and code
+size, so it is suitable for targeted investigation sessions but not continuous
+fuzzing. It deliberately does not extend to
+\texttt{CONFIG\_KCOV\_DATAFLOW\_INSTRUMENT\_ALL}: building the whole kernel
+with \texttt{-fno-inline} is not a supported configuration, because some code
+relies on the inliner to fold a value into an inline-asm \texttt{"i"} operand
+and fails to build without it.
 
-For Rust modules, the wrapper script
-\texttt{tools/kcov-dataflow/rustc-kcov-dataflow.sh} automates the three-stage
-pipeline.
+For Rust modules built through Kbuild, no wrapper script is involved:
+\texttt{RUSTFLAGS\_KCOV\_DATAFLOW} is appended by the same per-file switch
+that handles C objects. The three-stage \texttt{opt}/\texttt{llc} pipeline of
+Path~A applies only to modules built outside Kbuild.
+
+\subsection{User-Space Runtime and libFuzzer}\label{sec:libfuzzer}
+
+The same two callbacks have a user-space consumer, which keeps the ABI from
+being a kernel-private interface. \texttt{compiler-rt} provides weak no-op
+definitions in \texttt{sanitizer\_coverage\_libcdep\_new.cpp}, so a program
+built with the flags links and runs without a runtime that implements them, and
+libFuzzer provides real ones in \texttt{FuzzerTracePC.cpp}. Its
+\texttt{HandleDataflow()} derives the PC the same way the kernel does---caller
+return address minus one, for the same inlined-frame reason---drops records
+whose \texttt{size} is~0, and folds each observed value into the value profile
+keyed on the triple of call site, argument position, and field index, so the
+same value seen at a different site stays a distinct observation. A return is
+given the synthetic position \texttt{0xFFFF} so it cannot collide with an
+argument of the same function.
+
+Two independent clamps are worth noting because they differ from the kernel's.
+libFuzzer caps the field loop at 32 fields and, like the kernel, truncates a
+field wider than 8 bytes. More importantly, libFuzzer has the \emph{whole}
+\texttt{offsets} table in process---it reads the same \texttt{.rodata} array
+the compiler emitted---whereas the kernel record deliberately carries only the
+resulting values, leaving offsets and sizes behind
+(Section~\ref{sec:ringbuf}). The field table is therefore available to a
+user-space consumer and not to a kernel one; closing that gap is a UAPI
+question, not a compiler one.
 
 \subsection{User-Space Consumer}
 
-A minimal consumer opens \texttt{/dev/kcov\_dataflow}, calls
-\texttt{ioctl(KCOV\_DF\_INIT\_TRACE, buf\_size)} to allocate the buffer,
+A minimal consumer opens \texttt{/sys/kernel/debug/kcov\_dataflow}, calls
+\texttt{ioctl(KCOV\_DF\_INIT\_TRACK, size\_in\_words)} to size the buffer,
 \texttt{mmap()}s it, enables recording with \texttt{ioctl(KCOV\_DF\_ENABLE)},
-triggers the target kernel path, then reads records directly from the mapped
-buffer before calling \texttt{ioctl(KCOV\_DF\_DISABLE)}.
+triggers the target kernel path, then walks the mapped buffer---reading
+\texttt{area[0]} once and stepping record by record with
+\texttt{KCOV\_DF\_RECORD\_WORDS(KCOV\_DF\_HDR\_NVALS(hdr))}---before calling
+\texttt{ioctl(KCOV\_DF\_DISABLE)}. Because the PC is a return address inside
+the call that produced the record, resolving it with
+\texttt{addr2line -i} names an inlined callee, where \texttt{kallsyms} can only
+name the function its code was merged into.
 
 
 \section{Evaluation}\label{sec:eval}
 
 \subsection{Experimental Setup}
 
-I evaluate \toolname{} on linux-next 7.1.0-rc6 (next-20260604) compiled with
-my custom clang/LLVM~23 (commit \texttt{322873d}, trunk plus the dataflow
-pass). Rust modules are compiled with rustc~1.98.0-nightly (2026-05-22), built
-against the same LLVM~23 to share the dataflow instrumentation passes. The
-kernel is configured with:
+I evaluate \toolname{} on linux-next 7.3.0-rc5 (next-20261001) compiled with
+my custom clang/LLVM~24.0.0git (commit \texttt{ca763b76e2fd}, trunk plus the
+dataflow pass). Rust modules are compiled with rustc~1.101.0, built against
+that same LLVM~24 via \texttt{llvm-config} in \texttt{config.toml}, so the
+dataflow passes are shared rather than duplicated. The
+kernel is configured with the selftest fragment
+(\texttt{tools/testing/selftests/kcov\_dataflow/config}):
 \begin{itemize}[nosep]
-  \item \texttt{CONFIG\_KASAN=y}
   \item \texttt{CONFIG\_KCOV=y}
   \item \texttt{CONFIG\_KCOV\_DATAFLOW\_ARGS=y}
   \item \texttt{CONFIG\_KCOV\_DATAFLOW\_RET=y}
-  \item \texttt{CONFIG\_RUST=y}
-  \item \texttt{CONFIG\_ANDROID\_BINDER\_IPC=y}
-  \item \texttt{CONFIG\_SAMPLE\_RUST\_MISC\_DEVICE=y}
+  \item \texttt{CONFIG\_KCOV\_DATAFLOW\_INSTRUMENT\_ALL=y}
+  \item \texttt{CONFIG\_KCOV\_DATAFLOW\_NO\_INLINE=y}
+  \item \texttt{CONFIG\_DEBUG\_INFO\_DWARF5=y}, \texttt{CONFIG\_DEBUG\_FS=y}
+  \item \texttt{CONFIG\_RUST=y}, \texttt{CONFIG\_MODULES=y}
+  \item \texttt{CONFIG\_ANDROID\_BINDER\_IPC\_RUST=y} (binderfs comes with the
+        driver; there is no longer a separate C binder or
+        \texttt{CONFIG\_ANDROID\_BINDERFS} in this tree)
 \end{itemize}
-Tests run under virtme-ng (QEMU/KVM) with 8~vCPUs and 1\,GB RAM.
+plus \texttt{CONFIG\_KASAN=y} for the comparisons in
+Section~\ref{sec:eval}. Tests run under virtme-ng (QEMU/KVM) with 8~vCPUs
+and 1\,GB RAM.
 
-Four selftest kernel modules (2 Rust, 2 C) exercise argument capture
-correctness, and additional purpose-built modules in \texttt{findings/}
-exercise distinct scenarios: FFI contract violation, silent in-bounds
-corruption, 10-level deep taint propagation, binder ioctl edge cases, and
-Rust core API boundary conditions (KVec, RBTree, Arc, Page, UserSlice,
-credential subsystem).
+The test suite lives in \texttt{tools/testing/selftests/kcov\_dataflow/} and
+comprises four kernel modules (2~C, 2~Rust) plus two user-space tests, driven
+by a KTAP runner:
+\begin{itemize}[nosep]
+  \item \texttt{eight\_struct\_args\_c} and
+        \texttt{eight\_struct\_args\_rust}: 1--8 struct-pointer arguments,
+        value-nested and pointer-linked struct towers on stack,
+        \texttt{kmalloc} and \texttt{vmalloc} memory, pointer forwarding, and
+        a 32-byte struct return that the ABI lowers to an indirect
+        \texttt{sret} return.
+  \item \texttt{rust\_ffi\_contract}: an FFI contract violation---
+        \texttt{ffi\_alloc\_buf()} returns 0 but leaves
+        \texttt{alloc->buffer} \texttt{NULL}, and \texttt{ffi\_check\_result()}
+        receives that \texttt{NULL} and returns \texttt{-EFAULT}.
+  \item \texttt{rust\_kworker\_remote}: \texttt{kcov\_df\_remote\_start()} /
+        \texttt{stop()} from kworker context, capturing three phases of work
+        queued on \texttt{system\_wq} through a published remote handle.
+  \item \texttt{user\_ioctl} and \texttt{binderfs}: the ioctl interface and
+        binder ioctls under active recording, both as TAP tests.
+\end{itemize}
+\texttt{test\_modules.py} loads each module, triggers it with recording
+active, and checks the captured arguments, expanded struct fields, and return
+values against the values the module uses; \texttt{trigger-view.py} is the
+interactive viewer it is built on, with kallsyms/\texttt{addr2line}
+symbolization and a \texttt{--remote} capture mode.
 Source code is available at:
 kernel\footnote{\url{https://github.com/yskzalloc/linux}},
 LLVM\footnote{\url{https://github.com/yskzalloc/llvm-project}}, and
@@ -654,43 +1009,62 @@ rustc\footnote{\url{https://github.com/yskzalloc/rust}}.
 
 \subsection{Correctness Verification}
 
-Table~\ref{tab:correctness} shows that \toolname{} correctly captures
-pre-corruption (ENTRY) and post-corruption (RET) argument values for all five
-cases, matching \texttt{printk} ground truth.
+The suite is self-checking: \texttt{test\_modules.py} loads each module,
+triggers it with recording active, and compares the captured records against
+the values the module uses---25 assertions over argument indices, expanded
+struct fields, object addresses, sizes, and return values.
+Table~\ref{tab:correctness} reports a recorded run of the configuration in
+Section~\ref{sec:eval} (kernel
+\texttt{7.3.0-rc5-next-20261001+}, clang \texttt{24.0.0git}
+\texttt{ca763b76e2fd}, LLD~24), x86-64 under KVM; Table~\ref{tab:correctness-tools}
+places each scenario against the tools it would otherwise need.
 
 \begin{table}[t]
 \centering
-\caption{Captured values at function ENTRY and RET.}\label{tab:correctness}
+\caption{Selftest results, all passing on the recorded run.}\label{tab:correctness}
 \small
-\begin{tabular}{@{}lll@{}}
+\begin{tabular}{@{}llc@{}}
 \toprule
-\textbf{Case} & \textbf{ENTRY} & \textbf{RET} \\
+\textbf{Test} & \textbf{What is checked} & \textbf{Result} \\
 \midrule
-OOB Write & id=0x1337, size=15 & size=32 \\
-UAF Write & buf=poison(0xfd) & 0x41414141 \\
-Double-Free & buf=poison(0xff) & 0xdf00df00 \\
-10-Deep Chain & offset: $16\to48\to24\to8$ & idx=8 (OOB) \\
-Rust Module & 0xcafe, mult=3 & 0xefbed000... \\
+\texttt{user\_ioctl}      & 9 ioctl cases: sizing, double-init, mmap     & 9/9 \\
+                          & ordering, enable/disable, records present    &     \\
+\texttt{binderfs}         & binder ioctls under recording, 6185 words    & 3/3 \\
+                          & captured, every record well-formed           &     \\
+\texttt{rust\_ffi\_}      & 4 arg indices, \texttt{\{0,0,0,0\}} at entry,  & pass \\
+\texttt{contract}         & \texttt{(256,16,1)}, ret 0, \texttt{\{NULL,0x110,0,0\}}, \texttt{-EFAULT} & \\
+\texttt{eight\_struct\_}  & flat/value-nested/pointer-linked fields,      & pass \\
+\texttt{args\_c}          & all return values, 32-byte \texttt{sret} return & \\
+\texttt{eight\_struct\_}  & same expectations via \texttt{\#[repr(C)]}      & pass \\
+\texttt{args\_rust}       & Rust twins                                     & \\
+\texttt{rust\_kworker\_}  & records produced in kworker context arrive     & pass \\
+\texttt{remote}           & in the enabling task's buffer                  & \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \begin{table}[t]
 \centering
-\caption{Tool comparison per vulnerability class.}\label{tab:correctness-tools}
+\caption{Which tool can observe each selftest scenario.}\label{tab:correctness-tools}
 \small
 \begin{tabular}{@{}lccc@{}}
 \toprule
-\textbf{Case} & \textbf{drgn} & \textbf{KASAN} & \textbf{\toolname{}} \\
+\textbf{Scenario} & \textbf{drgn} & \textbf{KASAN} & \textbf{\toolname{}} \\
 \midrule
-OOB Write (C) & \cmark & slab-oob & \cmark \\
-UAF Write (C) & \cmark & slab-uaf & \cmark \\
-Double-Free (C) & \cmark & double-free & \cmark \\
-10-Deep Chain (C) & \cmark & slab-oob & \cmark \\
-Rust Module & \xmark & N/A & \cmark \\
+Struct fields of a C argument    & \cmark~(C) & N/A & \cmark \\
+Struct fields of a Rust argument & \xmark & N/A & \cmark \\
+Arguments 7 and 8                & \cmark~(C) & N/A & \cmark \\
+Indirect (\texttt{sret}) return value & partial & N/A & \cmark \\
+Postcondition violation, no crash & \xmark & \xmark & \cmark \\
+Values seen inside a kworker     & \xmark & N/A & \cmark \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+\noindent KASAN is marked N/A throughout because none of these scenarios is a
+memory-safety violation---which is the point. \texttt{drgn} requires a crash
+dump and reads C locals only where DWARF variable locations survive; it fails
+outright on Rust frames at \texttt{-O2}.
 
 \subsection{Information Gain Over Existing Tools}
 
@@ -703,7 +1077,7 @@ against KASAN reports and \texttt{drgn} vmcore analysis.
 \small
 \begin{tabular}{@{}lccc@{}}
 \toprule
-\textbf{Observable} & \textbf{KASAN} & \textbf{drgn} & \textbf{Mine} \\
+\textbf{Observable} & \textbf{KASAN} & \textbf{drgn} & \textbf{\toolname{}} \\
 \midrule
 Which argument corrupted & \xmark & \cmark~(C) & \cmark \\
 Pre-corruption value & \xmark & partial & \cmark \\
@@ -723,63 +1097,119 @@ at runtime regardless of optimization level.
 
 \subsection{Performance Overhead}
 
-I measure overhead using a micro-benchmark that triggers 8 instrumented
-functions (1--8 arguments each, 44 total callbacks per iteration) over 5{,}000
-iterations in a QEMU/KVM guest, taking the best of 3 runs after warmup to
-eliminate cache effects.
+\paragraph{Measurement provenance.} Both measurements below were taken on the
+toolchain of Section~\ref{sec:eval} by \texttt{bench.sh} in the repository,
+which records the kernel, clang, rustc and commit of every run alongside the
+numbers. An earlier version of this paper carried figures from linux-next
+7.1.0-rc6 with clang/LLVM~23, measured against a micro-benchmark module that
+was never carried into the in-tree suite, and predating the ABI of
+Section~\ref{sec:llvm-pass}---so they could neither be reproduced nor
+compared. Where the two disagree it is noted, because the disagreements are
+informative.
+
+Absolute values are not comparable with that earlier table: the kernel
+version, the configuration and the syscall mix all differ. The percentages
+are.
+
+\paragraph{Cost per recorded value.} What has been re-measured on the current
+toolchain is the quantity that transfers between workloads: the cost of
+storing one record. Driving \texttt{eight\_struct\_args\_c}'s trigger on
+kernel \texttt{7.3.0-rc5-next-20261001+} with clang~\texttt{24.0.0git}
+(\texttt{ca763b76e2fd}) and rustc~1.101.0, x86-64 under KVM, with only that
+module carrying arg/ret instrumentation, gives
+$\mathbf{18}$--$\mathbf{21}$\,\textbf{ns per stored record} across four runs
+(17.1, 18.3, 20.6 and 20.9\,ns; the overhead on the same runs ranged 65--75\%).
+The spread is the honest precision available from a guest with eight vCPUs
+sharing a host, and it is reported rather than narrowed to the most favourable
+pair. The benchmark derives this by counting the records a run
+actually stored rather than by assuming how many calls the trigger makes---an
+assumption that was wrong by a factor of 16 when checked, which would have
+inflated the per-record figure by the same factor.
+
+The percentage overhead is deliberately not promoted to a headline, because it
+is a property of record \emph{density} rather than of the instrumentation: the
+same $\sim$20\,ns costs +75\% on this trigger, which crosses 10{,}587 recorded
+boundaries and comparisons per iteration, and far less on a workload that
+crosses fewer. Table~\ref{tab:perf} therefore reports the density beside the
+latency. An earlier version of this paper quoted +8.3\% at 44 callbacks per
+iteration with no density stated, which made the figure impossible to compare
+against anything---including its own successor.
 
 \begin{table}[t]
 \centering
-\caption{Performance overhead of \toolname{}.}\label{tab:perf}
+\caption{Cost of recording, measured with \texttt{bench.sh micro} on kernel
+\texttt{7.3.0-rc5-next-20261001+}, clang~\texttt{24.0.0git}, x86-64 under KVM.
+Only \texttt{eight\_struct\_args\_c} carries arg/ret instrumentation; the
+comparison records come from \texttt{CONFIG\_KCOV\_ENABLE\_COMPARISONS}
+sharing the same buffer.}\label{tab:perf}
 \small
 \begin{tabular}{@{}lrr@{}}
 \toprule
 \textbf{Configuration} & \textbf{Latency} & \textbf{Overhead} \\
 \midrule
-No recording (baseline) & 15.0\,$\mu$s/iter & --- \\
-\toolname{} recording ON & 16.3\,$\mu$s/iter & +8.3\% \\
+Instrumented, not recording & 291.3\,$\mu$s/iter & --- \\
+\toolname{} recording ON    & 509.8\,$\mu$s/iter & +75.0\% \\
+\midrule
+\multicolumn{3}{@{}l@{}}{\emph{density:} 10{,}587 records/iter --- 1{,}199 argument
+and return, rest comparison} \\
+\multicolumn{3}{@{}l@{}}{\emph{derived:} 20.6\,ns per stored record on this run;
+18--21\,ns across four} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The per-call cost is 1.24\,$\mu$s for 44 callbacks (8 functions $\times$
-avg.\ 4.5 args + 8 returns), yielding $\sim$27\,ns per individual callback.
-This cost is dominated by one \texttt{READ\_ONCE}/\texttt{WRITE\_ONCE}
-atomic counter update (portable to ARM64) plus
-one \texttt{copy\_from\_kernel\_nofault()} per struct field.
+The per-record cost is dominated by the slot reservation---a
+\texttt{READ\_ONCE}/\texttt{WRITE\_ONCE} validate-then-commit of the word count
+at \texttt{area[0]}, with no atomic and no lock on the local path (portable to
+ARM64)---plus one \texttt{copy\_from\_kernel\_nofault()} per struct field. A
+record that carries its value in a register performs no memory read at all.
 
 Critically, non-instrumented code paths incur \emph{zero} overhead---the
 compiler emits no callbacks for modules without the
-\texttt{KCOV\_DATAFLOW} flag. Kernel boot time is unchanged.
+\texttt{KCOV\_DATAFLOW} flag.
 
 \paragraph{Global Enablement Overhead.}
 With \texttt{CONFIG\_KCOV\_DATAFLOW\_INSTRUMENT\_ALL=y} and
 \texttt{CONFIG\_KCOV\_DATAFLOW\_NO\_INLINE=n} (inlining preserved), the kernel
 boots normally under virtme-ng. Table~\ref{tab:global-perf} quantifies the
 overhead when all kernel objects are instrumented but recording is
-\emph{not} enabled (the common idle state).
+\emph{not} enabled (the common idle state). These rows come from two full
+kernel builds of the tree in Section~\ref{sec:eval}, differing only in
+\texttt{INSTRUMENT\_ALL}, measured by \texttt{bench.sh global}.
 
 \begin{table}[htbp]
 \centering
-\caption{Global instrumentation overhead (recording disabled).}\label{tab:global-perf}
+\caption{Global instrumentation overhead, recording disabled. Two builds of
+kernel \texttt{7.3.0-rc5-next-20261001+} with clang~\texttt{24.0.0git},
+x86-64 under KVM.}\label{tab:global-perf}
 \small
 \begin{tabular}{@{}lrrr@{}}
 \toprule
 \textbf{Metric} & \textbf{Baseline} & \textbf{INSTRUMENT\_ALL} & \textbf{Overhead} \\
 \midrule
-vmlinux .text        & 81.2\,MB & 88.9\,MB & +9.5\% \\
-vmlinux .data        & 13.1\,MB & 18.9\,MB & +44\% \\
-bzImage              & 33.2\,MB & 37.6\,MB & +13\% \\
-Boot time            & 9.3\,s   & 15.9\,s  & +71\% \\
-Syscall latency      & 20.5\,$\mu$s/iter & 47.7\,$\mu$s/iter & +133\% \\
+vmlinux .text        & 54.9\,MB & 78.6\,MB & +43\% \\
+vmlinux .rodata      & 12.3\,MB & 19.5\,MB & +58\% \\
+vmlinux .data        & 9.9\,MB  & 9.9\,MB  & +0\% \\
+bzImage              & 34.7\,MB & 44.0\,MB & +27\% \\
+Time to userspace    & 11.0\,s  & 17.9\,s  & +62\% \\
+Syscall latency      & 132.6\,$\mu$s/iter & 220.0\,$\mu$s/iter & +66\% \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The .data increase (+44\%) is due to per-function \texttt{\_\_sancov\_offsets\_}
-constant arrays containing struct field layouts. The syscall overhead (+133\%)
-stems from per-function prologue code (alloca spills, 6-argument call setup,
-branch on \texttt{kcov\_df\_enabled}) and increased icache pressure. For
+The growth is in read-only and executable memory, not writable data.
+\texttt{.rodata} takes +58\% (+7.2\,MB) because that is where the
+\texttt{\_\_sancov\_offsets\_} field tables live: they are constant globals,
+one per traced composite type. \texttt{.data} is unchanged to the byte, which
+is the useful negative result---an earlier version of this paper attributed a
++44\% \texttt{.data} increase to those tables, which was wrong in both the
+number and the mechanism. \texttt{.text} takes +43\% (+23.7\,MB) from the
+per-parameter call setup planted at every frame start, and objtool's
+\texttt{.call\_sites} grows +3.8\,MB alongside it, being a table indexed by
+exactly those new calls.
+
+The syscall figure (+66\%) is the cost of instrumentation alone: recording is
+disabled, so each callback is a call and an early return. For
 comparison, basic KCOV (\texttt{trace-pc}) adds only 5--10\% with
 \texttt{INSTRUMENT\_ALL} since it emits a single call per edge with no argument
 setup.
@@ -795,7 +1225,7 @@ established kernel sanitizers. All measurements include
 
 \begin{table}[htbp]
 \centering
-\caption{Overhead comparison with kernel sanitizers.}\label{tab:sanitizer-cmp}
+\caption{Overhead comparison with kernel sanitizers. The \toolname{} row is measured (Table~\ref{tab:global-perf}); sanitizer ranges are from the literature.}\label{tab:sanitizer-cmp}
 \small
 \begin{tabular}{@{}lrl@{}}
 \toprule
@@ -803,7 +1233,7 @@ established kernel sanitizers. All measurements include
 \midrule
 Basic KCOV (trace-pc)       & +5--10\%   & 1 call/edge \\
 KCOV + comparisons          & +15--30\%  & edges + cmp operands \\
-\toolname{} (INSTRUMENT\_ALL) & +133\%   & per-arg + per-ret callbacks \\
+\toolname{} (INSTRUMENT\_ALL) & +66\%    & per-arg + per-ret callbacks \\
 KASAN (generic)             & +100--200\% & every memory access \\
 KCSAN                       & +100--200\% & every memory access \\
 KMSAN                       & +200--400\% & every uninitialized use \\
@@ -811,36 +1241,115 @@ KMSAN                       & +200--400\% & every uninitialized use \\
 \end{tabular}
 \end{table}
 
-\noindent The overhead of \toolname{} falls within the range of a single
-sanitizer (KASAN/KCSAN) and is well below KMSAN. Since fuzzing kernels
+\noindent The overhead of \toolname{} sits below a single
+sanitizer (KASAN/KCSAN) and well below KMSAN. Since fuzzing kernels
 routinely stack multiple sanitizers (KASAN + KCOV + UBSAN), adding dataflow
 extraction fits naturally within the accepted performance budget.
-Notably, my measurements already include KASAN---the +133\% is the
-\emph{additional} cost on top of an already-sanitized kernel.
+The ``KCOV + comparisons'' row is not additive with ours: \toolname{} reuses
+that same instrumentation rather than adding a second copy, so enabling
+\texttt{CONFIG\_KCOV\_ENABLE\_COMPARISONS} alongside the dataflow modes costs
+the comparison callbacks once and routes each operand pair to both collectors
+(Section~\ref{sec:ringbuf}).
+Notably, both builds in Table~\ref{tab:global-perf} have
+\texttt{CONFIG\_KASAN=y}, so the +66\% is the \emph{additional} cost on top of
+an already-sanitized kernel rather than a measurement against a bare one.
 
 \subsection{Triage Capability}
 
-For each vulnerability case, the ENTRY/RET record provides:
-(1)~the exact argument that was corrupted (identified by \texttt{arg\_idx} and
-field offset), (2)~the struct field where corruption occurred (visible as a
-value change between ENTRY and RET), and (3)~the call chain leading to
-corruption (via sequence numbers and PC values). The 10-deep chain case
-demonstrates that \toolname{} captures taint propagation across function
-boundaries automatically, identifying the root cause
-(\texttt{validate\_header()} missing bounds check) from the dataflow log alone.
+For each captured boundary, the ENTRY/RET record provides: (1)~which argument
+carried a value, identified by \texttt{arg\_idx} and, within a struct, by
+position in the field table; (2)~whether a struct field changed across a call,
+visible as a difference between the ENTRY record of a callee and the ENTRY
+record of the next function to receive the same object---this is what makes the
+\texttt{rust\_ffi\_contract} postcondition violation legible; and (3)~the order
+in which boundaries were crossed, from the 24-bit per-task sequence number, with
+the PC identifying the call site. Resolving that PC with \texttt{addr2line -i}
+additionally names an inlined callee, which \texttt{kallsyms} cannot.
 
-\subsection{8-Argument Rust Kernel Module}
+What the records do \emph{not} give is a call \emph{tree}: there is no caller
+field and no depth counter, so \texttt{trigger-view.py} reconstructs nesting
+heuristically from sequence order and symbol boundaries. A record also carries
+no piece index, so two register pieces of one struct return are
+indistinguishable from two calls to the same function
+(Section~\ref{sec:eval}).
+
+\subsection{Eight Struct Arguments, C and Rust}
 
 To verify that \toolname{} captures Rust kernel module function arguments
 natively (without the post-compilation pipeline), I built \texttt{rustc}
-against the custom LLVM~23 containing the trace-args/ret passes. The kernel
+against the custom LLVM~24 containing the trace-args/ret passes. The kernel
 build system passes \texttt{-Cllvm-args=-sanitizer-coverage-trace-args}
 and \texttt{-Cllvm-args=-sanitizer-coverage-trace-ret} to rustc for modules
 with \texttt{KCOV\_DATAFLOW\_module.o := y}.
 
-The \texttt{eight\_args\_rust} module defines 8 functions with 1--8 arguments
-of mixed types (u64, u32, struct pointer), exercising both register-passed
-(arguments 1--6 on x86-64) and stack-passed (arguments 7--8) parameters:
+The \texttt{eight\_struct\_args\_c} module and its Rust twin
+\texttt{eight\_struct\_args\_rust} exercise three struct families, each with
+eight members:
+\begin{itemize}[nosep]
+  \item \textbf{Flat} \texttt{s1..s8}: \texttt{sN} holds $N$ \texttt{u64}
+        members side by side, and \texttt{sf\_N} takes $N$ struct pointers.
+        This covers plain field expansion and, at \texttt{sf\_7}/\texttt{sf\_8},
+        arguments the x86-64 ABI passes on the stack rather than in the first
+        six registers.
+  \item \textbf{Value-nested} \texttt{st1..st8}: \texttt{stN} embeds every
+        smaller struct \emph{by value}, so \texttt{st8} is eight levels deep.
+        Exercised on the stack.
+  \item \textbf{Pointer-linked} \texttt{stp1..stp8}: every member is a pointer
+        to a separately allocated object, so the nesting runs through the heap.
+        Exercised with both \texttt{kmalloc} and \texttt{vmalloc} memory.
+\end{itemize}
+All fields carry the values $0\mathtt{x}11, 0\mathtt{x}22, \ldots$ (Figure~\ref{fig:eight-args}), and
+\texttt{test\_modules.py} asserts each expanded field and every return value
+(\texttt{sf\_N} returns $\sum_{k=1}^{N} 0\mathtt{x}11k$; the nested families
+return \texttt{field0} plus the recursive sums of the embedded structs).
+
+The two nested families are where the shallow-capture boundary of
+Section~\ref{sec:deref} becomes observable rather than theoretical: the
+value-nested tower yields one \emph{(offset, size)} pair per top-level member,
+with an embedded struct clamped to its first word, and the pointer-linked tower
+yields the pointer values rather than the objects behind them. The tests assert
+exactly that, so the limitation is pinned down by the suite instead of being
+left as an assumption.
+
+\paragraph{Indirect struct returns.} \texttt{sf\_ret\_struct()} returns
+\texttt{struct s4} by value. At $4 \times$~\texttt{u64}~=~32 bytes that is over
+the register-return limit on both x86-64 and arm64, so the ABI returns it
+indirectly through a caller-provided buffer---and \texttt{trace-ret} reports
+that buffer the way it reports a struct argument: one value word per field,
+word~[2] of the record holding the address the fields were read from, and
+\texttt{size} the whole object rather than one field:
+\begin{lstlisting}[language=,numbers=none,columns=fullflexible,basicstyle=\ttfamily\scriptsize,frame=none]
+[RET] seq=.. sf_ret_struct+0x91 ret(32) @0xffff888000003000 = {0x11,0x11,0x22,0x33}
+\end{lstlisting}
+The runner asserts all four fields, the object size, \emph{and} that word~[2]
+is non-zero---a scalar return leaves it zero, so that word is what
+distinguishes the two record shapes. Checking only the first value word would
+pass equally for a scalar return. \texttt{rsf\_ret\_struct()} takes the same
+path from an \texttt{extern "C"} Rust function with a \texttt{\#[repr(C)]}
+return type, and both modules are checked through one shared expectation---the
+point of having both. A struct small enough to come back in registers
+($\leq$~16 bytes here) has no address to report from and instead arrives as one
+record per register piece with no field table; because the piece records carry
+no piece index, a consumer cannot tell two pieces of one return from two calls
+to the same function. That path is covered by the LLVM IR tests rather than by
+the kernel suite.
+
+\paragraph{\texttt{\#[repr(C)]} is load-bearing.} It is what makes the field
+offsets the compiler reports match the C layout. A default-repr Rust struct may
+be reordered, and the reported offsets would then describe that layout
+instead---still correct, but not comparable with the C module field by field.
+
+\subsection{Remote Capture from Kworker Context}
+
+The \texttt{rust\_kworker\_remote} module exercises the remote path: the
+trigger queues a work item on \texttt{system\_wq} whose three phases
+(populate, update, drain of a composite store of red-black trees) run inside
+\texttt{kcov\_df\_remote\_start()}/\texttt{stop()} on handle~1, which the
+runner publishes with \texttt{KCOV\_DF\_REMOTE\_ENABLE}. The records land in
+the enabling task's buffer even though they were produced by a kernel thread
+that never entered a syscall, which is the gap that per-task-only collection
+leaves open and that \texttt{ftrace}'s global patching fills only by also
+capturing every other task on the system.
 
 \begin{figure}[t]
 \centering
@@ -848,26 +1357,29 @@ of mixed types (u64, u32, struct pointer), exercising both register-passed
   node distance=0.12cm,
   entry/.style={font=\ttfamily\scriptsize, anchor=west, text=blue!70!black},
   ret/.style={font=\ttfamily\scriptsize, anchor=west, text=red!60!black},
-  val/.style={font=\ttfamily\scriptsize, fill=yellow!20, rounded corners=1pt, inner sep=1pt},
+  note/.style={font=\tiny\itshape, anchor=west, text=black!60},
 ]
-\node[entry] (e1) at (0,0) {rdf\_func1(\colorbox{yellow!20}{0x1111111111111111})};
-\node[ret]   (r1) at (0.3,-0.35) {\colorbox{green!15}{0x1111111111111111} = rdf\_func1()};
-\node[entry] (e2) at (0,-0.75) {rdf\_func2(\colorbox{yellow!20}{0x1111..}, \colorbox{yellow!20}{0x22222222})};
-\node[ret]   (r2) at (0.3,-1.1) {\colorbox{green!15}{0x33333333} = rdf\_func2()};
-\node[entry, text=gray] (dots) at (0,-1.5) {\quad ...};
-\node[entry] (e8) at (0,-1.9) {rdf\_func8(\colorbox{yellow!20}{0x1111..}, \colorbox{yellow!20}{0x2222..}, ..., \colorbox{orange!20}{struct\{.x=0xaaaa, .y=0xbbbb\}}, \colorbox{yellow!20}{0x8888..})};
-\node[ret]   (r8) at (0.3,-2.3) {\colorbox{green!15}{0x22222222eef05552} = rdf\_func8()};
+\node[entry] (e1) at (0,0)    {sf\_2(arg0=\colorbox{orange!20}{\{0x11\}}, arg1=\colorbox{orange!20}{\{0x11, 0x22\}})};
+\node[ret]   (r1) at (0.3,-0.35) {\colorbox{green!15}{0x33} = sf\_2()};
+\node[entry] (e2) at (0,-0.8) {sf\_8(arg0..arg5 in registers, \colorbox{yellow!20}{arg6}, \colorbox{yellow!20}{arg7} on the stack)};
+\node[note]  (n2) at (0.3,-1.12) {all eight reported; the ABI's register/stack split is invisible to the pass};
+\node[entry] (e3) at (0,-1.6) {stf\_3(arg0=\colorbox{orange!20}{\{0x33, 0x11, 0x11\}})};
+\node[note]  (n3) at (0.3,-1.92) {value-nested: one pair per top-level member, embedded struct clamped to its first word};
+\node[entry] (e4) at (0,-2.4) {stpf\_3(arg0=\colorbox{orange!20}{\{0xffff888.., 0xffff888.., 0xffff888..\}})};
+\node[note]  (n4) at (0.3,-2.72) {pointer-linked: the pointers, not the heap objects behind them};
+\node[ret]   (r5) at (0,-3.2) {\colorbox{green!15}{\{0x11, 0x11, 0x22, 0x33\}} = sf\_ret\_struct() \quad ret(32) @0xffff888000003000};
+\node[note]  (n5) at (0.3,-3.52) {indirect \texttt{sret} return: word [2] non-zero, size is the whole 32-byte object};
 
-% Legend
-\node[font=\tiny, anchor=west] at (0,-2.8) {%
-  \colorbox{yellow!20}{arg values}\quad
-  \colorbox{orange!20}{struct expansion}\quad
+\node[font=\tiny, anchor=west] at (0,-4.0) {%
+  \colorbox{yellow!20}{scalar args}\quad
+  \colorbox{orange!20}{expanded struct fields}\quad
   \colorbox{green!15}{return values}};
 \end{tikzpicture}
-\caption{Captured output from \texttt{eight\_args\_rust} module. Each function
-shows ENTRY arguments (yellow) with struct field expansion (orange) and
-RET values (green). All 8 arguments captured on both x86-64 and
-arm64.}\label{fig:eight-args}
+\caption{Representative capture from \texttt{eight\_struct\_args\_c}; the Rust
+twin (\texttt{rsf\_*}, \texttt{rstf\_*}, \texttt{rstpf\_*}) is checked against
+the same expectations. The two nested families make the shallow-capture
+boundary of Section~\ref{sec:deref} directly
+observable.}\label{fig:eight-args}
 \end{figure}
 
 \begin{figure}[t]
@@ -909,13 +1421,13 @@ This confirms that Rust functions compiled with the custom rustc receive
 identical instrumentation to C functions---no post-compilation pipeline
 required.
 
-\subsection{Rust FFI Contract Auditing}
+\subsection{FFI Contract Auditing}
 
 The \texttt{rust\_ffi\_contract} module demonstrates \toolname{}'s primary
-Rust use case: detecting contract violations at Rust-to-C FFI boundaries.
-A Rust function prepares a \texttt{\#[repr(C)]} struct and passes it to a C
-callee. The C function silently modifies a field that the Rust caller assumes
-is immutable:
+auditing use case: a \emph{postcondition} violation at a boundary where the
+caller has no way to detect it. The callee reports success and leaves the
+caller's struct in a state its contract forbids; the next boundary then
+receives that state (Figure~\ref{fig:ffi-contract}).
 
 \begin{figure}[t]
 \centering
@@ -927,39 +1439,51 @@ is immutable:
   instlabel/.style={rectangle, draw=green!60!black, fill=green!10, font=\tiny\bfseries, inner sep=2pt, rounded corners=1pt},
   arrow/.style={-{Stealth[length=2mm]}, thick},
 ]
-% Rust caller ENTRY
-\node[funcbox] (rcall) {[ENTRY] rust\_caller(\colorbox{yellow!25}{.id=0xcafe}, \colorbox{yellow!25}{.buf\_ptr=0xffff8880..}, \colorbox{yellow!25}{.len=10})};
-\node[instlabel, anchor=south east] at ([xshift=-2pt, yshift=2pt]rcall.north east) {Rust};
+% ffi_alloc_buf ENTRY
+\node[funcbox] (rcall) {[ENTRY] ffi\_alloc\_buf(\colorbox{yellow!25}{\{.buffer=NULL, .data\_size=0, .free\_async=0, .flags=0\}}, \colorbox{yellow!25}{256}, \colorbox{yellow!25}{16}, \colorbox{yellow!25}{1})};
+\node[instlabel, anchor=south east] at ([xshift=-2pt, yshift=2pt]rcall.north east) {4 args};
 
-% C callee ENTRY (nested)
-\node[innerbox, below=0.5cm of rcall] (ccall) {\quad [ENTRY] c\_callee(\colorbox{orange!25}{.id=0xcafe}, \colorbox{orange!25}{.buf\_ptr=0xffff8880..}, \colorbox{orange!25}{.len=10})};
-\node[instlabel, anchor=south east] at ([xshift=-2pt, yshift=2pt]ccall.north east) {C};
+% ffi_alloc_buf RET
+\node[retbox, below=0.4cm of rcall, minimum width=7.5cm] (cret) {[RET] \quad ffi\_alloc\_buf() = \colorbox{green!20}{0} \quad -- claims success};
 
-% C callee RET
-\node[retbox, below=0.4cm of ccall] (cret) {\quad [RET] \quad c\_callee() = \colorbox{green!20}{0}};
+% ffi_check_result ENTRY
+\node[innerbox, below=0.5cm of cret] (ccall) {[ENTRY] ffi\_check\_result(\colorbox{orange!25}{\{.buffer=NULL, .data\_size=0x110, 0, 0\}})};
+\node[instlabel, anchor=south east] at ([xshift=-2pt, yshift=2pt]ccall.north east) {contract violated};
 
-% Rust caller RET
-\node[retbox, below=0.4cm of cret, minimum width=7.5cm, fill=green!10] (rret) {[RET] \quad rust\_caller() = \colorbox{green!20}{0xcafe}};
+% ffi_check_result RET
+\node[retbox, below=0.4cm of ccall, minimum width=7.5cm, fill=red!12] (rret) {[RET] \quad ffi\_check\_result() = \colorbox{red!25}{-EFAULT}};
 
-% FFI boundary marker
-\draw[thick, red!60, dashed] ([xshift=-0.3cm, yshift=0.15cm]ccall.north west) -- ([xshift=0.3cm, yshift=0.15cm]ccall.north east)
-  node[pos=1, right, font=\tiny\bfseries, text=red!60] {FFI boundary};
+% boundary marker
+\draw[thick, red!60, dashed] ([xshift=-0.3cm, yshift=0.17cm]ccall.north west) -- ([xshift=0.3cm, yshift=0.17cm]ccall.north east)
+  node[pos=1, right, font=\tiny\bfseries, text=red!60] {next boundary};
 \end{tikzpicture}
-\caption{Rust FFI contract auditing. \toolname{} captures struct fields at
-the Rust$\to$C boundary (yellow: Rust side, orange: C side). A verifier
-compares fields across the FFI boundary to detect silent contract
-violations.}\label{fig:ffi-contract}
+\caption{FFI contract auditing. \texttt{ffi\_alloc\_buf()} returns~0---which
+its contract says implies a valid \texttt{buffer}---but the expanded
+\texttt{struct ffi\_alloc} at the \emph{next} boundary still shows
+\texttt{buffer}~=~\texttt{NULL}. The violation is visible only because both
+boundaries are recorded with fields expanded.}\label{fig:ffi-contract}
 \end{figure}
 
-The captured records show the exact struct state at the FFI boundary.
-A post-hoc verifier can compare ENTRY fields of \texttt{c\_callee} against
-the Rust-side contract (e.g., \texttt{len} must not exceed buffer capacity)
-and detect violations that produce no crash, no KASAN report, and no
-observable symptom other than incorrect behavior downstream.
+The \texttt{rust\_ffi\_contract} module encodes exactly this:
+\texttt{ffi\_alloc\_buf()}'s documented contract is ``returns 0 $\implies$
+\texttt{alloc->buffer} is valid,'' and its async path with
+\texttt{free\_async == 0} returns 0 while leaving \texttt{buffer} \texttt{NULL}.
+\texttt{test\_modules.py} asserts the four argument indices, the expanded
+\texttt{\{0, 0, 0, 0\}} struct at entry, the scalars \texttt{(256, 16, 1)}, the
+\texttt{0} return, the \texttt{\{NULL, 0x110, 0, 0\}} struct the checker
+receives, and the \texttt{-EFAULT} it returns. No crash occurs, no KASAN report
+fires, and edge coverage is identical to the correct path---the postcondition
+violation is visible only in the recorded field values.
 
-This is impossible with \texttt{ftrace} (no \texttt{-mfentry} in Rust objects),
-\texttt{drgn} (DWARF elided at \texttt{-O2}), or kprobes (Rust symbol
-mangling makes targeting specific functions impractical).
+A verifier needs both boundaries to see it: the return value alone says
+success, and the struct alone says nothing about what was promised. This is the
+smallest complete instance of the postcondition checking formalized in
+Section~\ref{sec:contracts}.
+
+Neither \texttt{drgn} (DWARF variable locations elided at \texttt{-O2}) nor
+\texttt{ftrace}'s function-args printing (which would need the
+\texttt{struct ffi\_alloc} fields, not the pointer) reports this without
+writing a target-specific kprobe or eBPF handler per function.
 
 
 \section{Case Study: Runtime Boundary Auditing}\label{sec:realworld}
@@ -1031,7 +1555,9 @@ itself makes no policy decisions during recording.
 
 \paragraph{Binder \texttt{SET\_MAX\_THREADS} (reported, not a bug).}
 \toolname{} captured \texttt{BINDER\_SET\_MAX\_THREADS(0xffffffff)} being
-accepted without bounds validation. I initially hypothesized this could
+accepted without bounds validation at
+\texttt{drivers/android/binder/process.rs}'s ioctl dispatch. I initially
+hypothesized this could
 enable OOM via unbounded thread creation. Kernel maintainer Alice Ryhl
 confirmed that this value does \emph{not} bypass \texttt{RLIMIT\_NPROC}:
 the kernel enforces process-level thread limits independently. The recorded
@@ -1040,8 +1566,17 @@ that this was exploitable was incorrect.
 
 \paragraph{Binder \texttt{BC\_ENTER\_LOOPER} duplicate (reported, not a bug).}
 Dataflow records showed a duplicate \texttt{BC\_ENTER\_LOOPER} command being
-accepted. Rust Kernel Community review confirmed the operation is bit-level idempotent
+accepted at \texttt{drivers/android/binder/thread.rs}'s command loop. Rust
+Kernel Community review confirmed the operation is bit-level idempotent
 (\texttt{looper |= BINDER\_LOOPER\_STATE\_ENTERED}) and produces no corruption.
+
+\noindent Both observations are on the \emph{Rust} binder: this tree carries no
+C binder driver, only
+\texttt{drivers/android/binder/}, gated on
+\texttt{CONFIG\_ANDROID\_BINDER\_IPC\_RUST}. That is the substantive part
+even though the findings themselves were refuted---the values were read out of
+Rust frames at \texttt{-O2}, which is where \texttt{drgn} stops and where
+ftrace's BTF-based printing cannot decode the arguments.
 
 \paragraph{\texttt{Error::from\_errno} boundary (confirmed, pre-existing TODO).}
 The dataflow record captured \texttt{from\_errno(-4096)} returning \texttt{-22}
@@ -1076,10 +1611,18 @@ potential issues. The dataflow records provide reproducible evidence that
 APIs handle boundary inputs as intended---evidence that static review alone
 cannot provide at \texttt{-O2}.
 
+\paragraph{Reproducibility caveat.} These observations were made with ad-hoc
+modules that were not carried into the in-tree selftest suite of
+Section~\ref{sec:eval}. They are therefore not reproducible from the published
+tree as it stands; only the four suite modules are. The one exception is
+\texttt{RBTree}, which \texttt{rust\_kworker\_remote} exercises, though for the
+remote-capture path rather than for duplicate-key semantics. Carrying the
+remaining API probes into the suite is outstanding work.
+
 \subsection{Correction Note}
 
 In version~1 of this paper, I identified several potential vulnerabilities
-in the Android Binder driver and Rust kernel core APIs, assigning severity
+in the Rust Android Binder driver and Rust kernel core APIs, assigning severity
 labels (High, Critical) prior to maintainer verification. Following review
 and discussion with the Linux kernel maintainers, these specific findings
 were determined to be not exploitable under standard configurations or
@@ -1101,28 +1644,53 @@ presented in the preceding sections remain valid. Verified findings will be
 incorporated step by step in subsequent versions as maintainer review
 completes.
 
-\section{Why ftrace Cannot Trace Rust Functions}\label{sec:ftrace}
+\section{Why ftrace Does Not Replace Boundary Data-Flow}\label{sec:ftrace}
 
 A natural question is whether existing tracing infrastructure (\texttt{ftrace},
-\texttt{kprobes}) could achieve similar results. The answer is no, for
-fundamental architectural reasons.
+\texttt{kprobes}, eBPF) could achieve similar results. It can reach part of the
+way, and the gaps are architectural rather than incidental.
 
-\paragraph{ftrace requires \texttt{-mfentry}.} The C compiler emits a
-\texttt{call \_\_fentry\_\_} prologue when passed \texttt{-pg -mfentry}. The
-kernel's build system passes this flag to \texttt{clang}/\texttt{gcc} for C
-files. However, \texttt{rustc} does not understand \texttt{-mfentry}---it has
-its own codegen pipeline. No \texttt{\_\_fentry\_\_} call is emitted in Rust
-object files, so ftrace has nothing to patch at runtime.
+\paragraph{Global text patching, not per-task instrumentation.}
+\texttt{ftrace}, \texttt{kprobes}, and eBPF all patch global kernel text, so a
+probe fires on every task on every CPU. Per-task selection is a post-trigger
+filter applied to a shared stream, not a property of the instrumentation.
+\toolname{} records into the enabling task's own buffer, and follows that task
+through \texttt{execve}---which is what makes a captured record a reproducible
+per-input artifact rather than a slice of system-wide activity.
 
-\paragraph{ftrace captures no arguments.} Even for C functions where ftrace
-works, it only reports ``function X was entered/exited.'' Obtaining argument
-values requires writing a custom kprobe handler or eBPF program that reads
-specific registers---which requires knowing the exact calling convention and
-register assignment for each function.
+\paragraph{Six arguments, and no more.} ftrace's function-args feature is
+capped at \texttt{FTRACE\_REGS\_MAX\_ARGS}, which is 6. Scanning the
+\texttt{next-20260831} tree, 8{,}195 of 807{,}481 distinct functions (1.01\%)
+declare more than six parameters, and ftrace truncates the 7th onward for every
+one of them; the tail is long, reaching 33 parameters. Restricting the count to
+functions that actually survive as a text symbol in one representative
+\texttt{vmlinux}---the real ftrace targets---still leaves 668. The dataflow
+callbacks have no such cap: they report one call per declared parameter.
+
+\paragraph{Rust is only partially reachable.} \texttt{rustc} does emit
+\texttt{\_\_fentry\_\_} stubs---\texttt{-Zinstrument-mcount} accepts
+\texttt{fentry}, \texttt{fentry-record}, and \texttt{fentry-nop-record} on
+supported targets---so the claim that Rust objects are simply unpatchable is
+wrong. The gap is one level up: idiomatic Rust types (generics, slices, trait
+objects) do not lower to the \texttt{repr(C)} shapes that
+\texttt{pahole}/BTF-based argument printing expects, so even where the probe
+site exists, the argument values are not decodable by the BTF machinery.
+\toolname{} reads the types from DWARF at the IR level instead, before any of
+that applies.
+
+\paragraph{Inlined code has no boundary at all.} A callee the inliner merged
+away leaves no \texttt{call} for ftrace to patch, and no
+\texttt{\_\_fentry\_\_} stub; reaching it requires an explicit
+\texttt{noinline} or \texttt{\#[inline(never)]} in the source. The dataflow
+pass reports inlined callees' parameters from inside each inlined body
+(Section~\ref{sec:llvm-pass}), and
+\texttt{CONFIG\_KCOV\_DATAFLOW\_NO\_INLINE} can additionally keep the
+boundaries themselves when a session wants one record per source call site.
 
 \paragraph{Rust symbol mangling.} Rust function names are mangled into
 unreadable strings (e.g., \texttt{\_RNvMs3\_NtCsgHKxaxYGgF6\_11rust\_binder...}).
-Setting ftrace filters or kprobe targets requires these exact names.
+Setting ftrace filters or kprobe targets requires these exact names, whereas
+the dataflow pass instruments by compiler flag and needs no symbol list.
 
 \paragraph{\toolname{} operates at LLVM IR level.} My pass runs on LLVM IR
 \emph{before} codegen---the common representation shared by both \texttt{clang}
@@ -1130,25 +1698,32 @@ Setting ftrace filters or kprobe targets requires these exact names.
 SSA values with debug metadata, struct types have \texttt{DICompositeType}
 annotations, and the optimizer has not yet destroyed variable locations. The
 inserted callbacks survive optimization because they are function calls with
-side effects.
+side effects. Table~\ref{tab:ftrace} summarizes the comparison.
 
 \begin{table}[t]
 \centering
-\caption{Comparison: ftrace vs.\ \toolname{} for Rust kernel code.}\label{tab:ftrace}
+\caption{Comparison: ftrace/kprobes vs.\ \toolname{}.}\label{tab:ftrace}
 \small
 \begin{tabular}{@{}lcc@{}}
 \toprule
 \textbf{Capability} & \textbf{ftrace} & \textbf{\toolname{}} \\
 \midrule
-Trace Rust functions & \xmark & \cmark \\
-Capture argument values & \xmark & \cmark \\
+Probe site in Rust objects & \cmark & \cmark \\
+Decode idiomatic Rust arguments & \xmark & \cmark \\
+Arguments beyond the 6th & \xmark & \cmark \\
 Struct field decomposition & \xmark & \cmark \\
+Reach inlined callees & \xmark & \cmark \\
+Per-task isolation by construction & \xmark & \cmark \\
 Zero source modification & \cmark & \cmark \\
 Works at \texttt{-O2} & \cmark & \cmark \\
-Per-task isolation & \xmark & \cmark \\
+No recompilation needed & \cmark & \xmark \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+\noindent The last row is the honest cost of the approach: ftrace works on a
+shipped kernel, while \toolname{} requires a build with the instrumentation
+flags.
 
 \section{Boundary Contract Runtime Verification}\label{sec:contracts}
 
@@ -1179,23 +1754,30 @@ Define a \emph{Boundary Contract} $\mathcal{C}(f) = (\mathcal{P},
         over return value given inputs
 \end{itemize}
 
-\noindent\textbf{Example:} For \texttt{binder\_alloc\_buf(alloc, data\_size,
-offsets\_size, is\_async)}:
+\noindent\textbf{Example:} For the Rust binder's
+\texttt{Process::set\_max\_threads(max: u32)}, reached from
+\texttt{ioctl\_write\_only()} on \texttt{BINDER\_SET\_MAX\_THREADS}:
 \begin{align*}
-\mathcal{P}&: \mathit{data\_size} \leq 2^{20} \wedge
-              \mathit{offsets\_size} \leq 2^{16} \\
-\mathcal{Q}&: \mathit{ret} = 0 \implies
-              \mathit{alloc.buffer} \neq \texttt{NULL}
+\mathcal{P}&: \mathit{max} \leq \mathit{plausible\_thread\_cap} \\
+\mathcal{Q}&: \mathit{inner.max\_threads} = \mathit{max}
 \end{align*}
 
 A \emph{contract violation} occurs when the caller passes arguments violating
 $\mathcal{P}$ (caller bug) or the callee returns values violating $\mathcal{Q}$
-given valid inputs (callee bug).
+given valid inputs (callee bug). Section~\ref{sec:realworld} reports what
+happened when I actually wrote this predicate: the capture was correct and the
+predicate was wrong---\texttt{set\_max\_threads()} storing an arbitrary
+\texttt{u32} is harmless because \texttt{RLIMIT\_NPROC} is enforced elsewhere.
+A contract database is only as good as its predicates, which is why the tool
+reports evidence and not verdicts.
 
 \subsection{The Unknown Kernel Path Problem}
 
-When a user-space process calls \texttt{write(binder\_fd, data, len)}, it
-triggers a chain of kernel functions:
+When a user-space process issues
+\texttt{ioctl(binder\_fd, BINDER\_WRITE\_READ, \&bwr)}, it triggers a chain of
+kernel functions---all of them Rust in this tree, and none of them reachable by
+\texttt{write()}, since the Rust binder registers no \texttt{write} file
+operation at all:
 
 \begin{center}
 \begin{tikzpicture}[
@@ -1203,21 +1785,28 @@ triggers a chain of kernel functions:
   call/.style={rectangle, draw, rounded corners, fill=blue!5, minimum height=0.45cm, font=\ttfamily\scriptsize, inner sep=3pt},
   arrow/.style={-{Stealth[length=1.5mm]}, thick, gray},
 ]
-\node[call] (s1) {sys\_write};
-\node[call, below=of s1] (s2) {vfs\_write};
-\node[call, below=of s2] (s3) {binder\_write};
-\node[call, below=of s3] (s4) {binder\_thread\_write};
-\node[call, below=of s4] (s5) {binder\_transaction};
-\node[call, below=of s5, fill=orange!10] (s6) {binder\_alloc\_buf};
+\node[call] (s1) {sys\_ioctl};
+\node[call, below=of s1] (s2) {rust\_binder\_ioctl};
+\node[call, below=of s2] (s3) {Process::ioctl};
+\node[call, below=of s3] (s4) {Process::ioctl\_write\_read};
+\node[call, below=of s4] (s5) {Thread::write\_read};
+\node[call, below=of s5] (s6) {Thread::write};
+\node[call, below=of s6, fill=orange!10] (s7) {range\_alloc::allocate};
 \draw[arrow] (s1) -- (s2);
 \draw[arrow] (s2) -- (s3);
 \draw[arrow] (s3) -- (s4);
 \draw[arrow] (s4) -- (s5);
 \draw[arrow] (s5) -- (s6);
-\node[font=\tiny\itshape, right=0.3cm of s6, text=red!60!black] {contract checked here};
+\draw[arrow] (s6) -- (s7);
+\node[font=\tiny\itshape, right=0.3cm of s7, text=red!60!black] {contract checked here};
+\node[font=\tiny\itshape, right=0.3cm of s2, text=black!55] {C ABI shim};
+\node[font=\tiny\itshape, right=0.3cm of s3, text=black!55] {mangled Rust symbols below here};
 \end{tikzpicture}
 \end{center}
 
+Everything below the \texttt{extern "C"} shim carries a mangled Rust symbol, so
+naming these boundaries for a kprobe or an ftrace filter means knowing the
+mangling, and decoding their arguments means decoding Rust types.
 The user cannot predict which functions will execute. Linux
 RV~\cite{dealmeida2019rv} requires
 pre-defining which events to monitor. \toolname{} captures \emph{every}
@@ -1243,7 +1832,7 @@ Unknown functions & Cannot verify & Captures automatically \\
 Rust support & No & Yes \\
 Specification & Hardcoded in kernel & External database \\
 Compile-time sufficiency & N/A & No (value depends on runtime) \\
-Overhead & Near zero (event-driven) & $<$10\% per-module \\
+Overhead & Near zero (event-driven) & 18--21\,ns per record \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -1251,8 +1840,8 @@ Overhead & Near zero (event-driven) & $<$10\% per-module \\
 Table~\ref{tab:rv} summarizes the differences. Linux RV verifies
 \emph{anticipated} event orderings (e.g., ``sleep must not occur in atomic
 context''). \toolname{} verifies \emph{arbitrary} value contracts (e.g.,
-``\texttt{data\_size} must be $\leq 2^{20}$'') on functions the developer
-never explicitly instrumented.
+``\texttt{max\_threads} must be within a plausible cap'') on functions the
+developer never explicitly instrumented.
 
 \subsection{Concrete Example: Detecting the errno Bug}
 
@@ -1321,7 +1910,8 @@ $$\mathcal{S}(\mathit{fields}): \bigwedge_i \phi_i(f_1, f_2, \ldots, f_n)$$
 \end{align*}
 
 \paragraph{Detection mechanism.} At function entry, \toolname{} captures all
-struct fields simultaneously (one atomic record per parameter). The offline
+struct fields simultaneously, one record per parameter
+(Figure~\ref{fig:struct-verify}). The offline
 verifier evaluates $\mathcal{S}$ over the captured field values. A violation
 means the function received a struct whose internal state is inconsistent with
 what its logic requires---either the caller constructed it incorrectly, or
@@ -1346,10 +1936,12 @@ and edge coverage sees the same path regardless of field values.
   \item Static analysis cannot reason about runtime struct state.
   \item They often manifest only under specific timing or workload conditions.
 \end{itemize}
-Struct member contract verification with \toolname{} is the only automated
-method that can detect these violations at runtime with zero source annotation,
-by comparing the actual field values against the cross-field predicates that
-the function's conditional logic implicitly assumes.
+Struct member contract verification with \toolname{} detects these violations
+at runtime with zero source annotation, by comparing the actual field values
+against the cross-field predicates that the function's conditional logic
+implicitly assumes. An eBPF program with a hand-written per-function reader can
+reach the same values; what \toolname{} removes is the per-function work, since
+the field layout comes from the compiler rather than from the analyst.
 
 \paragraph{Formal model.}
 Let a function $f$ receive a struct parameter $s$ with fields
@@ -1399,7 +1991,7 @@ statically, but is intractable for 30M~LOC kernels. I observe that
 \emph{post-mortem contract verification}---mechanically checking recorded
 execution against formal specifications after the fact.
 
-\paragraph{Key Insight.} The ring buffer produces a complete sequence of
+\paragraph{Key Insight.} The record buffer produces a complete sequence of
 $\langle \mathit{PC}, \mathit{args}, \mathit{ret} \rangle$ tuples for every
 instrumented function the process executed. This is a \emph{finite execution
 trace} in the formal methods sense---the input to a runtime verification
@@ -1433,7 +2025,7 @@ I define \emph{runtime-originated auditing} as the methodology in which the
 analysis target is not the source code itself, but the dataflow records captured
 during actual kernel execution triggered by a user-space operation. This inverts
 the conventional workflow and eliminates the speculative gap inherent in
-source-only review.
+source-only review (Table~\ref{tab:methodology}, Figure~\ref{fig:workflow}).
 
 \begin{table}[t]
 \centering
@@ -1540,7 +2132,8 @@ artifact}: given the same kernel build, the same user action produces the same
 records. Any party can independently reproduce and verify the analysis,
 satisfying the reproducibility requirement for empirical security research.
 
-\paragraph{Dual utility.} The same records serve both (1)~security auditing
+\paragraph{Dual utility.} As Figure~\ref{fig:dual} shows, the same records
+serve both (1)~security auditing
 (identifying argument values that violate API contracts) and (2)~guided fuzzing
 (constraining mutation to value ranges observed at deep kernel code paths,
 eliminating blind 64-bit enumeration).
@@ -1551,13 +2144,18 @@ by my initial binder claims refuted by maintainers). With \toolname{}, the AI
 analyzes observed records rather than speculating about behavior---findings are
 grounded in physical execution regardless of reasoning quality.
 
-\paragraph{Debug Info Requirement.} Full struct field expansion requires
-\texttt{CONFIG\_DEBUG\_INFO}; without it, only scalar argument
-values are captured. This is not a practical limitation for kernel fuzzing
-(KASAN already requires debug info).
+\paragraph{Debug Info Requirement.} Struct field expansion needs
+\texttt{CONFIG\_DEBUG\_INFO}, which both Kconfig options depend on, so this is
+enforced at configuration time rather than degrading at runtime. For a
+translation unit compiled without \texttt{-g}---which can happen for an
+out-of-tree module---the pass still reports register-resident values, but
+pointer arguments lose their field tables and an indirect struct return is
+dropped entirely. Within the kernel the requirement is not a practical
+constraint, since the DWARF options are already standard in fuzzing
+configurations.
 
 \paragraph{Rust Pipeline.} Dataflow tracking of Rust kernel modules requires
-building \texttt{rustc} against the custom LLVM~23 that contains the
+building \texttt{rustc} against the custom LLVM~24 that contains the
 trace-args/ret passes. The post-compilation pipeline (Path~A) serves as a
 proof-of-concept demonstrating language-agnosticism but cannot instrument
 modules built through Kbuild. I propose adding native
@@ -1565,28 +2163,49 @@ modules built through Kbuild. I propose adding native
 work to eliminate the custom build requirement.
 
 \paragraph{Buffer Overflow.} If instrumented code generates more events than
-the buffer capacity, events are silently dropped. This is by design---blocking
-would introduce deadlocks in interrupt context.
+the buffer capacity, events are silently dropped. This is by design: the
+collector runs with a per-task recursion guard held and must not sleep,
+allocate, or take a lock, so there is nothing it could usefully block on. The
+word count at \texttt{area[0]} is an exact high-water mark, so a consumer can
+detect saturation by observing it pinned at capacity rather than by finding a
+truncated record.
 
-\paragraph{Interrupt and NMI Context.} Instrumentation callbacks are
-restricted to process context via an \texttt{in\_task()} check: any call
-originating from a softirq, hardirq, or NMI handler is silently discarded.
-This is stronger than the per-context filtering used by mainline KCOV
+\paragraph{Interrupt, NMI, and nofault Context.} Instrumentation callbacks bail
+out when \texttt{!in\_task() || pagefault\_disabled()}: a call originating from
+a softirq, hardirq, or NMI handler is silently discarded, and so is one issued
+from inside a \texttt{copy\_from\_kernel\_nofault()} region.
+The first half is stricter than the per-context filtering used by mainline KCOV
 (which allows softirq tracing via \texttt{kcov\_remote\_start}); I chose
 the stricter policy because the dataflow callback performs pointer
 dereferences (\texttt{copy\_from\_kernel\_nofault}) whose latency is
 unacceptable in hard-interrupt paths, and because per-task buffer
 interleaving from nested contexts would corrupt record boundaries.
+The second half is a containment measure rather than a policy: an instrumented
+leaf reached from inside the collector's own nofault read---or from a KASAN
+stack walk---otherwise issues a callback per load and soft-locks the CPU, and
+the per-task recursion guard only covers re-entry nested inside our own
+callback, not a fresh entry from the unwinder. The trade-off is that records
+are also dropped inside unrelated \texttt{pagefault\_disable()} regions
+(\texttt{kmap\_atomic()} on HIGHMEM, futex and perf callchain probes), which
+are short and rare on the targeted workloads.
+Kernel threads are still reachable: \texttt{kcov\_df\_remote\_start()}
+annotations let a kworker record into a published remote handle, as mainline
+\kcov{} does, but only in sleepable task context---it takes a mutex---so it
+closes the kworker gap and not the softirq one.
 Bugs triggered exclusively from interrupt context are therefore invisible
 to \toolname{}; however, such bugs are also unreachable by KCOV-guided
 fuzzers, which exercise kernel code through syscalls in process context.
 
-\paragraph{Fuzzer Integration (Future Work).} Integrating \toolname{} with
-syzkaller requires modifying the executor to parse the \texttt{mmap}'d
-\texttt{kcov\_dataflow} buffer and hash argument values into the coverage
-bitmap. I envision a composite feedback signal: unique
+\paragraph{Fuzzer Integration.} A user-space consumer already exists: libFuzzer
+implements both callbacks and folds the observed values into its value profile
+(Section~\ref{sec:libfuzzer}). Syzkaller integration is the remaining work and
+is a transport question rather than an instrumentation one---the executor must
+parse the \texttt{mmap}'d \texttt{kcov\_dataflow} buffer and hash argument
+values into the coverage bitmap. I envision a composite feedback signal: unique
 $(\mathit{PC}, \mathit{arg\_hash})$ pairs provide finer-grained state
-discrimination than unique edges alone.
+discrimination than unique edges alone. The interleaved \texttt{0xC} comparison
+records in the same buffer give input-to-state matching for free once that
+parsing exists.
 
 \paragraph{Upstream Path.} The LLVM pass has been submitted as a pull
 request\footnote{\url{https://github.com/llvm/llvm-project/pull/201410}} with
@@ -1594,9 +2213,16 @@ an RFC on LLVM
 Discourse\footnote{\url{https://discourse.llvm.org/t/rfc-sanitizercoverage-add-fsanitize-coverage-trace-args-trace-ret/91026}};
 LLVM maintainers have requested a formal RFC per the LLVM RFC
 process\footnote{\url{https://llvm.org/docs/RFCProcess.html}} given the
-complexity of extending \sancov with a new instrumentation mode.
-The kernel patch series is under review on
-LKML\footnote{\url{https://lore.kernel.org/all/20260603-kcov-dataflow-next-20260603-v2-0-fee0939de2c4@est.tech/}}.
+complexity of extending \sancov with a new instrumentation mode, and that
+review is ongoing. The kernel side was posted as RFC
+v2\footnote{\url{https://lore.kernel.org/all/20260611-b4-kcov-dataflow-v2-v2-0-0a261da3987c@est.tech/}}
+and now stands at v4---eight patches: the kcov core, the
+\texttt{Documentation/dev-tools/kcov-dataflow.rst} description, four selftests,
+and the \texttt{trigger-view.py} consumer---with the ksmbd remote-coverage
+support carried separately. It remains an RFC deliberately: the kernel-side
+design and the UAPI are being reviewed in parallel with the LLVM work rather
+than after it, since the record format is the part that would be hardest to
+change later.
 
 \section{Related Work}\label{sec:related}
 
@@ -1605,17 +2231,16 @@ syzkaller~\cite{vyukov2015syzkaller} and kAFL~\cite{schumilo2017kafl} use
 edge/block coverage as feedback. DIFUZE~\cite{corina2017difuze} adds
 interface-aware generation but no runtime data-flow.
 MORPHUZZ~\cite{bulekov2022morphuzz} fuzzes virtual devices without data-flow
-context. Healer~\cite{sun2021healer} learns syscall dependencies from coverage
-to improve sequence construction, yet remains blind to argument values.
+context. HEALER~\cite{sun2021healer} and
+Rtkaller~\cite{ma2022rtkaller} learn relation models between syscalls to
+construct deeper sequences, yet both remain blind to argument values and
+plateau once the structural path space is exhausted.
 SyzVegas~\cite{wang2021syzvegas} applies multi-armed bandit algorithms to
 syzkaller's mutation strategy but still uses edge coverage as the sole reward
 signal. ACTOR~\cite{fleischer2023actor} targets concurrency bugs via
 schedule-aware fuzzing; its feedback is scheduling order, not data-flow.
 Moonshine~\cite{pailoor2018moonshine} distills seeds from system call traces
 to improve initial coverage but cannot guide mutation once coverage saturates.
-HEALER~\cite{sun2021healer} and Rtkaller~\cite{ma2022rtkaller} learn
-relation models between syscalls to construct deeper call sequences, yet both
-plateau once the structural path space is exhausted.
 Google's AIxCC kernel fuzzing approach~\cite{google2024aixcc} combines AFL
 with KCOV and KASAN in a QEMU harness, reporting that ``the vulnerability
 cannot be easily found even after hours of fuzzing, unless provided with seed
@@ -1629,14 +2254,21 @@ Payer~\cite{payer2019dataflow} argues for data-flow-guided fuzzing but provides
 no kernel implementation. Angora~\cite{chen2018angora} uses byte-level taint for
 user-space programs at 10$\times$ overhead.
 GREYONE~\cite{gan2020greyone} combines taint with coverage but targets
-user-space only. None achieve the $<$5\% overhead required for continuous kernel
-fuzzing.
+user-space only. Both pay an order-of-magnitude cost for byte-level precision.
+\toolname{} makes the opposite trade: it observes values only where they cross
+a function boundary, which is far less than full taint but costs a bounded
+number of callbacks per call rather than a shadow operation per byte.
 
 \paragraph{Kernel Instrumentation.}
-KCOV~\cite{vyukov2016kcov} provides edge coverage---my foundation.
-\texttt{ftrace}/\texttt{kprobes} offer dynamic per-function tracing at high
-overhead. eBPF is programmable but restricted in context and cannot perform
-struct field expansion from debug metadata.
+KCOV~\cite{vyukov2016kcov} provides edge coverage---my foundation---and its
+\texttt{trace-cmp} mode provides comparison operands, which \toolname{} reuses
+rather than duplicates: when both are configured the operand pairs land in the
+same buffer as the boundary records. \texttt{ftrace}, \texttt{kprobes}, and
+eBPF patch global kernel text, so a probe fires for every task on every CPU and
+per-task selection is a filter rather than a property of the instrumentation;
+ftrace's argument printing is additionally capped at six parameters and depends
+on BTF shapes that idiomatic Rust types do not produce
+(Section~\ref{sec:ftrace}).
 
 \paragraph{Post-Mortem Analysis.}
 \texttt{drgn}~\cite{drgn} enables programmable vmcore analysis but requires a
@@ -1645,8 +2277,12 @@ full memory dumps but require manual analysis and miss silent bugs.
 
 \medskip\noindent
 \toolname{} is the first system combining compile-time data-flow instrumentation
-with a production-grade kernel transport, supporting both C and Rust with
-$<$10\% per-module overhead.
+with a production-grade kernel transport, supporting both C and Rust, at a
+measured 18--21\,ns per recorded value and +66\% syscall latency with the
+whole kernel instrumented and collection idle
+(Section~\ref{sec:eval}). The same two callbacks are also implemented by a
+user-space libFuzzer runtime, so the instrumentation is a general
+SanitizerCoverage mode rather than a kernel-specific mechanism.
 
 \section{Conclusion}\label{sec:conclusion}
 
@@ -1656,16 +2292,23 @@ boundaries are natural observation points where data-flow context is both cheap
 to capture and highly informative for both automated exploration and human
 triage.
 
-The system requires no source annotation, operates safely in process context
-with explicit rejection of interrupt and NMI callbacks,
-and---uniquely---supports Rust kernel modules via both a post-compilation
-pipeline and native instrumentation through a custom-built rustc, providing
-the only known runtime methods for capturing Rust function arguments
-given \texttt{-O2} DWARF elision.
+The system requires no source annotation, operates safely in sleepable task
+context with explicit rejection of interrupt, NMI, and nofault callbacks,
+reaches kernel threads through a remote-handle path, and---uniquely---decodes
+Rust kernel module arguments via both a post-compilation
+pipeline and native instrumentation through a custom-built rustc. That last
+point is narrower than it may appear: \texttt{ftrace} can place a probe in a
+Rust object, but cannot decode idiomatic Rust argument types, and
+\texttt{drgn} cannot read them at all once \texttt{-O2} has elided the DWARF
+variable locations.
 
-I demonstrated correctness on five vulnerability classes across C and Rust
-kernel modules, showing that boundary data-flow context provides information
-unavailable through any combination of KASAN, drgn, and edge coverage.
+I demonstrated correctness with an in-tree selftest suite covering struct field
+expansion in both C and Rust, arguments past the ABI's register budget,
+indirect struct returns, a postcondition violation that produces no crash, and
+capture from kworker context---showing that boundary data-flow context provides
+information unavailable through any combination of KASAN, drgn, and edge
+coverage. The same two callbacks also back a user-space libFuzzer consumer, so
+the ABI is not kernel-specific.
 Source code is available at \anonrepo{}.
 
 %Bibliography
@@ -1676,42 +2319,78 @@ Source code is available at \anonrepo{}.
 \section{LLVM Pass: InjectTraceForArgs Pseudocode}\label{app:pass}
 
 \begin{algorithmic}[1]
-\Function{InjectTraceForArgs}{$F$}
-  \State $\mathit{DI} \gets F.\mathrm{getSubprogram()}$
-  \If{$\mathit{DI} = \mathrm{null}$} \Return \EndIf
-  \For{each parameter $P_i$ of $F$}
-    \State $T \gets \mathrm{stripTypedefs}(\mathit{DI}.\mathrm{getType}(i))$
-    \If{$T$ is \texttt{DICompositeType}}
-      \State $\mathit{offsets} \gets \mathrm{getStructFieldOffsets}(T)$
-      \State $\mathit{nfields} \gets |T.\mathrm{getElements()}|$
-      \State $\mathit{hash} \gets \mathrm{FNV1a}(T.\mathrm{getName()})$
-      \State Create global: $[\mathit{hash}, \mathit{off}_0, \mathit{sz}_0, \ldots]$
-    \Else
-      \State $\mathit{offsets} \gets \mathrm{null}$; $\mathit{nfields} \gets 0$
-    \EndIf
-    \State $\mathit{ptr} \gets$ spill $P_i$ to alloca if scalar, else use directly
-    \State Insert call: \texttt{trace\_args(pc, $i$, sizeof($P_i$), ptr, offsets, nfields)}
+\Function{InjectTraceForArgs}{$F$, $\mathit{DT}$}
+  \State $\mathit{SP} \gets F.\mathrm{getSubprogram()}$
+  \If{$\mathit{SP} = \mathrm{null}$} \Return \EndIf
+  \State $\mathit{Frames} \gets \Call{CollectInlineFrames}{F, \mathit{DT}}$
+    \Comment{$F$'s own frame, then each inlined callee}
+  \For{each $\mathit{Frame} \in \mathit{Frames}$}
+    \State $\mathit{IP} \gets \mathit{Frame}.\mathrm{Start}$
+      \Comment{pushed past every reported value's definition}
+    \For{each declared parameter index $i \in 1 \ldots n$ of $\mathit{Frame}$}
+      \State $V \gets \mathit{Frame}.\mathrm{Params}[i]$
+        \Comment{IR value(s) from \texttt{DILocalVariable::getArg()}, 1-based}
+      \State $T \gets \Call{GetDeclaredParamType}{\mathit{Frame}.\mathrm{SP}, i}$
+      \State $\mathit{whole} \gets V$ is the entire parameter, not an ABI fragment
+      \If{$\mathit{whole}$ \textbf{and} $V$ is a pointer \textbf{and}
+          $\Call{GetFieldOffsets}{T}.\mathrm{Table} \neq \mathrm{null}$}
+        \State $\mathit{Off} \gets \Call{GetFieldOffsets}{T}$
+          \Comment{cached; unwraps one pointer level}
+        \State \Call{Emit}{$i$, ptrtoint($V$), $\mathit{Off}$.ObjectSize, $\mathit{Off}$}
+      \Else
+        \For{each $(w, \mathit{sz}) \in \Call{GetReportedValues}{V}$}
+          \State \Call{Emit}{$i$, $w$, $\mathit{sz}$, $\varnothing$}
+            \Comment{$\mathit{sz}=0$ when $V$ is unreportable}
+        \EndFor
+      \EndIf
+    \EndFor
   \EndFor
+\EndFunction
+\Statex
+\Function{Emit}{$i$, $\mathit{val}$, $\mathit{size}$, $\mathit{Off}$}
+  \State emit \texttt{trace\_args($i-1$, $\mathit{size}$, $\mathit{val}$, $\mathit{Off}$.Table, $\mathit{Off}$.NumFields)}
+    \Comment{the ABI's \texttt{arg\_idx} is 0-based}
 \EndFunction
 \end{algorithmic}
 
-\section{Ring Buffer Record Format}\label{app:ringbuf}
+\noindent Two details a reimplementation would otherwise get wrong. The
+parameter index is 1-based inside the pass, because that is what
+\texttt{DILocalVariable::getArg()} returns, and is decremented on the way into
+the callback, whose \texttt{arg\_idx} is 0-based. And no \texttt{alloca} is
+created: a value the ABI kept in a register is widened in place and passed in
+one. \Call{GetFieldOffsets}{} emits a private constant
+\texttt{\_\_sancov\_offsets\_} array of $2N$ words---$N$ consecutive
+\emph{(offset, size)} byte pairs with no type tag---memoized per
+\texttt{DICompositeType}, and is only consulted on the path that uses it, so a
+struct that ends up reported by value leaves no unreferenced global behind.
 
-Each record occupies $3 + N$ quadwords (64-bit each), where $N$ is the number of fields (or 1 for scalar values when $N=0$):
+\section{Record Buffer Format}\label{app:ringbuf}
+
+Each record occupies $3 + \mathit{nvals}$ quadwords (64-bit each), where
+$\mathit{nvals}$ is the number of expanded fields, 1 when the record carries
+the value itself, and 2 for a comparison record:
 
 \begin{center}
 \small
-\begin{tabular}{|c|l|p{10.7cm}|}
+\begin{tabular}{|c|l|p{10.0cm}|}
 \hline
 \textbf{Offset} & \textbf{Field} & \textbf{Description} \\
 \hline
-0 & \texttt{type\_and\_seq} & Type marker (bits [31:28]: \texttt{0xE}=entry, \texttt{0xF}=return) | seq (bits [23:0]) \\
-1 & \texttt{pc} & Instrumented function address \\
-2 & \texttt{meta} & arg\_idx [63:56] | size [55:48] | pointer [47:0] \\
-3..3+N & \texttt{field\_val[0..N]} & Field or scalar values via \texttt{copy\_from\_kernel\_nofault} \\
+0 & \texttt{header} & \texttt{arg\_idx} [63:56] | \texttt{size} [55:48] | \texttt{nvals} [47:32] | \texttt{type} [31:28] | \texttt{seq} [23:0] \\
+1 & \texttt{pc} & Call site that produced the record: callback return address $-1$, KASLR offset removed \\
+2 & \texttt{address} & ENTRY/RET: address the fields were read from, 0 when the record carries the value itself. CMP: comparison type bits \\
+3..3+\textit{nvals} & \texttt{val[\,]} & The value itself, the expanded fields, or the two CMP operands; \texttt{KCOV\_DF\_MAGIC\_BAD} (\texttt{0xBADADD85}) where there was nothing to record \\
 \hline
 \end{tabular}
 \end{center}
+
+\noindent Record types are \texttt{0xE} (entry), \texttt{0xF} (return), and
+\texttt{0xC} (comparison). \texttt{size} and \texttt{arg\_idx} are clamped to
+255, \texttt{nvals} to $2^{16}-1$. \texttt{area[0]} holds the number of record
+words committed after it; every counted word has been written, so a consumer
+walking \texttt{pos += 3 + nvals} while \texttt{pos < 1 + area[0]} stays inside
+the mapping. The field \emph{table} is not part of the record: offsets and
+sizes stay in kernel \texttt{.rodata} and never reach user space.
 
 \section{Rust Post-Compilation Pipeline}\label{app:rust}
 
@@ -1720,9 +2399,9 @@ Each record occupies $3 + N$ quadwords (64-bit each), where $N$ is the number of
 rustc --edition 2021 --emit=llvm-ir -g \
   -o module.ll module.rs --crate-type lib
 
-# 2. Instrument with my opt (uses custom LLVM 23)
+# 2. Instrument with my opt (uses custom LLVM 24).
+#    No -sanitizer-coverage-level: the boundary modes do not need one.
 opt -passes=sancov-module \
-  -sanitizer-coverage-level=3 \
   -sanitizer-coverage-trace-args \
   -sanitizer-coverage-trace-ret \
   -S module.ll -o module_inst.ll
@@ -1737,12 +2416,13 @@ llc -filetype=obj -relocation-model=static \
 \section{Ioctl Interface Specification}\label{app:ioctl}
 
 \begin{lstlisting}[language=C,caption={Ioctl definitions}]
-#define KCOV_DF_INIT_TRACK  _IOR('d', 1, unsigned long)
-  /* = 0x80086401 */
-#define KCOV_DF_ENABLE      _IO('d', 100)
-  /* = 0x6464 */
-#define KCOV_DF_DISABLE     _IO('d', 101)
-  /* = 0x6465 */
+/* Buffer size is passed by value, in u64 words. */
+#define KCOV_DF_INIT_TRACK     _IOR('d', 1, unsigned long)
+#define KCOV_DF_ENABLE         _IO('d', 100)
+#define KCOV_DF_DISABLE        _IO('d', 101)
+/* Takes a pointer to a kcov_remote_handle()-encoded __u64. */
+#define KCOV_DF_REMOTE_ENABLE  _IOW('d', 102, __u64)
+#define KCOV_DF_REMOTE_DISABLE _IO('d', 103)
 \end{lstlisting}
 
 \end{document}
