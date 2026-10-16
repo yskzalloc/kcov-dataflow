@@ -23,6 +23,15 @@
 #     binderfs legitimately SKIP. An RT job going green therefore does NOT
 #     mean the Rust side works; only the non-RT jobs can say that.
 #
+# Every job also checks the records against the test modules' DWARF:
+# test_modules.py resolves each one through "sancov -symbolize-dataflow" (the
+# __sancov_dataflow descriptors plus DW_TAG_LLVM_sancov_observation) and
+# compares the source parameters, struct members and pointee layouts with the
+# ones the sources declare. The build job runs the LLVM tests of the passes,
+# the codegen and sancov changes they rely on, and the compiler-rt end-to-end
+# tests first, so a toolchain regression fails there rather than as a
+# kselftest failure.
+#
 # Timeouts: the kcov_dataflow "settings" file asks for 300s per target, which
 # is sized for KVM. The arm64 runners have no KVM, so everything runs under
 # TCG and the heaviest target (test_modules.py: four module load/trigger/
@@ -91,6 +100,36 @@ jobs:
           -DLLVM_ENABLE_RUNTIMES="compiler-rt" \
           -DLLVM_TARGETS_TO_BUILD="${{ matrix.target }}"
         ninja -C build
+
+    # The toolchain's own tests: the trace-args/trace-ret pass, the codegen
+    # it relies on (!pcsections on calls, one entry per PC), the DWARF tag,
+    # sancov, the clang flags, and the compiler-rt runtime end to end. Run on
+    # a cache hit too: they take a minute and say the cached build is sound.
+    # Tests for the other architecture report UNSUPPORTED.
+    - name: Test custom LLVM
+      run: |
+        cd llvm-project
+        build/bin/llvm-lit -sv \
+          llvm/test/Instrumentation/SanitizerCoverage \
+          llvm/test/CodeGen/X86/pcsections-per-pc.ll \
+          llvm/test/CodeGen/X86/pcsections-call.ll \
+          llvm/test/CodeGen/AArch64/pcsections-per-pc.ll \
+          llvm/test/CodeGen/AArch64/pcsections-call.ll \
+          llvm/test/DebugInfo/X86/sancov-observation.ll \
+          llvm/test/DebugInfo/AArch64/call-site-param-zero-register.ll \
+          llvm/test/tools/sancov \
+          clang/test/CodeGen/sanitizer-coverage-trace-args-ret.c \
+          clang/test/Driver/fsanitize-coverage.c
+        # lit finds a suite only from a directory with its own lit.site.cfg.py:
+        # one per sanitizer configuration (asan-<arch>-Linux, ...), not their
+        # parent.
+        shopt -s nullglob
+        configs=(build/runtimes/runtimes-bins/compiler-rt/test/sanitizer_common/*-Linux)
+        if [ ${#configs[@]} -eq 0 ]; then
+          echo "FAIL: no compiler-rt sanitizer_common test configurations"
+          exit 1
+        fi
+        build/bin/llvm-lit -sv --filter=sanitizer_coverage_trace_args "${configs[@]}"
 
     - name: Cache Rust build
       id: cache-rust
@@ -212,6 +251,7 @@ jobs:
 
     - name: Build kernel (${{ matrix.name }})
       run: |
+        set -o pipefail
         export PATH="$PWD/llvm-project/build/bin:$PATH"
         export RUSTC="$PWD/rust/build/${{ matrix.rust-target }}/stage1/bin/rustc"
         export RUST_LIB_SRC="$PWD/rust/library"
@@ -225,6 +265,24 @@ jobs:
         if [ "${{ matrix.arch }}" = "arm64" ]; then
           # Disable 32-bit compat to avoid needing ARM LLVM target for vdso32
           EXTRA_CONFIGS="$EXTRA_CONFIGS --configitem CONFIG_COMPAT=n"
+          # Upstream clang 22287cb04839 ("[Clang][AArch64] Diagnose invalid
+          # FPM scale arguments"), in the LLVM base, declares the
+          # __arm_set_fpm_*scale builtins in arm_vector_types.h with
+          # uint64_t/int64_t. asm/neon-intrinsics.h redefines
+          # __UINT64_TYPE__/__INT64_TYPE__ as long long before including
+          # arm_neon.h, so every file using NEON intrinsics fails with
+          # "conflicting types for '__arm_set_fpm_lscale'". Leave those files
+          # out -- none of them is what this pipeline tests -- until clang
+          # is fixed:
+          #   lib/crc/crc64-neon.c            CRC_OPTIMIZATIONS (needs EXPERT)
+          #   lib/raid/xor/*                  XOR_BLOCKS, ASYNC_XOR
+          #   lib/raid/raid6/arm/recov_neon*  RAID6_PQ (btrfs, md raid456)
+          #   crypto/aegis128-neon-inner.c    CRYPTO_AEGIS128
+          for c in CONFIG_EXPERT=y CONFIG_CRC_OPTIMIZATIONS=n \
+                   CONFIG_BTRFS_FS=n CONFIG_MD_RAID456=n CONFIG_ASYNC_XOR=n \
+                   CONFIG_XOR_BLOCKS=n CONFIG_RAID6_PQ=n CONFIG_CRYPTO_AEGIS128=n; do
+            EXTRA_CONFIGS="$EXTRA_CONFIGS --configitem $c"
+          done
         fi
 
         # Rust only on non-RT. The binder driver in this tree is Rust-only
@@ -247,12 +305,33 @@ jobs:
           --configitem CONFIG_KCOV_DATAFLOW_INSTRUMENT_ALL=y \
           --configitem CONFIG_KCOV_DATAFLOW_NO_INLINE=y \
           --configitem CONFIG_DEBUG_INFO=y \
-          --configitem CONFIG_DEBUG_INFO_DWARF5=y \
           --configitem CONFIG_DEBUG_INFO_REDUCED=n \
           --configitem CONFIG_WERROR=y \
           $RUST_CONFIGS \
           $EXTRA_CONFIGS \
-          LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC
+          LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC \
+          2>&1 | tee /tmp/kernel_build.txt
+
+    # The descriptors the compiler emits next to every trace call
+    # (__sancov_dataflow) need a rule in vmlinux.lds.h -- an orphan section
+    # is a link error under WERROR -- one output section per module, or the
+    # loader fails with -EEXIST, and objtool's IBT check must skip them: they
+    # point at call instructions, never at an indirect branch target. A
+    # warning here is one per instrumented call, so check for any at all.
+    - name: Verify the observation descriptors
+      run: |
+        rc=0
+        if grep -E "__sancov_dataflow.*(data relocation|is being placed)" /tmp/kernel_build.txt | head -5 | grep .; then
+          echo "FAIL: build warnings about __sancov_dataflow"
+          rc=1
+        fi
+        if llvm-project/build/bin/llvm-readelf -S linux/vmlinux | grep -q " __sancov_dataflow "; then
+          echo "ok      vmlinux has __sancov_dataflow"
+        else
+          echo "MISSING __sancov_dataflow in vmlinux"
+          rc=1
+        fi
+        exit $rc
 
     # CONFIG_KCOV_DATAFLOW_* carry
     #   depends on !RUST || $(rustc-option,-Cllvm-args=-sanitizer-coverage-...)
@@ -260,13 +339,19 @@ jobs:
     # probes the default rustc, the dependency goes unmet, and every symbol is
     # dropped from .config with no diagnostic. Read them back rather than
     # trusting that --configitem took effect.
+    #
+    # The DWARF version is read from vmlinux rather than from .config: vng
+    # appends CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y after the
+    # --configitem values, so that member of the "Debug information" choice
+    # always wins over a requested CONFIG_DEBUG_INFO_DWARF5=y. clang's default
+    # is DWARF 5, which is what is checked.
     - name: Verify kernel config
       run: |
         cd linux
         rc=0
         for s in CONFIG_KCOV CONFIG_KCOV_DATAFLOW_ARGS CONFIG_KCOV_DATAFLOW_RET \
                  CONFIG_KCOV_DATAFLOW_INSTRUMENT_ALL CONFIG_KCOV_DATAFLOW_NO_INLINE \
-                 CONFIG_DEBUG_INFO; do
+                 CONFIG_DEBUG_INFO CONFIG_WERROR; do
           if grep -q "^$s=y" .config; then
             echo "ok      $s=y"
           else
@@ -274,6 +359,28 @@ jobs:
             rc=1
           fi
         done
+        if grep -qE "^CONFIG_DEBUG_INFO_(DWARF5|DWARF_TOOLCHAIN_DEFAULT)=y" .config; then
+          echo "ok      $(grep -E "^CONFIG_DEBUG_INFO_DWARF" .config)"
+        else
+          echo "MISSING CONFIG_DEBUG_INFO_DWARF5 or CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT"
+          rc=1
+        fi
+        # An int with the same fail-open rustc-option dependency: absent, the
+        # compiler default applies, but the selftests expect snapshots on.
+        if grep -qE "^CONFIG_KCOV_DATAFLOW_POINTEE_BYTES=[1-9]" .config; then
+          echo "ok      $(grep "^CONFIG_KCOV_DATAFLOW_POINTEE_BYTES=" .config)"
+        else
+          echo "MISSING CONFIG_KCOV_DATAFLOW_POINTEE_BYTES (pointee snapshots off)"
+          rc=1
+        fi
+        v=$(../llvm-project/build/bin/llvm-dwarfdump --debug-info vmlinux 2>/dev/null |
+            grep -m1 -o "version = 0x000[0-9]") || true
+        if [ "$v" = "version = 0x0005" ]; then
+          echo "ok      vmlinux DWARF $v"
+        else
+          echo "MISSING DWARF 5 in vmlinux (${v:-no compile unit found})"
+          rc=1
+        fi
         if [ "${{ matrix.rt }}" != "true" ]; then
           for s in CONFIG_RUST CONFIG_ANDROID_BINDER_IPC_RUST; do
             if grep -q "^$s=y" .config; then
@@ -303,14 +410,23 @@ jobs:
         make -C tools/testing/selftests TARGETS=kcov_dataflow $MAKE_ARGS \
           install INSTALL_PATH=$PWD/kselftest-install
         ls -l kselftest-install/kcov_dataflow
+        # One descriptor section per module, which sancov can resolve.
+        for ko in kselftest-install/kcov_dataflow/*.ko; do
+          n=$(../llvm-project/build/bin/llvm-readelf -S "$ko" | grep -c " __sancov_dataflow ")
+          echo "$ko: $n __sancov_dataflow section(s)"
+          [ "$n" = 1 ] || exit 1
+          ../llvm-project/build/bin/sancov -symbolize-dataflow "$ko" > /dev/null
+        done
 
+    # The guest sees the host's file system, so test_modules.py can run the
+    # toolchain's sancov for its DWARF checks.
     - name: Run selftests
       run: |
         source venv-virtme/bin/activate
         cd linux
-        vng --user root \
-          --exec "$PWD/kselftest-install/run_kselftest.sh -o ${{ matrix.timeout }} -c kcov_dataflow" \
-          | tee /tmp/kselftest_result.txt
+        vng --user root --verbose \
+          --exec "env SANCOV=$PWD/../llvm-project/build/bin/sancov $PWD/kselftest-install/run_kselftest.sh -o ${{ matrix.timeout }} -c kcov_dataflow" \
+          2>&1 | tee /tmp/kselftest_result.txt
 
     # --- Results ---
 
@@ -323,6 +439,18 @@ jobs:
         grep -E "^(ok|not ok|# (ok|not ok|Totals|FAIL|TIMEOUT|selftests:))|# TIMEOUT" \
           /tmp/kselftest_result.txt 2>/dev/null || echo "MISSING"
         echo "============================================"
+        grep -E "^# # [a-z_]+: DWARF: |^# # DWARF: " /tmp/kselftest_result.txt 2>/dev/null || true
+
+    - name: Upload logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: kselftest-${{ matrix.name }}
+        path: |
+          /tmp/kselftest_result.txt
+          /tmp/kernel_build.txt
+          linux/.config
+        retention-days: 14
 
     # Note on matching: a kernel printk can land in the middle of a TAP line,
     # e.g. "# ok 2 k[   18.3] workqueue: ... deprecated workqueue". Patterns
@@ -346,6 +474,12 @@ jobs:
           grep -qE "^ok [0-9]+ selftests: kcov_dataflow: $t" $R || \
             fail "$t did not report ok"
         done
+
+        # The DWARF checks need sancov in the guest; skipped, they leave the
+        # mapping of records to source parameters unverified.
+        if grep -q "DWARF checks skipped" $R; then
+          fail "DWARF source map checks did not run (no sancov in the guest)"
+        fi
 
         if grep -qE "^(# )?not ok" $R; then
           echo "--- failing cases ---"
