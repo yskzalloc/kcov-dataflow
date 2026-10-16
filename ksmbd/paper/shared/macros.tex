@@ -1,0 +1,53 @@
+% shared/macros.tex — Identity-masked macros for both arXiv and symposium versions
+% Toggle anonymization: set \anonymoustrue before \input{macros} for double-blind review,
+%                       set \anonymousfalse before \input{macros} for arXiv
+
+\ifanonymous
+  \newcommand{\toolname}{{\sc SMBGrain}\xspace}
+  \newcommand{\anonrepo}{\url{https://anonymous.4open.science/r/XXXX}}
+  \newcommand{\authorblock}{%
+    \author{Anonymous Submission \\ Paper ID: TBD}%
+  }
+\else
+  \newcommand{\toolname}{{\sc ksmbdzzer}\xspace}
+  \newcommand{\anonrepo}{\url{https://github.com/yskzalloc/kcov-dataflow}}
+  \newcommand{\authorblock}{%
+    \author{Yunseong Kim \\
+      Ericsson Software Technology \\
+      \texttt{yunseong.kim@est.tech}}%
+  }
+\fi
+
+% Technical shorthands
+\newcommand{\kcovdf}{{\sc kcov-dataflow}\xspace}
+\newcommand{\ksmbd}{\texttt{ksmbd}\xspace}
+\newcommand{\sancov}{\texttt{SanitizerCoverage}\xspace}
+\newcommand{\tracepc}{\texttt{trace-pc}\xspace}
+\newcommand{\traceargs}{\texttt{trace-args}\xspace}
+\newcommand{\traceret}{\texttt{trace-ret}\xspace}
+\newcommand{\tracecmp}{\texttt{trace-cmp}\xspace}
+\newcommand{\kcov}{\texttt{KCOV}\xspace}
+\newcommand{\kasan}{\texttt{KASAN}\xspace}
+\newcommand{\syzkaller}{\texttt{syzkaller}\xspace}
+\newcommand{\libfuzzer}{\texttt{libFuzzer}\xspace}
+\newcommand{\virtme}{\texttt{virtme-ng}\xspace}
+
+% Data-flow tuple notation
+\newcommand{\dftuple}[4]{\ensuremath{\langle #1, #2, #3, #4 \rangle}}
+\newcommand{\callerid}{\ensuremath{\mathit{PC}_{\mathrm{caller}}}}
+\newcommand{\calleeid}{\ensuremath{\mathit{PC}_{\mathrm{callee}}}}
+
+% Results that are not yet measured on the paper's toolchain. Every \pending{}
+% must be replaced by a measured value before submission; grep for it.
+\newcommand{\pending}[1]{\textcolor{red}{\textbf{[#1]}}}
+
+% Listing style
+\usepackage{listings}
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny,
+  captionpos=b,
+}

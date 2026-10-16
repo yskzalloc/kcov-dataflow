@@ -14,6 +14,15 @@ measures the dataflow steering against a pc-only + i2s/havoc baseline.
 > oracle** for non-crashing access-control/logic bugs. They look at different things;
 > do not benchmark one against the other.
 
+## Discoveries
+
+- [CVE-2026-74522](https://www.cve.org/CVERecord/?id=CVE-2026-74522) (CVSS 3.1: 8.8): ksmbd: fix use-after-free in `__close_file_table_ids()` ([e7188199eff4](https://github.com/torvalds/linux/commit/e7188199eff4))
+- [CVE-2026-90174](https://www.cve.org/CVERecord/?id=CVE-2026-90174) (CVSS 3.1: 7.1): ksmbd: fix slab-out-of-bounds read in `ksmbd_alloc_user()` ([7405d0ba2943](https://github.com/torvalds/linux/commit/7405d0ba2943))
+- [CVE-2026-90173](https://www.cve.org/CVERecord/?id=CVE-2026-90173) (CVSS 3.1: 9.8): smb: smbdirect: free completion queues with `ib_free_cq()` ([fe2c0cacbcff](https://github.com/torvalds/linux/commit/fe2c0cacbcff))
+- [CVE-2026-90172](https://www.cve.org/CVERecord/?id=CVE-2026-90172) (CVSS 3.1: 7.5): smb: smbdirect: destroy QP before mem pools on accept failure ([383a9480f5f4](https://github.com/torvalds/linux/commit/383a9480f5f4))
+- [CVE-2026-90171](https://www.cve.org/CVERecord/?id=CVE-2026-90171): smb: smbdirect: release pending child sockets outside the handler lock ([db82fbe4bb68](https://github.com/torvalds/linux/commit/db82fbe4bb68))
+- [CVE-2026-90170](https://www.cve.org/CVERecord/?id=CVE-2026-90170): ksmbd: validate IPC response length before dereferencing its fields ([e9b33376bd07](https://github.com/torvalds/linux/commit/e9b33376bd07))
+
 ---
 
 ## Design principles

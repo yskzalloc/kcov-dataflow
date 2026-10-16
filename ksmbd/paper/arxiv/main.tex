@@ -1,0 +1,1591 @@
+\documentclass{article}
+
+\usepackage{PRIMEarxiv}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{fancyhdr}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,fit,calc,decorations.pathreplacing,backgrounds}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{pifont}
+\usepackage{amssymb}
+\usepackage{xspace}
+\usepackage[text=PREPRINT,color=gray!25,scale=3]{draftwatermark}
+\graphicspath{{media/}}
+
+\newcommand{\cmark}{\ding{51}}
+\newcommand{\xmark}{\ding{55}}
+\newif\ifanonymous
+% \anonymoustrue
+\anonymousfalse
+\input{../shared/macros}
+
+%% ---------------------------------------------------------------------------
+%% STATUS OF THE EVALUATION (read before submitting)
+%%
+%% Every number printed in red via \pending{} is NOT yet measured on the
+%% paper's toolchain. The engine-comparison campaigns recorded so far
+%% (~/ksmbdzzer-logs/2026-08-28_*, 2026-09-01_*, 2026-09-02_*) are all
+%% INVALID: their summaries report kern_pcs = 0 for every arm, and the logs
+%% show "REMOTE_ENABLE(0x4b440001) failed ... Bad address" (Section~\ref{sec:correction}).
+%% Measured facts used in this draft: the 2026-07-22 grain selftest
+%% (208 WORKS / 0 DEAD / 0 BAIL / 2 EXCL), the upstream fixes and CVEs, the
+%% source-code constants, and the kcov-dataflow cost figures taken from the
+%% foundational paper.
+%% ---------------------------------------------------------------------------
+
+% Header
+\pagestyle{fancy}
+\thispagestyle{empty}
+\renewcommand{\shorttitle}{Dataflow-Steered SMB-Procedure Fuzzing of the Linux In-Kernel SMB Server}
+\renewcommand{\headeright}{A Preprint}
+
+%% Title
+\title{Deep by Construction: Dataflow-Steered, Procedure-Level Fuzzing of the Linux In-Kernel SMB Server}
+
+\authorblock
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+The Linux in-kernel SMB3 server, \texttt{ksmbd}, runs a network-reachable
+protocol stack in ring~0. Fuzzing it means clearing three obstacles. A
+\emph{protocol wall}: file-system logic is reached only after a valid
+negotiate, NTLMv2 session setup, tree connect and \texttt{CREATE}. A
+\emph{value wall}: once the handlers are covered, edge coverage cannot tell a
+benign length from a malicious one. An \emph{oracle wall}: the most damaging
+server defect, modifying a file the client may not touch, does not crash. I
+present \toolname, a fuzzer that works on SMB \emph{procedures} rather than
+system calls. A \emph{grain} is a valid scenario whose authenticated prefix
+is never mutated; only its final protocol data unit is fuzzed, so every input
+starts past the parser. 210 grains cover all 19 SMB2 commands, every FSCTL
+and information class, the \texttt{CREATE} contexts, SMB3 transforms,
+SMBDirect and SMB1. Feedback comes from \kcovdf, a compiler-based KCOV
+extension that records function arguments, return values and comparison
+operands. A handle derived from each connection's loopback address routes
+those records to that connection's harness. The harness folds them into
+\libfuzzer's counters as saturating path features plus bounded, first-seen
+value features, and feeds the comparison operands to an input-to-state
+mutator. An effect-based contract oracle checks write-side integrity against
+a root-owned victim, and a stability oracle flags silent state corruption.
+208 of the 210 grains reach \texttt{ksmbd} code. The campaigns found six
+vulnerabilities, all assigned CVEs and fixed upstream. The aim is not to beat
+edge-coverage fuzzers on their own metric, but to guide mutation with what the
+kernel's functions actually receive and return.
+\end{abstract}
+
+\keywords{Kernel Fuzzing \and SMB \and ksmbd \and Data-Flow Feedback \and Compiler Instrumentation \and Input-to-State Correspondence \and Logic-Bug Oracles}
+
+
+\section{Introduction}\label{sec:intro}
+
+\ksmbd~\cite{ksmbddoc} is the SMB3 file server built into Linux. It parses
+untrusted network input in kernel context, and its request handlers run on
+kernel workqueues with the privileges needed to act on any file in an exported
+tree. A single defect there can be reached remotely, with the attacker sending
+the bytes and the kernel parsing them. The server's history shows the
+consequence: CVE-2022-47939~\cite{cve202247939}, a use-after-free reachable
+during tree disconnect, was rated critical. Since then, file-table
+lifetimes, IPC message validation and the SMBDirect transport have all
+produced memory-safety bugs. The security-critical paths are well known; the
+open question is how to reach them systematically and judge what happens
+there.
+
+A fuzzer faces three distinct obstacles in this setting.
+
+\paragraph{The protocol wall.} \ksmbd does nothing interesting with a request
+until a session exists. The client must negotiate a dialect, complete a
+two-leg NTLMSSP exchange whose response is an HMAC over a server
+challenge~\cite{msnlmp}, connect to a share, and open a handle. Signing or
+encryption may be required on top. Random bytes, and mutations of a captured
+trace that break the session state, are rejected in
+\texttt{ksmbd\_smb2\_check\_message()} or in session lookup, long before any
+file-system code runs. Syscall-level kernel fuzzers such as
+\syzkaller~\cite{vyukov2015syzkaller} can open a TCP socket to port~445, but
+they would have to generate the NTLMv2 proof and keep the message identifiers,
+credits and session identifiers consistent across calls.
+
+\paragraph{The value wall.} When valid requests do reach the handlers, edge
+coverage soon runs out of new edges. \texttt{smb2\_write()} with a length of
+eight and with a length of \texttt{0xFFFFFFFF} take the same edges up to the
+bounds check. A \texttt{CREATE} asking for \texttt{FILE\_READ\_DATA} and one
+asking for \texttt{FILE\_WRITE\_DATA|DELETE\_ON\_CLOSE} also look the same to
+\tracepc. These argument values decide what the server does, and edge coverage
+does not record them~\cite{kim2026kcovdataflow}.
+
+\paragraph{The oracle wall.} The defect class that matters most for a file
+server is an \emph{integrity violation}: the server truncates, overwrites or
+deletes a file the authenticated user has no right to modify. Such a bug
+returns \texttt{STATUS\_SUCCESS} and leaves no \kasan report or lockdep splat.
+Crash oracles miss it, and a naive ``request succeeded although access was
+not granted'' check produces false positives, because \ksmbd authorizes at the
+POSIX layer and an owner may legitimately operate on its own file
+(Section~\ref{sec:correction}).
+
+\medskip
+\toolname is designed around these three obstacles. It fuzzes at the
+granularity of \emph{SMB procedures}, steers with \emph{kernel values}, and
+judges results with \emph{effect-based contract oracles}. It operates through
+three layers:
+\begin{enumerate}[nosep]
+  \item \textbf{Grains (Section~\ref{sec:grain}).} A grain is a working SMB
+        scenario whose authenticated prefix is fixed. \libfuzzer mutates only
+        the final target PDU or its parameters, so every input reaches deep
+        handler code by construction. 210 grains, ordered by kernel data-path
+        depth, cover the whole SMB1/2/3 procedure surface.
+  \item \textbf{Value-aware kernel feedback
+        (Sections~\ref{sec:route}--\ref{sec:i2s}).} \kcovdf records reach the
+        right harness because each connection's records are routed by a
+        handle derived from its loopback destination address. The harness
+        folds them into \libfuzzer's extra counters as a path region, which
+        saturates, and a value region, which adds a feature only for a
+        never-before-seen value at a call site. A RedQueen-style
+        mutator~\cite{aschermann2019redqueen} consumes the comparison
+        operands.
+  \item \textbf{Orchestration and oracles
+        (Sections~\ref{sec:combine}--\ref{sec:loop}).} A four-phase round loop
+        (enumerate, saturate, combine, save) runs the grain fleet in parallel,
+        combines grains pairwise on a shared handle, and carries corpora
+        forward from round to round. Crash, stability and contract oracles run
+        as checks alongside fuzzing rather than as separate phases.
+\end{enumerate}
+
+\paragraph{Scope: a different axis, not a faster edge fuzzer.} This work does
+not set out to beat existing fuzzers at their own game, and it is not a
+comparison against them. Edge-coverage engines such as \syzkaller decide what
+to keep using only \emph{which} code ran, and they mutate only bytes that the
+fuzzer itself generated. \toolname explores a different question: what
+happens when mutation is guided by knowledge of the target, namely the values
+its functions actually \emph{received} and \emph{returned}? A head-to-head
+benchmark against an edge-coverage engine cannot answer that question
+cleanly, because the two systems differ in interface, input model, feedback
+and oracle at once. A syscall-level fuzzer and a procedure-level fuzzer do not
+even run the same inputs. I therefore measure the value signal \emph{inside}
+one system, where everything else is held fixed (Section~\ref{sec:eval}), and
+treat edge-coverage fuzzers as complementary. The direction is promising
+because it opens a channel that edge coverage does not have. The kernel tells
+the fuzzer which lengths, flags, handles and comparison operands its code
+actually processed, and the fuzzer can push exactly those values towards
+boundaries or reuse them in later requests, instead of guessing blindly. This
+paper is a first, end-to-end step in that direction on a production kernel
+subsystem, and the direction deserves further development.
+
+My contributions are:
+\begin{itemize}[nosep]
+  \item \textbf{Procedure-level, deep-by-construction fuzzing of an in-kernel
+        network server.} The grain abstraction fixes a valid authenticated
+        prefix and fuzzes only the last procedure. A 210-grain fleet covers
+        all 19 SMB2 commands, all 16 FSCTLs handled by \texttt{smb2\_ioctl()},
+        the \texttt{SET\_INFO}/\texttt{QUERY\_INFO} classes, 11
+        \texttt{CREATE} contexts, the SMB3 transforms, SMBDirect, and the SMB1
+        compatibility opcodes. A coverage-measured self-test shows that 208 of
+        the 210 grains reach \ksmbd handlers.
+  \item \textbf{Per-connection routing of kernel dataflow.} An IP-derived
+        remote handle (\texttt{0x4b440000 | low16(daddr)}) is set in
+        \ksmbd's TCP transport and published from user space through
+        \texttt{KCOV\_DF\_REMOTE\_ENABLE}. Each concurrent fuzzing worker
+        therefore receives exactly the argument, return and comparison records
+        produced while \ksmbd services \emph{its} connection, even though that
+        work runs on shared kworkers.
+  \item \textbf{A bounded value-coverage fold and a controlled engine
+        ablation.} The fold keeps edge coverage's clean saturation signal and
+        adds a first-seen value region with value-class normalization. Five
+        engine arms run the same grains on the same kernel, so the
+        contribution of value coverage and of input-to-state mutation can be
+        \emph{measured} rather than asserted.
+  \item \textbf{Effect-based integrity oracles for a file server.} A
+        cross-user contract oracle checks a root-owned victim through the
+        backing file system. It is accompanied by lease-grant, race-integrity,
+        teardown-lifetime and fragmented-framing oracles, and by a stability
+        oracle that flags a working scenario that stops working.
+  \item \textbf{Upstream impact.} Six vulnerabilities were assigned CVEs and
+        fixed in Linux (Table~\ref{tab:bugs}), plus one further SMBDirect
+        locking fix.
+\end{itemize}
+
+
+\section{Background \& Motivation}\label{sec:background}
+
+\subsection{ksmbd and its Attack Surface}
+
+\ksmbd splits the server between the kernel and a user-space daemon,
+\texttt{ksmbd.mountd}. The daemon owns the user database and the share
+configuration, and answers login, tree-connect and RPC requests over a generic
+netlink channel (\texttt{transport\_ipc.c}). The kernel owns everything else.
+A per-connection handler thread (\texttt{ksmbd\_conn\_handler\_loop()}) reads
+NetBIOS-framed PDUs from TCP, or from SMBDirect over RDMA, and queues each
+request to a kworker, where \texttt{handle\_ksmbd\_work()} validates and
+dispatches it to one of the 19 SMB2 command handlers in
+\texttt{smb2pdu.c}. Compound requests chain several commands in one frame.
+SMB3 adds a transform header for encryption and a compression transform, and
+SMBDirect adds its own credit-based framing on queue pairs.
+
+Two properties of this design shape everything that follows. First, the code
+that matters runs \emph{off the client's task}: it runs on the handler thread
+and on kworkers, not in the context of the process that sent the bytes.
+Per-task coverage collection, the mode most fuzzers use, sees nothing; the
+coverage has to be routed remotely. Second, \ksmbd authorizes in two places:
+it checks the granted access mask in its SMB layer, and it then calls the VFS
+with the mapped user's credentials, so POSIX permissions remain the last line
+of defence. An oracle has to distinguish a genuine bypass from the case where
+the SMB layer misses a check that POSIX enforces anyway.
+
+\subsection{KCOV and kcov-dataflow}
+
+KCOV~\cite{vyukov2016kcov} records the program counters a task executes into a
+buffer mapped into user space. Its remote mode lets a kernel thread annotated
+with \texttt{kcov\_remote\_start\_common(handle)} attribute its coverage to
+whichever user-space collector registered that handle. \kcovdf~\cite{kim2026kcovdataflow},
+the foundation of this work, extends \sancov with two compiler modes,
+\texttt{-fsanitize-coverage=trace-args} and \texttt{trace-ret}. The first
+reports every source-level parameter of every instrumented frame, inlined
+frames included. The second reports every return value. A struct passed by
+pointer is expanded field by field through a DWARF-derived
+\emph{(offset, size)} table, read with \texttt{copy\_from\_kernel\_nofault()}.
+The kernel backend writes variable-length records into a per-task (or
+per-remote-handle) buffer exposed at \texttt{/sys/kernel/debug/kcov\_dataflow}.
+Each record has a three-word header (sequence, type \texttt{0xE}/\texttt{0xF}/\texttt{0xC},
+value count, size, argument index), then the PC, then the source address, then
+the values. A field that cannot be read is recorded as the sentinel
+\texttt{0xBADADD85}. With \texttt{CONFIG\_KCOV\_ENABLE\_COMPARISONS}, the
+\tracecmp operand pairs land in the \emph{same} stream as \texttt{0xC}
+records, so argument values and comparison operands of one execution arrive
+interleaved and in sequence order. The foundational paper measures
+18--21\,ns per stored record and a 66\% syscall-latency cost for whole-kernel
+instrumentation with collection idle~\cite{kim2026kcovdataflow}.
+
+\kcovdf provides the signal. This paper is about what a fuzzer has to do to
+benefit from it on a real target: deliver valid stateful input, route each
+connection's records to the right consumer, fold values into coverage without
+flooding the map, turn comparison operands into mutations, and recognize the
+bugs that do not crash.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  node distance=0.3cm,
+  box/.style={rectangle, draw, thick, minimum width=2.4cm, minimum height=0.6cm, font=\scriptsize\bfseries, align=center},
+  msg/.style={-{Stealth[length=2mm]}, thick},
+  lbl/.style={font=\scriptsize, midway, above},
+  note/.style={font=\scriptsize\itshape, text=gray},
+  rec/.style={-{Stealth[length=1.6mm]}, densely dashed, blue!60!black},
+]
+\node[box] (client) {Grain harness\\(\libfuzzer, 127.0.0.$n$)};
+\node[box, right=4.2cm of client] (server) {\ksmbd\\(conn thread + kworker)};
+\node[box, right=1.6cm of server, fill=blue!6] (buf) {kcov\_dataflow\\buffer[$n$]};
+
+% Vertical lifelines
+\draw[dashed, gray] (client.south) -- ++(0,-6.0);
+\draw[dashed, gray] (server.south) -- ++(0,-6.0);
+\draw[dashed, gray] (buf.south) -- ++(0,-6.0);
+
+% Fixed prefix
+\begin{scope}[on background layer]
+\fill[green!7] ([xshift=-1.4cm, yshift=-0.35cm]client.south) rectangle ([xshift=0.3cm, yshift=-3.85cm]server.south);
+\end{scope}
+\draw[msg] ([yshift=-0.7cm]client.south) -- node[lbl] {NEGOTIATE} ([yshift=-0.7cm]server.south);
+\draw[msg] ([yshift=-1.3cm]client.south) -- node[lbl] {SESSION\_SETUP (NTLMSSP NEGOTIATE)} ([yshift=-1.3cm]server.south);
+\draw[msg] ([yshift=-1.9cm]server.south) -- node[lbl] {challenge} ([yshift=-1.9cm]client.south);
+\draw[msg] ([yshift=-2.5cm]client.south) -- node[lbl] {SESSION\_SETUP (NTLMv2 AUTH)} ([yshift=-2.5cm]server.south);
+\draw[msg] ([yshift=-3.1cm]client.south) -- node[lbl] {TREE\_CONNECT, CREATE} ([yshift=-3.1cm]server.south);
+\draw[msg] ([yshift=-3.6cm]server.south) -- node[lbl] {SessionId, TreeId, FileId} ([yshift=-3.6cm]client.south);
+
+% Target PDU
+\draw[msg, red!70!black] ([yshift=-4.5cm]client.south) -- node[lbl, text=red!70!black] {target PDU \colorbox{yellow!30}{mutated}} ([yshift=-4.5cm]server.south);
+\draw[rec] ([yshift=-4.8cm]server.south) -- node[lbl, text=blue!60!black, font=\tiny] {0xE / 0xF / 0xC records} ([yshift=-4.8cm]buf.south);
+\draw[msg] ([yshift=-5.2cm]server.south) -- node[lbl] {NTSTATUS} ([yshift=-5.2cm]client.south);
+\draw[rec] ([yshift=-5.6cm]buf.south) -- node[lbl, text=blue!60!black, font=\tiny] {mmap: fold $\to$ ctr[\,], operands $\to$ mutator} ([yshift=-5.6cm]client.south);
+
+% Annotations
+\node[note, anchor=east] at ([xshift=-0.15cm, yshift=-2.1cm]client.south) {fixed prefix};
+\node[note, anchor=east] at ([xshift=-0.15cm, yshift=-2.45cm]client.south) {(never mutated)};
+\draw[decorate, decoration={brace, amplitude=3pt, mirror, raise=2pt}, gray]
+  ([xshift=-1.45cm, yshift=-0.45cm]client.south) -- ([xshift=-1.45cm, yshift=-3.75cm]client.south);
+\node[note, anchor=east] at ([xshift=-0.15cm, yshift=-4.5cm]client.south) {fuzzed};
+\end{tikzpicture}
+\caption{A grain. The authenticated prefix (shaded) is a valid, unmutated SMB
+exchange; \libfuzzer mutates only the final target PDU. \ksmbd services the
+connection on its own threads, and the remote handle derived from the
+destination address $127.0.0.n$ routes the resulting \kcovdf records into
+buffer~$n$, which only this grain maps.}\label{fig:grain}
+\end{figure}
+
+\subsection{Why Existing Approaches Stall}
+
+\paragraph{Syscall-level kernel fuzzing.} \syzkaller and its
+descendants~\cite{sun2021healer,wang2021syzvegas,pailoor2018moonshine}
+generate sequences of system calls guided by edge coverage. For \ksmbd the
+relevant system calls are a TCP \texttt{connect()} and \texttt{sendmsg()} of a
+blob, so the SMB state machine becomes an opaque byte string that the fuzzer
+has to rediscover. Its coverage signal is value-blind. Its oracle is the
+kernel log.
+
+\paragraph{Stateful network-protocol fuzzing.} AFLNet~\cite{pham2020aflnet},
+StateAFL~\cite{natella2022stateafl}, SGFuzz~\cite{ba2022sgfuzz} and
+Nyx-Net~\cite{schumilo2022nyxnet} model a server's states from message
+sequences, response codes, or snapshots. They target user-space servers,
+derive state from responses rather than from the server's internal values,
+and assume per-process coverage that does not exist for a kernel server whose
+work runs on kworkers.
+
+\paragraph{Data-flow-guided fuzzing.} Taint-based fuzzers~\cite{chen2018angora,gan2020greyone}
+pay a per-byte shadow cost that is infeasible in the kernel.
+IJON~\cite{aschermann2020ijon} requires manual state annotations. RedQueen~\cite{aschermann2019redqueen}
+and CmpLog~\cite{fioraldi2020aflpp} obtain input-to-state correspondence from
+comparison operands, and Eclipser~\cite{choi2019eclipser} steers values
+towards branch conditions. \toolname borrows the input-to-state idea but
+draws its operands from the kernel's \tracecmp stream and its argument values
+from \kcovdf.
+
+\paragraph{Semantic oracles.} Hydra~\cite{kim2019hydra} checks file systems
+for semantic bugs such as crash-consistency violations, and
+PeX~\cite{zhang2019pex} and Crix~\cite{lu2019crix} look statically for missing
+permission checks. None of them checks a network file server's authorization
+contract at run time.
+
+Table~\ref{tab:positioning} summarizes the gap.
+
+\begin{table}[t]
+\centering
+\caption{Capabilities needed to fuzz \ksmbd's deep, value-dependent,
+non-crashing surface.}\label{tab:positioning}
+\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+& \textbf{Kernel} & \textbf{Valid auth.} & \textbf{Value} & \textbf{Kernel cmp} & \textbf{Integrity} \\
+\textbf{Approach} & \textbf{coverage} & \textbf{prefix} & \textbf{feedback} & \textbf{i2s} & \textbf{oracle} \\
+\midrule
+\syzkaller (syscall level)              & \cmark & \xmark & \xmark & \xmark & \xmark \\
+AFLNet / StateAFL / Nyx-Net             & \xmark & \cmark & \xmark & \xmark & \xmark \\
+RedQueen / AFL++ CmpLog (user space)    & \xmark & ---    & \xmark & \cmark & \xmark \\
+\kcovdf alone (signal only)             & \cmark & \xmark & \cmark & \cmark & \xmark \\
+\toolname                               & \cmark & \cmark & \cmark & \cmark & \cmark \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Threat Model and Assumptions}
+
+The attacker is a network client that can reach \ksmbd over TCP port~445 or
+over SMBDirect. The attacker holds valid credentials for a \emph{low-privilege}
+account, or uses guest access where the configuration allows it, and wants to
+(a)~corrupt kernel memory, (b)~deny service, or (c)~violate the integrity of
+files the account may not modify. Bugs reachable before authentication are in
+scope as well: the \texttt{negotiate} and \texttt{session\_setup} grains fuzz
+exactly those PDUs. One reported bug (\texttt{ipc\_validate\_msg()},
+Table~\ref{tab:bugs}) requires a malfunctioning or compromised
+\texttt{ksmbd.mountd}. That attacker is stronger than the network client, and I
+report the bug as kernel hardening against a less-trusted user-space
+component. The fuzzer runs entirely inside a \virtme guest on loopback with a
+sanitizer-heavy kernel (\kasan, UBSAN, lockdep, \texttt{DEBUG\_LIST}). No
+production system or third-party server is involved.
+
+
+\section{System Design \& Architecture}\label{sec:design}
+
+\subsection{Overview}
+
+\toolname follows one rule throughout: \emph{Python manages, C fuzzes}. The
+orchestrator (\texttt{ksmbdzzer.py}) enumerates grains, compiles and launches
+harnesses, aggregates their metrics and runs the oracles, and it performs no
+per-input work. Each grain is a separate \libfuzzer process. Its
+\texttt{LLVMFuzzerTestOneInput} drives one SMB procedure over its own
+loopback address, folds that connection's \kcovdf records into
+\texttt{\_\_libfuzzer\_extra\_counters}, and returns; its
+\texttt{LLVMFuzzerCustomMutator} turns the same records into directed
+mutations. \libfuzzer's own corpus logic, which keeps an input that produces
+a new feature, is therefore steered entirely by \emph{kernel} behaviour
+(Figure~\ref{fig:arch}).
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  font=\scriptsize,
+  zone/.style={rectangle, draw, thick, rounded corners=3pt, inner sep=0pt},
+  ztitle/.style={font=\scriptsize\bfseries, anchor=north west, inner sep=2pt},
+  sub/.style={rectangle, draw, rounded corners=2pt, dashed, inner sep=0pt},
+  stitle/.style={font=\tiny\bfseries, anchor=north west, inner sep=1.5pt, text=black!75},
+  comp/.style={rectangle, draw, fill=white, minimum height=0.62cm, align=center, font=\tiny, inner sep=1.5pt},
+  arrow/.style={-{Stealth[length=1.6mm]}, thick},
+  darrow/.style={-{Stealth[length=1.6mm]}, thick, dashed},
+  lab/.style={font=\tiny\itshape, fill=white, inner sep=0.8pt, align=center},
+]
+%% HOST
+\node[zone, fill=gray!8, minimum width=16cm, minimum height=1.45cm, anchor=north west] (host) at (0,0) {};
+\node[ztitle] at (host.north west) {Host};
+\node[comp, minimum width=2.9cm, text width=2.78cm, fill=gray!15] (clang) at (2.1,-0.85) {custom clang/LLVM\\SanCov trace-args/ret/cmp};
+\node[comp, minimum width=2.6cm, text width=2.48cm, fill=gray!15] (vng) at (5.25,-0.85) {\texttt{vng --build}\\portable config items};
+\node[comp, minimum width=2.4cm, text width=2.28cm, fill=gray!15] (bg) at (8.0,-0.85) {\texttt{build-grains}\\compile cache};
+\node[comp, minimum width=2.6cm, text width=2.48cm, fill=gray!15] (cmp) at (10.75,-0.85) {comparison runner\\arms $\times$ trials, cold};
+\node[comp, minimum width=2.4cm, text width=2.28cm, fill=gray!15] (db) at (13.5,-0.85) {\texttt{.fuzzdb} (9p)\\durable corpus};
+\node[comp, minimum width=0.9cm, text width=0.78cm, fill=gray!15] (con) at (15.4,-0.85) {serial\\console};
+\draw[arrow] (clang) -- (vng);
+%% GUEST USER SPACE
+\node[zone, fill=yellow!6, minimum width=16cm, minimum height=5.0cm, anchor=north west] (us) at (0,-1.7) {};
+\node[ztitle] at (us.north west) {Guest user space (\virtme, loopback only)};
+% orchestrator
+\node[sub, fill=yellow!14, minimum width=8.5cm, minimum height=1.25cm, anchor=north west] (orch) at (0.2,-2.05) {};
+\node[stitle] at (orch.north west) {\texttt{ksmbdzzer.py} orchestrator: round loop};
+\node[comp, minimum width=1.8cm, text width=1.68cm] (p1) at (1.25,-2.85) {P1 enumerate\\lib + raw + v2};
+\node[comp, minimum width=1.8cm, text width=1.68cm] (p2) at (3.3,-2.85) {P2 saturate\\ALIGNED gate};
+\node[comp, minimum width=1.8cm, text width=1.68cm] (p3) at (5.35,-2.85) {P3 combine\\shared object};
+\node[comp, minimum width=1.8cm, text width=1.68cm] (p4) at (7.4,-2.85) {P4 save\\feed-forward};
+\draw[arrow] (p1) -- (p2); \draw[arrow] (p2) -- (p3); \draw[arrow] (p3) -- (p4);
+% oracles
+\node[sub, fill=red!6, minimum width=7.1cm, minimum height=1.25cm, anchor=north west] (orc) at (8.85,-2.05) {};
+\node[stitle] at (orc.north west) {oracles (checks, not phases)};
+\node[comp, minimum width=1.9cm, text width=1.78cm] (stab) at (9.95,-2.85) {stability\\$\mathit{ft}_0 < 0.5\cdot$base};
+\node[comp, minimum width=2.6cm, text width=2.48cm] (ctr) at (12.3,-2.85) {contract suite: cross-user,\\lease, race, teardown, frag};
+\node[comp, minimum width=1.6cm, text width=1.48cm] (arb) at (14.95,-2.85) {arbiter\\\texttt{fb.bin}};
+% scheduler
+\node[comp, minimum width=15.6cm, text width=15.48cm, fill=orange!8] (sched) at (8.0,-3.75) {\texttt{gen.py run\_grains()}: slot $s \mapsto 127.0.0.(2{+}s \bmod 250)$ $\cdot$ replicas share a corpus $\cdot$ saturation detection $\cdot$ fast-bail $\cdot$ PRODUCTIVE gate $\cdot$ fleet-union PC bitmap};
+% grain fleet
+\node[sub, fill=orange!12, minimum width=13.9cm, minimum height=2.15cm, anchor=north west] (fleet) at (0.2,-4.3) {};
+\node[stitle] at (fleet.north west) {grain fleet: one \libfuzzer process per grain or replica, each on its own 127.0.0.$n$};
+\node[comp, minimum width=2.5cm, text width=2.38cm] (lib) at (1.6,-5.05) {library tier (most grains)\\\texttt{GRAINS[]} + libsmbclient};
+\node[comp, minimum width=2.3cm, text width=2.18cm] (raw) at (4.15,-5.05) {raw tier\\\texttt{common.h} + NTLMv2};
+\node[comp, minimum width=1.7cm, text width=1.58cm] (v2) at (6.25,-5.05) {v2 hybrid\\i2s at stuck};
+\node[comp, minimum width=1.9cm, text width=1.78cm] (cmb) at (8.2,-5.05) {combo harness\\$A{+}B$ shared fid};
+\node[comp, minimum width=2.3cm, text width=2.18cm, fill=cyan!10] (fold) at (10.6,-5.05) {fold $\to$ \texttt{ctr[4096]}\\path + first-seen value};
+\node[comp, minimum width=2.0cm, text width=1.88cm, fill=red!8] (mut) at (12.95,-5.05) {\texttt{mutate\_i2s}\\cmp ring, ret tokens};
+\draw[arrow] (fold) -- (mut);
+\node[comp, minimum width=1.6cm, text width=1.48cm, fill=gray!12] (mountd) at (15.05,-5.05) {\texttt{ksmbd.mountd}\\users, shares};
+%% GUEST KERNEL
+\node[zone, fill=green!6, minimum width=16cm, minimum height=3.05cm, anchor=north west] (kern) at (0,-6.95) {};
+\node[ztitle, anchor=south west] at (kern.south west) {Guest kernel (linux-next, whole kernel built with trace-args/ret/cmp)};
+\node[comp, minimum width=2.6cm, text width=2.48cm, fill=green!12] (tcp) at (1.6,-7.75) {TCP :445, handle\\\texttt{0x4b44}$\,|\,$low16(daddr)};
+\node[comp, minimum width=2.3cm, text width=2.18cm, fill=green!12] (rdma) at (4.25,-7.75) {SMBDirect (RXE/SIW)\\5 annotated work fns};
+\node[comp, minimum width=2.7cm, text width=2.58cm, fill=green!12] (conn) at (7.0,-7.75) {conn thread\\\texttt{ksmbd\_conn\_handler\_loop}};
+\node[comp, minimum width=3.7cm, text width=3.58cm, fill=green!12] (work) at (10.45,-7.75) {kworker \texttt{handle\_ksmbd\_work}\\$\to$ 19 SMB2 handlers $\to$ VFS};
+\node[comp, minimum width=1.8cm, text width=1.68cm, fill=green!12] (ipc) at (14.85,-7.75) {\texttt{transport\_ipc}\\generic netlink};
+\node[comp, minimum width=3.6cm, text width=3.48cm, fill=blue!8] (rem) at (6.0,-9.0) {remote sections\\\texttt{kcov\_df\_remote\_start\_common}};
+\node[comp, minimum width=3.8cm, text width=3.68cm, fill=blue!8] (kdf) at (10.45,-9.0) {\kcovdf: remote map, per-worker scratch, atomic merge $\to$ buffer[$n$]};
+\node[comp, minimum width=2.4cm, text width=2.28cm, fill=red!8] (san) at (14.1,-9.0) {\kasan, UBSAN, lockdep,\\\texttt{DEBUG\_LIST}};
+\draw[arrow] (rdma) -- (conn); \draw[arrow] (tcp.north) -- ++(0,0.22) -| ([xshift=-0.4cm]conn.north); \draw[arrow] (conn) -- (work);
+\draw[arrow] (conn.south) -- (conn.south |- rem.north); \draw[arrow] (work.south) -- node[lab] {remote section} (work.south |- kdf.north);
+\draw[arrow] (rem) -- (kdf);
+%% CROSS-ZONE FLOWS
+\draw[arrow] (p2.south) -- node[lab, right=1pt] {launch} (p2.south |- sched.north);
+\draw[arrow] (lib.south) -- node[lab, pos=0.45] {SMB2 PDUs to\\127.0.0.$n$:445} (lib.south |- tcp.north);
+\draw[darrow] (raw.south) -- node[lab, pos=0.4] {\texttt{rdma}\\grain} (rdma.north);
+\draw[arrow, blue!60!black] (kdf.east) -- (12.55,-9.0) -- (12.55,-6.2) -| node[lab, pos=0.25, text=blue!60!black] {mmap: this connection's records} (fold.south);
+\draw[{Stealth[length=1.6mm]}-{Stealth[length=1.6mm]}, thick] (mountd.south) -- node[lab] {login,\\tree} (mountd.south |- ipc.north);
+\draw[arrow, red!60!black] (san.east) -- (15.92,-9.0) |- node[lab, pos=0.15, text=red!60!black, rotate=90] {splats} (con.east);
+\draw[arrow] (p4.north) -- (7.4,-1.58) -| node[lab, pos=0.25] {corpus, features, value pool} (db.south);
+\end{tikzpicture}
+\caption{System architecture of \toolname. On the host, a custom clang builds
+the kernel with \traceargs/\traceret/\tracecmp, and harnesses are pre-compiled
+into a cache. In the guest, the orchestrator runs the four-phase round loop and
+the oracles, and \texttt{gen.py} schedules a fleet of \libfuzzer grain
+processes, each dialling its own loopback address. In the kernel, \ksmbd's
+transports derive a remote handle from that address, and the connection thread,
+kworkers and SMBDirect work functions run in remote sections, so \kcovdf
+merges the argument, return and comparison records into the buffer that only
+that grain maps. Sanitizer reports leave the guest on the serial console, and
+corpora are mirrored to a host-durable store after every round.}\label{fig:arch}
+\end{figure}
+
+\subsection{Grains: Deep by Construction}\label{sec:grain}
+
+A \emph{grain} is a working, ordinary SMB scenario, written down as code. It
+performs the prerequisite exchange (negotiate, authenticate, tree connect,
+and usually \texttt{CREATE}) with valid values, and then issues one
+\emph{target} procedure whose fields or parameters come from the fuzzer
+input. The prefix is never mutated. This is the central structural decision:
+mutation begins \emph{past} the parser and the session checks, so no budget
+is spent rediscovering the handshake, and every input exercises handler code
+on its first execution.
+
+\paragraph{Two tiers.} Most grains (the \emph{library} tier) are functions in
+the \texttt{GRAINS[]} registry of \texttt{libksmbdzzer.so}. They obtain the
+prefix from \texttt{libsmbclient}, or from a raw, already-authenticated
+connection pool, and use the input to parameterize the target operation:
+offsets, lengths, information classes, FSCTL buffers, create options,
+compound layouts. A smaller \emph{raw} tier of socket harnesses speaks SMB2
+directly: it builds the 64-byte sync header and the 4-byte NetBIOS length
+prefix itself, authenticates with its own NTLMv2 implementation, and lets the
+input \emph{be} the target PDU. The library tier inherits correct signing and
+session handling. The raw tier can corrupt structure sizes, offsets and
+compound links that \texttt{libsmbclient} would never emit. Each tier covers
+the other's blind spot.
+
+\paragraph{Coverage of the procedure surface.} The registry defines 211
+grains and runs 210 of them; one ACL grain is suppressed because another
+grain reaches the same \texttt{parse\_sec\_desc()} surface. The grains are
+ordered by kernel data-path depth, with file and VFS I/O first and session
+and authentication last, so that the grain index means the same thing in the
+documentation, the registry and the compile order. Table~\ref{tab:surface}
+shows how the fleet maps onto the protocol. Beyond one grain per handler,
+112 grains target parser depth and interaction: chained compound requests,
+array walkers left at one iteration by single-element grains, durable and
+lease reconnect races, credit exhaustion, transform nesting, and partial or
+oversize framing.
+
+\begin{table}[t]
+\centering
+\caption{Procedure surface covered by the 210 active grains (canonical
+grain-to-handler map in \texttt{GRAIN.md}).}\label{tab:surface}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Surface} & \textbf{Coverage} & \textbf{Example grains} \\
+\midrule
+SMB2 commands (\texttt{smb2pdu.c})     & 19 of 19, each with a dedicated grain & \texttt{write}, \texttt{lock}, \texttt{notify}, \texttt{oplock\_ack} \\
+FSCTL (\texttt{smb2\_ioctl})           & all 16 handled codes                 & \texttt{copychunk}, \texttt{fsctl\_zero}, \texttt{fsctl\_dupext} \\
+\texttt{SET\_INFO}/\texttt{QUERY\_INFO} & file, FS and security classes       & \texttt{rename}, \texttt{hardlink}, \texttt{set\_alloc} \\
+\texttt{CREATE} contexts               & 11 contexts                          & \texttt{create\_dh2}, \texttt{create\_aapl}, \texttt{lease\_v2} \\
+SMB3 features                          & encryption, signing, multichannel, durable-v2 & \texttt{encrypt}, \texttt{session\_bind}, \texttt{dh2c} \\
+Transport                              & TCP framing, SMBDirect (RDMA)        & \texttt{partial\_pdu\_dribble}, \texttt{rdma} \\
+SMB1 compatibility                     & generic + 5 per-opcode grains        & \texttt{smb1\_ntcreate}, \texttt{smb1\_trans} \\
+IPC / RPC                              & named pipes, DCE/RPC opnums, netlink & \texttt{ndr}, \texttt{rpc\_opnum}, \texttt{ipc} \\
+Parser depth / interaction             & 112 grains                           & \texttt{compound\_related\_fid}, \texttt{credit\_exhaust} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Five archetypes.} Although there are 211 grains, they follow only
+five procedure shapes (Table~\ref{tab:archetypes}). Every grain shares one
+skeleton: it arms the per-connection coverage once, establishes its preamble,
+and for each input resets the buffer, sends its fuzzed PDU, and folds the
+resulting records. Grains differ in two respects only: \emph{what the fuzzed
+endpoint is}, and \emph{how many messages it takes to reach it}. The archetype
+also determines how a grain recovers when an input kills its connection,
+which is what keeps a long campaign productive.
+
+\begin{table}[t]
+\centering
+\caption{Grain archetypes, distilled from \texttt{GRAIN.md}. Counts are
+approximate shares of the 211-grain registry.}\label{tab:archetypes}
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\begin{tabular}{@{}L{2.1cm}L{4.4cm}L{4.1cm}L{0.9cm}L{3.9cm}@{}}
+\toprule
+\textbf{Archetype} & \textbf{Shape (prefix $\to$ fuzzed endpoint)} & \textbf{What it stresses} & \textbf{Share} & \textbf{Representative grains} \\
+\midrule
+\textbf{P} single-op & authenticated preamble and a persistent \texttt{FileId}; each input is \emph{one} operation on it & handler argument decoding, bounds and offset checks, VFS calls & $\approx$150 & \texttt{write\_ext}, \texttt{fsctl\_*}, \texttt{set\_*}, \texttt{create\_*} \\
+\textbf{M} multi-op & several ordered operations per input: compound chain, deferred lock with cancel, close during an operation & cross-operation state, teardown ordering, race windows & $\approx$40 & \texttt{compound\_related\_fid}, \texttt{write\_lock\_race}, \texttt{durable\_reconnect\_race} \\
+\textbf{R} RPC / pipe & \texttt{IPC\$} tree, pipe open, DCE/RPC \texttt{BIND}; each input is one RPC request & NDR decoding, opnum dispatch, pipe transceive & $\approx$7 & \texttt{ndr}, \texttt{rpc\_opnum}, \texttt{pipe\_transceive\_bind} \\
+\textbf{D} disrupting & negotiate only; the fuzzed PDU is session- or protocol-level and may tear the connection down, so the grain reconnects & SPNEGO/NTLMSSP, signing, transform headers, SMB1, logoff, framing & $\approx$30 & \texttt{spnego\_asn1}, \texttt{encrypt}, \texttt{logoff\_*}, \texttt{smb1\_*} \\
+\textbf{X} architectural & reaches \ksmbd through a path without a per-connection IP handle & netlink IPC to \texttt{ksmbd.mountd}, SMBDirect data plane & 2 & \texttt{ipc}, \texttt{rdma} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Alignment.} A grain is only as good as its prefix. A wrong
+\texttt{StructureSize}, a dialect rejected early, or a pool connection torn
+down by an earlier grain makes \ksmbd drop the PDU before any handler runs,
+yet the grain keeps running and keeps consuming budget. \toolname enforces
+alignment twice. Before a campaign, \texttt{selftest} runs each grain several
+times and classifies it by the number of distinct kernel PCs its connection
+produced: WORKS ($\geq$1 PC), DEAD (it ran but no PC), BAIL (a prerequisite
+failed), or EXCL (architecturally unmeasurable on a per-connection handle).
+The measurement uses kernel coverage, not the SMB reply, because an error
+reply is produced both by a PDU rejected at dispatch and by one that ran the
+whole handler and then failed a check. During a campaign, \texttt{gen.py}
+tags a grain ALIGNED only if its \libfuzzer feature count reaches
+$\mathit{ft} \geq 100$. In practice deep grains reach thousands of features
+and misaligned ones stay below~30.
+
+\subsection{Per-Connection Kernel Coverage Routing}\label{sec:route}
+
+The fleet runs many grains at once, and \ksmbd services all of them on shared
+kworkers. A buffer that mixed every grain's records would credit one grain's
+input with another grain's coverage. \toolname gives each worker its own
+loopback destination, $127.0.0.n$, and routes by destination:
+\begin{itemize}[nosep]
+  \item In \texttt{ksmbd\_conn\_alloc()} every connection receives a default
+        \texttt{kcov\_common\_handle()}. For an IPv4 TCP connection,
+        \texttt{alloc\_transport()} overrides it with
+        \[ \mathit{handle}(c) = \texttt{0x4b440000} \;\big|\; \big(\mathrm{ntohl}(\texttt{inet\_rcv\_saddr}(c)) \wedge \texttt{0xFFFF}\big), \]
+        that is, the \emph{local} (destination) address the client dialled.
+        The \texttt{0x4b44} (``KD'') tag keeps the value out of the
+        small-integer handle space that other subsystems use.
+  \item The connection handler loop and the request kworker
+        (\texttt{handle\_ksmbd\_work()}) bracket their bodies with
+        \texttt{kcov\_remote\_start\_common()}/\texttt{kcov\_df\_remote\_start\_common()}
+        on that handle, and with the matching stops. Five SMBDirect work
+        functions (negotiate receive on accept and connect, the idle timer,
+        immediate send, and receive-buffer refill) are wrapped the same way
+        through thin wrappers around their bodies, so that early returns
+        cannot unbalance a section. The RDMA transport copies the
+        connection's handle into its SMBDirect socket.
+  \item The grain process computes the same value from its own octet, maps
+        a \kcovdf buffer, and publishes the handle with
+        \texttt{KCOV\_DF\_REMOTE\_ENABLE}. Remote writers assemble records in
+        a per-worker scratch area and merge them into the shared buffer with
+        one atomic cursor update~\cite{kim2026kcovdataflow}.
+\end{itemize}
+The design costs a few lines in \ksmbd's transport and nothing on the hot
+path. It requires no change to the SMB protocol and no cooperation from the
+client library, since \texttt{libsmbclient} only needs to be told which
+address to dial. The low 16 bits of the address name the worker, so up to
+250 concurrent workers fit in $127.0.0.\{2..251\}$. IPv6 connections remain
+unrouted.
+
+\subsection{Value-Aware Coverage Folding}\label{sec:fold}
+
+Each execution leaves a sequence of records
+$r = \langle \tau, \mathit{pc}, a, v_0..v_{m-1}\rangle$ in the buffer, where
+$\tau \in \{\texttt{E}, \texttt{F}, \texttt{C}\}$ and $m$ is the number of
+values. The harness must turn these records into \libfuzzer features. Folding
+every $(\mathit{pc}, v)$ pair naively makes the map unbounded: every kernel
+pointer, sequence number or timestamp becomes a ``new'' feature, the corpus
+grows without limit, and a grain never saturates, which removes the very
+signal the scheduler uses (Section~\ref{sec:loop}). Folding only the PC
+discards what \kcovdf was built to provide. \toolname splits the 4096-entry
+counter table into two regions (Figure~\ref{fig:fold}). The description below
+is the raw-tier implementation. The library tier implements the same policy
+by feature hashing (Section~\ref{sec:impl}).
+
+\paragraph{Path region.} The path region,
+$\mathit{ctr}[0..P{-}1]$ with $P = 3584$ by default, is folded from the PC
+alone, $\phi_\mathrm{path}(r) = \lfloor (\mathit{pc}\cdot c_1)/2^{12}\rfloor \bmod P$.
+It is bounded by the set of reachable PCs, so it \emph{saturates}. Saturation
+is a feature here, not a defect: it is the clean ``no new behaviour'' signal
+on which grain scheduling depends.
+
+\paragraph{Bounded value region.} For every entry or return record and every
+field $k$ whose value is neither zero nor the unreadable sentinel, the harness
+computes a 16-bit bucket
+\[ b_k = \Big\lfloor \big((\mathit{pc} \oplus \kappa(v_k)) + k\cdot c_2\big)\cdot c_3 \,/\, 2^{48} \Big\rfloor \]
+and increments $\mathit{ctr}[P + (b_k \bmod V)]$ \emph{only the first time}
+$b_k$ is seen, tracked in a persistent $2^{16}$-bit bitmap. Here $V = 512$,
+$c_3$ is the 64-bit golden-ratio constant, and mixing in the field index $k$
+keeps the same value in different struct fields distinct. A loop that reads
+the same length a million times produces one feature, not a million. A
+request that drives a length, flag word or create option to a value
+\emph{never before seen at that call site} is rewarded and kept.
+
+\paragraph{Value classes.} Raw values still over-reward noise: two allocations
+give two pointers, and lengths of 1000 and 1001 behave identically. The
+canonical arm therefore folds a value class
+\[ \kappa(v) = \begin{cases}
+0 & v = 0\\
+\texttt{0x1000} \;|\; (v \wedge \texttt{0x38}) & v \geq \texttt{0xffff}\cdot 2^{48} \quad\text{(kernel pointer)}\\
+\texttt{0x2000} & v > 2^{47}-1 \quad\text{(other non-canonical)}\\
+\lfloor \log_2 v \rfloor & \text{otherwise (scalar magnitude)}
+\end{cases} \]
+which keeps NULL-ness, a little alignment, and order of magnitude, so that
+crossing a boundary such as $2^{31}$ or $2^{32}$ is still a new feature. A
+relational variant adds, for each pair of fields $(a, b)$ in one record, the
+three-way ordering $\rho(v_a, v_b) \in \{<, =, >\}$. Value classes collapse
+an offset and a length of the same magnitude into one bucket, and the ordering
+splits them again, because whether \texttt{offset < length} holds is exactly
+what decides an out-of-bounds access.
+
+\paragraph{Comparisons are not coverage.} Comparison records reach the path
+region only through their PC. Their operands are usually the fuzzer's own
+input bytes echoed back, so folding them would mint a new feature on almost
+every mutation, flood the value region, and drown the genuine argument
+values. Of the two ways to use comparisons, \emph{operand as coverage}
+(libFuzzer's value profile) or \emph{context plus directed solving},
+\toolname takes the second: the PC refines the location, and the operand
+pair goes to the mutator (Section~\ref{sec:i2s}).
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  cell/.style={rectangle, draw, minimum height=0.7cm, font=\scriptsize, align=center},
+  box/.style={rectangle, draw, rounded corners, fill=gray!8, minimum height=0.6cm, font=\scriptsize, align=center},
+  note/.style={font=\scriptsize\itshape, text=black!75, fill=white, inner sep=1pt},
+  arrow/.style={-{Stealth[length=1.6mm]}, thick},
+]
+\node[cell, fill=orange!20, minimum width=10.5cm] (path) at (0,0) {PATH region: \texttt{ctr[0..3583]}, folded from $\phi(\mathit{pc})$, saturates};
+\node[cell, fill=cyan!20, minimum width=3.2cm, anchor=west] (val) at (path.east) {VALUE region: \texttt{ctr[3584..4095]}};
+\node[box] (rec) at (0,1.9) {record $\langle \tau, \mathit{pc}, a, v_0..v_{m-1} \rangle$, $\tau \in \{\texttt{0xE}, \texttt{0xF}, \texttt{0xC}\}$};
+\node[box, fill=red!8] (mut) at ([xshift=-3.6cm]rec.west |- 0,1.9) {\texttt{mutate\_i2s}\\operand ring};
+\draw[arrow] (rec.south -| path.north) -- node[note] {every record: $\mathit{pc}$} (path.north);
+\draw[arrow] (rec.south east) -- node[note, pos=0.45] {\texttt{0xE}/\texttt{0xF} only: first-seen $(\mathit{pc}, k, \kappa(v_k))$} (val.north);
+\draw[arrow, dashed] (rec.west) -- node[note, above=2pt] {\texttt{0xC} operands} (mut.east);
+\end{tikzpicture}
+\caption{The coverage fold. The path region gives edge coverage's bounded,
+saturating signal. The value region adds one feature per never-before-seen
+(call site, field, value class) triple. Comparison operands drive mutation
+instead of coverage.}\label{fig:fold}
+\end{figure}
+
+\paragraph{Engine arms.} Because the fold policy lives in the harness and not
+in the kernel, the same grains on the same kernel can be run as several
+engines, selected by \texttt{KSMBDZZER\_ENGINE}, with identical
+instrumentation (Table~\ref{tab:arms}). Comparing \texttt{dataflow-vec} with
+\texttt{pc-i2s} isolates the payoff of value coverage at the same
+per-execution cost, and comparing \texttt{pc-i2s} with \texttt{pc-havoc}
+isolates the payoff of input-to-state mutation. A sixth configuration replaces
+\kcovdf with mainline KCOV (\texttt{KSMBDZZER\_KCOV=1}) on the same
+per-connection handle, as a stock edge-coverage baseline.
+
+\begin{table}[t]
+\centering
+\caption{Engine arms. All arms use the same kernel and the same grains; only
+the fold and the mutator differ.}\label{tab:arms}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Arm} & \textbf{Coverage folded from the record stream} & \textbf{Mutator} \\
+\midrule
+\texttt{dataflow}     & path + raw value of the record              & i2s + havoc \\
+\texttt{dataflow-vec} & path + every field, value-class normalized (canonical) & i2s + havoc \\
+\texttt{dataflow-rel} & \texttt{dataflow-vec} + pairwise field ordering & i2s + havoc \\
+\texttt{pc-i2s}       & path only (values dropped)                  & i2s + havoc \\
+\texttt{pc-havoc}     & path only (values dropped)                  & havoc \\
+\midrule
+\texttt{kcov}         & mainline \tracepc, path only                & havoc (no records for i2s) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Dataflow-Directed Mutation}\label{sec:i2s}
+
+The custom mutator turns the same record stream into mutations
+(Algorithm~\ref{alg:i2s}, Appendix~\ref{app:i2s}). Two of every three calls
+are plain \libfuzzer havoc, which keeps exploration cheap; the third is
+directed. In the hybrid (v2) grains, the directed call is made only at a
+saturation point, after 64 consecutive executions without a new path. The
+directed step has three passes.
+
+\paragraph{Pass 0: comparison operands (RedQueen).} For each \texttt{0xC}
+record of width $w \geq 2$ with distinct operands $(a_1, a_2)$, if the
+little-endian encoding of one operand occurs in the input, it is overwritten
+with the other, which flips a magic-value check in a single step. In the
+library tier this in-place case is rare. There the input only
+\emph{parameterizes} a \texttt{libsmbclient} operation, and the operands live
+in the PDU that the library builds, not in the bytes \libfuzzer holds. To
+handle this, every operand seen by the fold, except trivial values
+($\leq 1$) and kernel pointers, is recorded in a persistent, deduplicated
+512-entry ring. Up to six operands, drawn alternately from the current
+execution and from the ring, are \emph{injected} at seed-chosen offsets of an
+input that is first grown to at least 16 bytes. The magic value thereby enters
+the bytes that parameterize the PDU, and it can reach the comparison on the
+next execution. Without the ring, the operand supply would depend on what the
+buffer happens to contain when the mutator runs, which is frequently an
+execution with no comparison record at all.
+
+\paragraph{Pass 1--2: arguments to boundaries, returns to arguments.} For each
+\texttt{0xE} field value $v$ that occurs in the input (widest match first, at
+8, 4 and 2 bytes, since lengths and offsets live in the wide fields), the
+mutator replaces it with one of three things: a kernel \emph{return} value
+taken from a persistent 512-entry return dictionary or from the current
+execution, a value carried over from the previous round, or a type boundary
+($0$, $1$, $2^{31}{-}1$, $2^{31}$, $2^{32}{-}1$, $2^{63}{-}1$, $2^{63}$,
+$2^{64}{-}1$, $\texttt{0x1000}$, and narrower equivalents). Using returns as
+tokens is the \emph{reverse} direction of input-to-state correspondence: a
+handle, size or status that the kernel computed at iteration $N$ is exactly
+the value a later request will be checked against.
+
+\paragraph{Cross-round arbiter.} After each round, the orchestrator distils
+the body offsets that increased coverage or tripped an oracle, together with
+the interesting values, into a packed blob (\texttt{fb.bin}, magic
+\texttt{0xF00DDA7A}, 64 offsets and 128 values). The raw grains load it at
+start-up and include those offsets and values in the directed pass. This
+closes a data-driven loop with no recompilation: the harness is compiled
+once, and its behaviour comes from data.
+
+The mutator uses no SMT solver, no symbolic execution and no byte-level
+taint, none of which is feasible across the user/kernel boundary at fuzzing
+speed. It relies on the observation that \ksmbd copies most wire fields into
+kernel arguments with little or no transformation, so a value that appears in
+the record stream can usually be located in the PDU.
+
+\subsection{Procedure Combination on a Shared Object}\label{sec:combine}
+
+Single-procedure grains cannot find bugs that need two procedures to
+interact: a lease taken by one request and abused by another, a byte-range
+lock left behind, a handle torn down halfway. Phase~P3 therefore runs grains
+in pairs, \texttt{pfz\_grain\_combo2(a, b)}, on \emph{one shared object}. A
+file \texttt{combo\_obj} is opened on the pool connection(s) so that both
+grains act on the same handle and path, and the first input byte selects one
+of three modes:
+\begin{enumerate}[nosep]
+  \item \textbf{Shared}: $A$ then $B$ on the same connection and handle, with
+        no reset in between, so $B$ inherits $A$'s state.
+  \item \textbf{Interleave}: $A, B, A, B$ on the shared handle.
+  \item \textbf{Race}: $A$ on connection~0 and $B$ on connection~1, at the
+        same time. $B$ runs in a forked child that rebinds its connection
+        references to connection~1's own socket, so the bytes on the wire
+        never interleave, and a five-second alarm bounds a hung read.
+\end{enumerate}
+All pairs are generated from one compiled combination harness plus one
+symbolic link per pair, so the $O(n^2)$ space costs one compilation.
+
+\subsection{Oracles as Checks, not Phases}\label{sec:oracles}
+
+\paragraph{Crash.} \kasan, UBSAN, lockdep, \texttt{DEBUG\_LIST},
+refcount-saturation and fault messages on the serial console, matched against
+a fixed pattern list. \texttt{panic\_on\_oops} and \texttt{hung\_task\_panic}
+turn a wedge into a VM exit, so the run harness can resume the campaign from
+the durable corpus.
+
+\paragraph{Stability.} Every round re-runs each grain's bare scenario, and the
+first $\mathit{ft}$ that \libfuzzer reports, $\mathit{ft}_0$, is the coverage
+of that unmutated scenario. The orchestrator keeps a per-grain baseline that
+only ratchets upwards. If a grain with baseline $\geq 100$ now reaches less
+than half of it, the \emph{normal} scenario has stopped working. The previous
+round's fuzzing has then left \ksmbd in a corrupted but still running state:
+a non-crashing bug whose reproducer is in that grain's corpus history.
+
+\paragraph{Contract (write-side integrity).} Once per round, the
+\texttt{DataflowDirector} authenticates to a dedicated \texttt{[privtest]}
+share, where the fuzzing account maps to a non-root UID, and runs a battery of
+probes. Each probe rebuilds its own clean session.
+\begin{itemize}[nosep]
+  \item \emph{Cross-user integrity.} A victim file owned by \texttt{root:root}
+        with mode \texttt{0644}, in a \texttt{0755} root-owned directory,
+        holds a known secret. Three procedures are attempted through a
+        handle opened \emph{read-only}: \texttt{CREATE} with
+        \texttt{OVERWRITE\_IF}, \texttt{CREATE} with
+        \texttt{FILE\_DELETE\_ON\_CLOSE}, and a direct \texttt{SMB2\_WRITE}.
+        The verdict is taken \emph{from the backing file system}: did the
+        secret change, or did the file disappear? It is not taken from the
+        returned status, because \ksmbd can return \texttt{STATUS\_SUCCESS}
+        while POSIX silently prevents the effect. A hit therefore means the
+        server acted with more authority than the user has. A sanity probe
+        first confirms that the account is in fact non-root on the share;
+        otherwise the oracle declares itself inconclusive.
+  \item \emph{Lease grant.} The granted lease state must be a subset of the
+        requested state and internally consistent (write caching implies
+        read caching), as required by MS-SMB2~\S3.3.5.9.11~\cite{mssmb2}.
+  \item \emph{Race integrity.} A known pattern is written, an oplock race is
+        driven across pool connections, and the file is read back. A silent
+        mismatch is state corruption without a crash.
+  \item \emph{Teardown lifetime.} A handle is opened, its owner is destroyed
+        (\texttt{TREE\_DISCONNECT} frees the tree connection; \texttt{LOGOFF}
+        frees the session with all its trees and files), and the dangling
+        \texttt{FileId} is used. \texttt{STATUS\_SUCCESS} is a logic bug; a
+        \kasan splat between the printed begin and end markers is a memory
+        bug.
+  \item \emph{Fragmented framing.} A \texttt{CREATE}/\texttt{WRITE}/\texttt{CLOSE}
+        cycle is re-sent with each PDU split across eight TCP segments, so
+        that the partial-read loop in \texttt{ksmbd\_tcp\_readv()}, which a
+        single loopback write coalesces away, actually runs.
+\end{itemize}
+Every round also runs a positive control, so that silence has a meaning. A
+predicate self-test checks that a known read-only plus \texttt{OVERWRITE}
+tuple is flagged and a read-write tuple is not. A live control then opens the
+victim with \texttt{FILE\_READ\_DATA} only and writes through that handle;
+\ksmbd must reject the write on its granted-access check. Without the
+control, a silent oracle could mean either a correct server or a broken
+probe.
+
+\subsection{The Round Loop and Feed-Forward}\label{sec:loop}
+
+A campaign is a sequence of \emph{rounds} (generations), each with four
+phases.
+\begin{description}[nosep, font=\normalfont\bfseries]
+  \item[P1 enumerate.] Build the grain set (library, raw and hybrid
+        harnesses). A compile cache keyed on the source hash and dependency
+        modification times skips \texttt{clang} for an unchanged harness.
+        The value pool travels in \libfuzzer's \texttt{-dict} file, not in
+        the C source, so carrying values forward never forces a recompile.
+  \item[P2 saturate.] Run every grain until its coverage saturates or its time
+        cap expires. Saturation means that the relative growth of
+        $\mathit{ft}$ per five-second window stays below a ratio (default
+        $0.02$) for three consecutive windows, after a warm-up of at least 32
+        executions so that the directed mutator has had time to act.
+  \item[P3 combine.] All-pairs combination on a shared object
+        (Section~\ref{sec:combine}), in the final round, under an explicit
+        combination budget.
+  \item[P4 save.] Persist each grain's corpus, its features and the value
+        pool, and mirror them to a host-durable directory, so that a VM
+        wedge costs one round rather than the campaign. The next round
+        replays this corpus, so its $\mathit{ft}_0$ starts higher.
+\end{description}
+
+Two selection rules keep the fleet honest. \emph{Anti-monkey selection}: a
+grain counts as PRODUCTIVE only if mutation beats the bare scenario,
+$\Delta = \mathit{ft} - \mathit{ft}_0 \geq 100$ or
+$\Delta \geq 0.2\,\mathit{ft}_0$. A grain that reaches deep code but gains
+nothing from fuzzing is a monkey at a keyboard and is not ranked or combined.
+\emph{Fast-bail}: a grain whose session never came up runs the harness
+entirely in-process, at execution rates that no grain making SMB round trips
+can reach. A grain that exceeds 20{,}000 executions per second after 50{,}000
+executions while staying below the alignment threshold is killed at once,
+instead of spending its whole budget producing no kernel coverage.
+
+\section{Implementation}\label{sec:impl}
+
+\subsection{Components}
+
+Table~\ref{tab:loc} lists the components. The kernel side consists of
+\kcovdf~\cite{kim2026kcovdataflow} (\texttt{kernel/kcov\_dataflow.c}, 1{,}174
+lines) and the remote-coverage annotations in \texttt{fs/smb/server} and
+\texttt{fs/smb/smbdirect}, carried as four patches: mainline KCOV and \kcovdf
+sections for the server and for SMBDirect.
+
+\begin{table}[t]
+\centering
+\caption{Implementation size (lines, \texttt{wc -l}).}\label{tab:loc}
+\small
+\begin{tabular}{@{}lrl@{}}
+\toprule
+\textbf{Component} & \textbf{LOC} & \textbf{Role} \\
+\midrule
+\texttt{libksmbdzzer.c} / \texttt{.h} & 6{,}429 / 198 & \texttt{GRAINS[]} registry, \kcovdf mmap + fold, i2s, combo, RDMA \\
+\texttt{grain/gen.py}                 & 2{,}886       & harness generator, compile cache, fleet scheduler, metrics \\
+\texttt{grain/common.h}               & 1{,}005       & raw-tier harness: SMB2 framing, fold, \texttt{mutate\_i2s} \\
+\texttt{grain/ntlmv2.h}               & 92            & raw-tier NTLMv2 authentication \\
+\texttt{ksmbdzzer.py}                 & 2{,}483       & orchestrator: round loop, oracles, arbiter, \texttt{init}/\texttt{selftest} \\
+\texttt{engine\_compare\_campagin.sh} & 628           & build + multi-arm, multi-trial comparison runner \\
+\midrule
+\texttt{kernel/kcov\_dataflow.c}      & 1{,}174       & \kcovdf backend (foundational work) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Two Fold Back-Ends, One Policy}
+
+The raw tier implements the fold of Section~\ref{sec:fold} directly over the
+4096-byte \texttt{\_\_libfuzzer\_extra\_counters} section: path region,
+first-seen value region, and an optional relational pass. The library tier,
+which hosts most of the fleet, hashes each kernel record with 64-bit FNV-1a
+into one 32-bit feature. The hash covers the PC alone for comparison records
+and for the PC-only arms; the PC and every value-classed field, tagged with
+its index, for \texttt{dataflow-vec}; and the PC and the classed value for
+returns. The generated harness increments
+$\mathit{ctr}[\mathit{feature} \wedge 4095]$. Only records whose PC lies in
+the kernel text range ($\geq$\texttt{0xffffffff80000000}) are counted. Both
+back-ends implement the same policy: comparisons never enter the value space,
+pointers are classed, and the PC-only arms drop values completely, so a
+comparison between arms is a controlled ablation in both tiers. A grain's
+whole \texttt{LLVMFuzzerTestOneInput} is three calls: run grain $i$, fetch
+its features, write the counters (Listing~\ref{lst:grain},
+Appendix~\ref{app:harness}).
+
+\subsection{Fleet Scheduling}
+
+\texttt{run\_grains()} assigns slot $s$ the address
+$127.0.0.(2 + s \bmod 250)$ and runs grains in waves of \texttt{-procs}
+(default: all CPUs) with \texttt{-max\_len=512}, the per-grain dictionary,
+and a seed derived from \texttt{KSMBDZZER\_SEED} and the slot. When there
+are fewer grains than cores, the idle cores run \emph{replicas} of the same
+grain that share its corpus directory. Several engineering measures emerged
+from running unattended multi-hour campaigns against a sanitizer kernel:
+\begin{itemize}[nosep]
+  \item \textbf{Lazy pool authentication.} Only grains that need the
+        authenticated two-connection pool create it. When every grain
+        authenticated up front, the single \texttt{ksmbd.mountd} IPC daemon
+        was flooded with NTLMv2 logins. In the self-test this storm alone
+        reduced WORKS from 208 to 78.
+  \item \textbf{Session drain.} A wave with many grains that executed zero
+        inputs means \ksmbd hit its connection or session ceiling, so the
+        scheduler sleeps $\min(8\,\mathrm{s}, 1\,\mathrm{s} \times \text{deaths})$
+        before the next wave. \ksmbd is restarted only when a liveness probe
+        on port~445 fails, never as a matter of routine.
+  \item \textbf{Staggered teardown.} Flat grains saturate on a purely
+        time-based schedule, so a whole wave reaches \texttt{terminate()}, and
+        closes its \kcovdf descriptors, in the same instant. A per-grain
+        delay spreads these closes out. Each grain is a session leader and is
+        killed by process group, so forked race children cannot survive while
+        holding a \ksmbd socket.
+  \item \textbf{Metrics that survive \texttt{SIGKILL}.} Saturation ends a grain
+        with a signal that bypasses \texttt{atexit}. The harness therefore
+        re-emits its counters (distinct kernel PCs, comparison and
+        return-token splices, record census) periodically on a line-buffered
+        \texttt{stderr}, and the scheduler keeps the maximum.
+\end{itemize}
+
+\subsection{Measuring Coverage Without Double Counting}
+
+The per-grain popcount of distinct kernel PCs, \emph{summed} over the fleet,
+is biased: shared PCs (the dispatcher, session lookup, the VFS) are counted
+once per grain, so the engine that cycles through the most grains wins
+without reaching any new code. Each harness therefore keeps a $2^{17}$-bit
+PC bitmap (index $= (\mathit{pc}\cdot c_3) \gg 47$, the same layout in both
+tiers). Whenever the popcount grows, the bitmap is dumped, and
+\texttt{gen.py} ORs every dump into a fleet-wide union. Its popcount,
+$\mathit{kern\_pcs}_\cup$, is the primary metric of
+Section~\ref{sec:eval}. \libfuzzer's $\mathit{ft}$ and corpus size are
+reported only as secondary metrics: value coverage keeps more inputs by
+construction, so those numbers favour the dataflow arms.
+
+\subsection{Build and Target Bring-Up}
+
+The kernel is built with \virtme from its default base plus an explicit list
+of configuration items, so no machine-specific \texttt{.config} is needed:
+\texttt{KCOV}, \texttt{KCOV\_ENABLE\_COMPARISONS},
+\texttt{KCOV\_DATAFLOW\_\{ARGS,RET,INSTRUMENT\_ALL\}}, \texttt{SMB\_SERVER}
+with SMBDirect and Kerberos, \texttt{UNICODE} (required for the casefold
+path), Soft-RoCE and Soft-iWARP, \kasan (generic, inline), \texttt{SLUB\_DEBUG\_ON},
+UBSAN bounds, lockdep with RCU proving, \texttt{DEBUG\_LIST}, hung-task and
+soft-lockup panics, \texttt{FAILSLAB}, and DWARF5. \texttt{ksmbdzzer.py init}
+then performs an idempotent nine-step bring-up: share and mount directories,
+loading \ksmbd, provisioning the \texttt{fuzz} account, RDMA links,
+\texttt{ksmbd.mountd}, the client mount, and an optional KDC. Grain harnesses
+can be pre-compiled on the host (\texttt{build-grains}), which turns an 11--20
+minute in-guest build over 9p into a cache hit.
+
+
+\section{Evaluation}\label{sec:eval}
+
+The evaluation answers five questions:
+\begin{description}[nosep, font=\normalfont\bfseries]
+  \item[RQ1] Do grains actually reach \ksmbd handler code?
+  \item[RQ2] Does value-aware feedback reach more kernel code than PC-only
+             feedback at the same cost per execution?
+  \item[RQ3] Does input-to-state mutation from kernel comparison operands add
+             coverage over havoc?
+  \item[RQ4] Does \toolname find real vulnerabilities, and of which kinds?
+  \item[RQ5] What do the instrumentation and the fleet cost?
+\end{description}
+
+\paragraph{What is and is not compared.} None of these questions is a
+benchmark against another fuzzer. Edge-coverage engines and \toolname differ
+in their unit of input (system call versus SMB procedure), in their feedback
+(\emph{where} execution went versus \emph{what values} it carried), and in
+their oracle (crash versus integrity effect). A difference in their numbers
+could not be attributed to any one of these factors, and the bug classes that
+\toolname targets, integrity violations that return success, do not register
+as findings in a crash-only engine. RQ2 and RQ3 therefore ablate
+\emph{within} \toolname: the arms share the kernel, the instrumentation, the
+grains, the scheduler and the oracles, and differ only in whether kernel
+values enter the coverage map and whether comparison operands drive mutation.
+The \texttt{kcov} arm uses mainline \tracepc through the same harness, so it
+places stock edge coverage on the same scale without changing anything else.
+The goal is to isolate what knowledge of function inputs and outputs
+contributes, not to rank fuzzers.
+
+\subsection{Experimental Setup}
+
+The kernel is linux-next 7.3.0-rc5 (\texttt{next-20261001}) with the \kcovdf
+and \ksmbd remote-coverage patches, built with clang/LLVM~24.0.0git
+carrying the \traceargs/\traceret pass and the configuration of
+Section~\ref{sec:impl}. It runs under \virtme (QEMU/KVM) with
+\pending{N}~vCPUs and 16\,GB of memory, on a \pending{host CPU} host.
+Grains talk to \ksmbd over guest-internal loopback, so no network device is
+involved.
+
+\paragraph{Methodology.} Following the recommendations of Klees et
+al.~\cite{klees2018evaluating} and Schloegel et al.~\cite{schloegel2024sok},
+each arm runs \pending{$T$} independent trials. Every trial starts
+\emph{cold}: the guest corpus, the host-durable mirror and the stability
+baselines are wiped, and the trial gets a distinct but reproducible seed, so
+no arm inherits another arm's inputs. The arms share the grain set, the
+kernel image and the per-grain time cap of \pending{$G$}\,s. Phase~P3 is
+disabled for the coverage comparison, because combination is a refinement
+that would add a confound without contributing to the coverage question. I
+report the median $\mathit{kern\_pcs}_\cup$ with its range, the two-sided
+Mann--Whitney $U$ test, and the Vargha--Delaney
+$\hat{A}_{12}$ effect size~\cite{arcuri2011practical}. The fleet is restricted to the 60
+grains of \texttt{ALIGNED\_SUBSET.txt}, the grains tagged ALIGNED in at least
+6 of the 9 runs of an earlier calibration campaign, so that a grain that
+reaches the kernel only intermittently cannot bias one arm.
+
+\subsection{Correctness Verification (RQ1)}
+
+\texttt{selftest} runs each of the 210 grains four times with a
+deterministic 64-byte seed per (grain, try) and takes the largest number of
+distinct kernel PCs that the grain's own connection produced
+(Table~\ref{tab:selftest}). On the recorded run, \textbf{208 grains reached
+\ksmbd code and none was DEAD or BAIL}. The two exclusions are architectural:
+\texttt{ipc} drives the generic-netlink channel to \texttt{ksmbd.mountd}
+rather than an SMB connection, so the IP-keyed remote handle never fires, and
+\texttt{rdma} needs an SMBDirect data plane that the loopback self-test does
+not drive. Both stay in the fleet for real campaigns. Single-operation
+grains that had intermittently looked DEAD reached 2{,}000--8{,}000 distinct
+PCs once the asynchronous merge was awaited (artifact~(i) below).
+
+\begin{table}[t]
+\centering
+\caption{Grain self-test verdicts, full 210-grain fleet (recorded
+2026-07-22).}\label{tab:selftest}
+\small
+\begin{tabular}{@{}lrl@{}}
+\toprule
+\textbf{Verdict} & \textbf{Grains} & \textbf{Condition} \\
+\midrule
+WORKS & 208 & best-of-4 distinct kernel PCs $\geq 1$ \\
+DEAD  & 0   & ran, but its connection produced no kernel PC \\
+BAIL  & 0   & a prerequisite (pool, fid, auth) failed on every try \\
+EXCL  & 2   & \texttt{ipc}, \texttt{rdma}: not measurable on a per-connection handle \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Three artifacts of running the whole fleet in one process initially made
+correct grains look broken, and each has to be controlled for the
+measurement to be accurate.
+(i)~\ksmbd merges a remote section into the user buffer in
+\texttt{kcov\_df\_remote\_stop()}, \emph{after} the response has been sent,
+so a single-operation grain can read its buffer before the merge has landed.
+The self-test therefore polls the buffer, idempotently, up to six times at
+3\,ms intervals.
+(ii)~Grains that tear down a connection (\texttt{encrypt},
+\texttt{session\_setup}, \texttt{smb1\_*}, \texttt{logoff*}, \texttt{tdis*})
+left the shared pool with a dead socket, and every pool grain after them then
+bailed. Re-authenticating before every grain is not a fix, because it causes
+the \texttt{mountd} storm described above. Instead, the pool is healed once,
+only after a grain has bailed on every try.
+(iii)~Per-connection coverage cannot measure \texttt{ipc} and \texttt{rdma};
+hence EXCL rather than DEAD. Every grain that had looked DEAD or BAIL turned
+to WORKS once these artifacts were controlled. No grain was removed to reach
+this result.
+
+\emph{Caveat.} The self-test was recorded on an earlier build of the same
+tree, before the \kcovdf v4 UAPI. It must be repeated on the evaluation kernel:
+\pending{re-run selftest on 7.3.0-rc5}.
+
+\subsection{Information Gain Over Existing Tools (RQ2, RQ3)}
+
+Table~\ref{tab:ablation} is the controlled ablation. Comparing
+\texttt{dataflow-vec} with \texttt{pc-i2s} answers RQ2: both arms pay for the
+same instrumentation and the same mutator, and differ only in whether values
+are folded into coverage. Comparing \texttt{pc-i2s} with \texttt{pc-havoc}
+answers RQ3. That comparison is meaningful only if input-to-state mutation was
+actually active, so the table reports $\mathit{cmp\_hits}$, the number of
+inputs in which a kernel comparison operand was spliced. If
+$\mathit{cmp\_hits}=0$, the two arms are expected to tie, and a difference
+would be noise. The \texttt{kcov} row places stock mainline \tracepc
+coverage, routed through the same per-connection handle, on the same scale.
+
+\begin{table}[t]
+\centering
+\caption{Engine ablation on the aligned subset: median fleet-union kernel PCs
+over $T$ trials, with [min--max]. $p$ and $\hat{A}_{12}$ compare each arm with
+\texttt{pc-i2s}. Corpus size and \texttt{max\_ft} are engine-biased secondary
+metrics.}\label{tab:ablation}
+\small
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+\textbf{Arm} & $\mathbf{kern\_pcs_\cup}$ & $\mathbf{p}$ & $\hat{\mathbf{A}}_{12}$ & \textbf{cmp\_hits} & \textbf{corpus} & \textbf{max\_ft} \\
+\midrule
+\texttt{dataflow-vec} & \pending{TBD} & \pending{} & \pending{} & \pending{} & \pending{} & \pending{} \\
+\texttt{dataflow-rel} & \pending{TBD} & \pending{} & \pending{} & \pending{} & \pending{} & \pending{} \\
+\texttt{dataflow}     & \pending{TBD} & \pending{} & \pending{} & \pending{} & \pending{} & \pending{} \\
+\texttt{pc-i2s}       & \pending{TBD} & ---        & ---        & \pending{} & \pending{} & \pending{} \\
+\texttt{pc-havoc}     & \pending{TBD} & \pending{} & \pending{} & 0 (by design) & \pending{} & \pending{} \\
+\texttt{kcov} (mainline) & \pending{TBD} & \pending{} & \pending{} & \pending{} & \pending{} & \pending{} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Expected shape and how to read it.} Two properties of \ksmbd matter
+when the table is read. First, return-value tokens are structurally rare in
+this target. \ksmbd's C functions return NTSTATUS codes, error codes or
+pointers, all of which the token filter discards, while file identifiers and
+resume keys travel through \emph{output buffers}, and so appear in argument
+records rather than in returns. A $\mathit{ret\_hits}$ near zero is therefore
+expected, and it is not a failure of the mutator. Second, the value region is
+bounded by design, so a dataflow arm can only win by reaching new
+(call site, value class) pairs, not by inflating its feature count. The
+$\mathit{kern\_pcs}_\cup$ metric counts PCs only, never values, so a value
+arm is credited only for the \emph{code} that its value-driven corpus
+reaches. \pending{Result paragraph: observed medians, significance, and the
+grains that account for the difference.}
+
+\subsection{Performance Overhead (RQ5)}
+
+Two costs compound: the kernel instrumentation, and SMB round trips over
+loopback. The foundational measurements apply unchanged. \kcovdf stores a
+record in 18--21\,ns, and whole-kernel argument and return instrumentation
+adds 66\% syscall latency with collection idle, on top of a \kasan
+kernel~\cite{kim2026kcovdataflow}. Table~\ref{tab:perf} reports what this
+means for a grain: the per-grain execution rate, the records per execution,
+and the share of records that are comparisons, which is what drives the 2\,MiB
+($2^{18}$-word) raw-tier buffer size.
+
+\begin{table}[t]
+\centering
+\caption{Throughput per grain (median over the aligned subset).}\label{tab:perf}
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Configuration} & \textbf{exec/s} & \textbf{records/exec} & \textbf{cmp share} \\
+\midrule
+\kcovdf, \texttt{INSTRUMENT\_ALL}, \texttt{dataflow-vec} & \pending{} & \pending{} & \pending{} \\
+\kcovdf, \texttt{INSTRUMENT\_ALL}, \texttt{pc-i2s}      & \pending{} & \pending{} & \pending{} \\
+\kcovdf, \ksmbd-only instrumentation                     & \pending{} & \pending{} & \pending{} \\
+mainline KCOV (\texttt{kcov})                           & \pending{} & ---        & ---        \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The fast-bail threshold makes the cost of a misaligned grain explicit. A grain
+that does not reach \ksmbd runs \emph{in-process} at more than 20{,}000
+executions per second, while a grain that makes real SMB round trips stays far
+below that rate. Before fast-bail, misaligned grains that ran until
+\libfuzzer's execution cap accounted for most of the wall-clock time in a
+dataflow-arm campaign while contributing almost no kernel PCs.
+\pending{Report the measured fraction of wall-clock reclaimed by fast-bail.}
+
+\subsection{Triage Capability}
+
+Each finding carries the \kcovdf records of the execution that produced it.
+For the contract oracle, the emitted reproducer contains the request bytes,
+the NTSTATUS, the effect on the backing file system, and the decoded record
+stream, including the arguments that \texttt{smb2\_create\_open\_flags()}
+received for the probing \texttt{CREATE}. This makes it immediately clear
+whether the SMB layer ever saw the dangerous access bits. For memory-safety
+findings, the records just before the \kasan report tell the analyst which
+length, count or index a function received, without adding \texttt{printk}
+and without a crash dump. Values at function boundaries survive
+optimization~\cite{kim2026kcovdataflow}. The fix for the
+\texttt{ksmbd\_alloc\_user()} out-of-bounds read
+(Section~\ref{sec:realworld}) explicitly credits \toolname and its
+$\mathit{pc}\oplus\mathit{val}$ signal: \texttt{hash\_sz} is a 16-bit field
+of an IPC response, and its out-of-range value is visible as a value even
+where the edges it takes are not new.
+
+
+\section{Case Study}\label{sec:realworld}
+
+\subsection{Methodology}
+
+All findings were reproduced on a sanitizer kernel, root-caused, and reported
+to the \ksmbd and SMBDirect maintainers with a patch where possible.
+Table~\ref{tab:bugs} lists the defects that \toolname campaigns surfaced and
+that are now fixed in Linux.
+
+\begin{table}[t]
+\centering
+\caption{Vulnerabilities found by \toolname and fixed upstream. CVE identifiers are CVE-2026-\textit{NNNNN}.}\label{tab:bugs}
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}llllr@{}}
+\toprule
+\textbf{Defect} & \textbf{Component} & \textbf{Class / detector} & \textbf{Fix} & \textbf{CVE (CVSS)} \\
+\midrule
+foreign-session \texttt{fp} put via wrong table & \texttt{vfs\_cache.c} & UAF / \kasan & \texttt{e7188199eff4} & 74522 (8.8) \\
+\texttt{hash\_sz} not bounded by \texttt{hash[]}   & \texttt{user\_config.c} & slab OOB read / \kasan & \texttt{7405d0ba2943} & 90174 (7.1) \\
+CQ freed with \texttt{ib\_destroy\_cq()}         & smbdirect \texttt{connection.c} & UAF in CQ poll work & \texttt{fe2c0cacbcff} & 90173 (9.8) \\
+pools freed before QP on accept failure & smbdirect \texttt{accept.c} & leak + NULL deref & \texttt{383a9480f5f4} & 90172 (7.5) \\
+child sockets released under listener lock        & smbdirect \texttt{socket.c} & UAF / \kasan + lockdep & \texttt{db82fbe4bb68} & 90171 \\
+IPC fields read before length check               & \texttt{transport\_ipc.c} & slab OOB read / \kasan & \texttt{e9b33376bd07} & 90170 \\
+\midrule
+recursive \texttt{listen.lock} in cleanup         & smbdirect \texttt{socket.c} & lockdep & \texttt{76fa42c004eb} & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{File-table lifetime (CVE-2026-74522).} \texttt{ksmbd\_close\_fd()}
+marked a file pointer closed and dropped its IDR reference, but it left the
+pointer in the owning session's IDR. A \emph{different} session holding a
+reference obtained through \texttt{ksmbd\_lookup\_fd\_inode()} could then
+perform the final put through the wrong file table and free the object, while
+the owner's IDR still pointed at it, and the owner's teardown then used freed
+memory. The bug needs two sessions acting on one inode, which is the kind of
+state that shared-object combination and the teardown oracle are designed to
+create. The maintainer's fix removes the IDR entry under the owner's table lock.
+
+\paragraph{IPC validation (CVE-2026-90174, CVE-2026-90170).} Both bugs are
+violations of one contract: the kernel trusted lengths inside a
+\texttt{ksmbd.mountd} response before checking that the response was large
+enough to contain them. \texttt{ksmbd\_alloc\_user()} used the 16-bit
+\texttt{hash\_sz} to size a \texttt{memcpy} from a fixed-size \texttt{hash[]}.
+\texttt{ipc\_validate\_msg()} read \texttt{payload\_sz},
+\texttt{session\_key\_len} and \texttt{ngroups} before checking
+\texttt{msg\_sz} against the base structure of the event, so an 8-byte
+response caused a read at offset~8 of a \texttt{kmalloc-8} object. The fixes
+bound \texttt{hash\_sz} by \texttt{sizeof(hash)} and check the size of each
+event's base structure before any dereference.
+
+\paragraph{SMBDirect teardown (CVE-2026-90173, -90172, -90171).} The RDMA
+transport produced three teardown-ordering bugs. Completion queues allocated
+with \texttt{ib\_alloc\_cq\_any()} in \texttt{IB\_POLL\_WORKQUEUE} mode were
+freed with \texttt{ib\_destroy\_cq()}, which does not cancel the poll work, so
+a late completion after \texttt{rdma\_destroy\_qp()}, such as a Soft-RoCE RNR
+error, re-queued work on a freed CQ. On accept failure, the memory pools and
+the receive slab were destroyed while a posted receive was still owned by the
+queue pair. Pending child sockets were released under the listener's handler
+mutex and before the listener's \texttt{rdma\_destroy\_id()}, so
+\texttt{\_cma\_cancel\_listens()} walked a freed child; the nested mutex also
+produced a lockdep recursive-locking report. A separate fix
+(\texttt{76fa42c004eb}) removes a recursive acquisition of
+\texttt{listen.lock} during cleanup. All of these bugs lie on error and
+teardown paths that are reached mainly under connection churn, which the
+fleet's constant creation and destruction of sessions plausibly supplies as a
+side effect.
+
+\paragraph{Contract oracle.} \pending{Cross-user oracle outcome on the
+evaluation kernel, with positive-control status.} If the oracle stays silent
+while the positive control passes, the result is a \emph{negative} one with a
+known meaning: for the three write-side procedures and the account mapping
+tested, \ksmbd did not act with more authority than POSIX grants. The
+SMB-layer checks themselves are a separate matter. \ksmbd honours lock, delete-on-close and overwrite requests on handles
+whose \emph{granted access} lacks the corresponding right, contrary to
+MS-SMB2. Those are real missing SMB-layer checks, but POSIX gates them, so they
+cannot be used against a file the user does not own. I report them as
+conformance defects, not as privilege escalation.
+
+\subsection{Correction Note}\label{sec:correction}
+
+Three corrections to earlier statements, two of them in the project's own
+records, are part of the result.
+
+\paragraph{Owner-on-own-file ``findings'' were false positives.} The first
+contract oracle flagged a violation whenever \ksmbd accepted a dangerous
+\texttt{CREATE} (for example \texttt{DELETE\_ON\_CLOSE} without
+\texttt{DELETE} in the granted mask) on a victim file that the fuzzing account
+had created itself. It produced five ``findings'', and all five were false
+positives: \ksmbd authorizes at the VFS layer, and an owner may legitimately
+truncate or delete its own file. The oracle was redesigned around a
+root-owned victim and an effect-based verdict (Section~\ref{sec:oracles}).
+The owner sweep is still run, but now only to drive coverage of
+\texttt{smb2\_create\_open\_flags()} and input-to-state mapping, and it never
+emits a finding.
+
+\paragraph{Earlier comparison campaigns were invalid.} Every engine-comparison
+summary recorded between 2026-08-28 and 2026-09-02 reports
+$\mathit{kern\_pcs}_\cup = 0$ for all arms and was rejected by the runner's
+all-zero guard. There were two causes. First, grains killed at saturation
+never reached their \texttt{atexit} metric dump; periodic emission fixed
+this. Second, the logs show
+\texttt{KCOV\_DF\_REMOTE\_ENABLE(0x4b440001)} failing with \texttt{EFAULT}.
+The \kcovdf v2/v4 UAPI takes the handle \emph{by pointer}, as a
+\texttt{\_\_u64}, so that the full 64-bit handle survives 32-bit and compat
+callers, and it moved the value count to header bits 32--47, while the harness
+still passed the handle by value and parsed the count from bits 24--27. Those
+campaigns therefore received no kernel coverage at all. The results in
+Section~\ref{sec:eval} must come only from campaigns run after the harness
+tracks the v4 UAPI. The same logs also show that the contract oracle never
+ran in those campaigns: its probe failed to authenticate to
+\texttt{[privtest]}, and the oracle disabled itself as designed. The lesson
+generalizes: a fuzzer whose feedback channel
+fails silently is a random-input generator that still looks like it is
+working, and the all-zero guard is what exposed the failure here.
+
+\paragraph{Oplock break deadlock.} A deadlock in level-II oplock breaking that
+was observed during campaigns had already been fixed upstream, independently
+(\texttt{27a9bc968d4a}: \ksmbd no longer holds \texttt{ci->m\_lock} while
+waiting for a lease-break acknowledgement). I do not count it as a finding of
+this work.
+
+
+\section{Discussion \& Limitations}\label{sec:discussion}
+
+\paragraph{Why not a head-to-head benchmark.} An obvious objection is that
+\toolname is not compared with \syzkaller or with a network-protocol fuzzer.
+The omission is deliberate. Such a comparison would mix a different input
+model, a different feedback signal and a different oracle, so it would rank
+two systems without explaining either. The question this work asks is
+narrower and, I argue, more useful: does knowledge of the target's function
+arguments and return values make mutation more effective than relying on
+fuzzer-generated inputs alone? That question is answered by ablation with
+everything else held fixed. The approach is also compatible with edge-coverage
+engines rather than competing with them: \kcovdf records arrive through a
+separate device and leave KCOV untouched~\cite{kim2026kcovdataflow}, so a
+syscall-level fuzzer could adopt the same value fold and operand ring. Doing
+so is a natural next step.
+
+\paragraph{A direction worth developing.} Guiding mutation by what the kernel
+actually received and returned is still in its early days, and this paper uses
+it in a deliberately simple form: first-seen value classes, literal operand
+splicing, boundary drives and return tokens. Several extensions follow
+directly:
+\begin{itemize}[nosep]
+  \item \emph{Transform-aware correspondence}, matching an observed value
+        against its UTF-16LE, big-endian or ASN.1-length encoding in the
+        input.
+  \item \emph{Distance feedback}, rewarding comparison operands that move
+        closer rather than only operands that become equal.
+  \item \emph{Field-level state}, using the struct fields \kcovdf already
+        expands (for example lease state, credit counts or open flags) as a
+        state model for sequencing procedures.
+  \item \emph{Value-timed concurrency}, firing the second request of a race
+        on the \emph{entry} record of a target function rather than after a
+        fixed delay.
+  \item \emph{Value-level contracts}, generalizing the integrity oracle to
+        pre- and postconditions on the arguments and returns of security
+        checks~\cite{kim2026kcovdataflow}.
+\end{itemize}
+Each of these uses information that an edge-coverage engine does not have.
+
+\paragraph{Grains are hand-written.} Each grain is a few dozen lines of C, and
+a fleet of 210 represents real effort. A declarative PDU specification
+interpreted by one generic harness (\texttt{\$GRAIN\_SPEC}) already exists as
+an opt-in path, and migrating the single-request grains to it would make
+adding a procedure a one-line change. Stateful grains (compound, races,
+durable reconnects, SPNEGO) still need code.
+
+\paragraph{Fixed prefixes trade breadth for depth.} By construction, a grain
+does not fuzz its own prefix, so a bug that requires a malformed negotiate
+\emph{followed by} a deep operation is outside any single grain.
+Pre-authentication surfaces are covered by grains whose target \emph{is} the
+early PDU (\texttt{negotiate}, \texttt{session\_setup}, \texttt{spnego\_asn1}),
+and combination covers two-procedure interactions. Sequences of three or more
+procedures are not explored.
+
+\paragraph{Input-to-state needs literal correspondence.} Operand splicing
+fires when a wire field reaches a comparison or an argument unchanged, or as a
+plain little-endian integer. SMB carries names in UTF-16LE, and NTLM and
+SPNEGO wrap values in ASN.1 and HMACs. Values behind a MAC cannot be solved
+this way at all.
+
+\paragraph{Shallow dereference.} \kcovdf expands one level of struct fields.
+\texttt{smb2\_open()} receives a \texttt{struct ksmbd\_work *} whose request
+lives behind an opaque \texttt{void *}, so the request's fields become visible
+only one frame deeper, where callees take them by value~\cite{kim2026kcovdataflow}.
+For \ksmbd this costs little, because the handlers pass decoded fields down
+promptly.
+
+\paragraph{Throughput.} Every execution makes real SMB round trips over
+loopback through a sanitizer kernel. Snapshot-based
+designs~\cite{schumilo2021nyx,song2020agamotto,schumilo2022nyxnet} could
+restore the post-prefix state directly and would avoid the per-execution
+session cost. They would also remove the session churn that surfaced the
+SMBDirect teardown bugs.
+
+\paragraph{Concurrency.} The race mode of combination creates contention
+without controlling interleavings. Razzer~\cite{jeong2019razzer} and
+KRACE~\cite{xu2020krace} control interleavings, and value-timed races are
+one of the extensions listed above.
+
+\paragraph{Generality.} Nothing in the routing or the fold is specific to SMB.
+Any in-kernel network service whose work runs off the client task (NFSD, the
+TLS handshake upcall, in-kernel RPC) can adopt the
+destination-address-keyed remote handle and the grain structure.
+
+\paragraph{Ethics and disclosure.} All testing ran on loopback in disposable
+VMs, against no system other than the author's own. Every finding in
+Table~\ref{tab:bugs} was reported to the upstream maintainers, and each is
+fixed in Linux.
+
+
+\section{Related Work}\label{sec:related}
+
+\paragraph{Kernel fuzzing.} \syzkaller~\cite{vyukov2015syzkaller} and
+kAFL~\cite{schumilo2017kafl} use edge or block coverage. HEALER~\cite{sun2021healer},
+SyzVegas~\cite{wang2021syzvegas}, Moonshine~\cite{pailoor2018moonshine} and
+ACTOR~\cite{fleischer2023actor} improve sequence construction, scheduling,
+seeds and action modelling. StateFuzz~\cite{zhao2022statefuzz} identifies
+driver state variables statically and rewards new value combinations of
+those variables. That is the closest idea to the value region here, but it
+requires a static analysis to choose the variables, whereas \toolname rewards
+values at every instrumented boundary and bounds the reward with value
+classes. All of these systems work at the syscall interface. \toolname works
+one layer higher, at the protocol procedure, and treats \syzkaller as
+complementary rather than as a baseline.
+
+\paragraph{Network-protocol fuzzing.} AFLNet~\cite{pham2020aflnet} uses
+response codes as state, StateAFL~\cite{natella2022stateafl} infers state from
+memory snapshots, SGFuzz~\cite{ba2022sgfuzz} tracks state variables, and
+Nyx-Net~\cite{schumilo2022nyxnet} uses incremental snapshots. They target
+user-space servers. The grain is a coarser but kernel-compatible answer to the
+same problem: instead of learning to reach a state, each grain is written to
+start in one.
+
+\paragraph{Input-to-state and value steering.} RedQueen~\cite{aschermann2019redqueen},
+AFL++ CmpLog~\cite{fioraldi2020aflpp} and Eclipser~\cite{choi2019eclipser}
+solve comparisons cheaply from observed operands. Angora~\cite{chen2018angora}
+and GREYONE~\cite{gan2020greyone} use taint. IJON~\cite{aschermann2020ijon}
+lets an analyst annotate state. \toolname takes its operands from the
+kernel's \tracecmp stream, adds a persistent operand ring and injection for
+the case where the input does not hold the operand literally, and uses
+function \emph{arguments}, not only comparisons, as steering targets.
+
+\paragraph{Semantic and permission bugs.} Hydra~\cite{kim2019hydra} finds
+semantic file-system bugs with checkers such as crash consistency.
+PeX~\cite{zhang2019pex} and Crix~\cite{lu2019crix} find missing permission
+checks statically. The contract oracle here is a dynamic, effect-based check
+of a network file server's authorization contract. It reports a violation
+only if the backing file system shows the effect, which avoids the false
+positives that a status-based oracle produced (Section~\ref{sec:correction}).
+
+\paragraph{Instrumentation.} KCOV~\cite{vyukov2016kcov} and \sancov~\cite{llvmsancov}
+provide the coverage substrate, and \kcovdf~\cite{kim2026kcovdataflow}
+provides the argument, return and comparison signal used here. This paper is
+the first end-to-end use of that signal to fuzz a production kernel
+subsystem.
+
+
+\section{Conclusion}\label{sec:conclusion}
+
+\toolname fuzzes the Linux in-kernel SMB server at the level of protocol
+procedures. A grain starts every input past the protocol wall. A
+per-connection remote handle delivers each worker exactly the kernel
+arguments, returns and comparison operands that its own requests caused. A
+bounded fold turns those values into coverage without destroying the
+saturation signal, and the comparison operands drive input-to-state
+mutation. Effect-based contract and stability oracles look for the bugs that
+do not crash. 208 of 210 grains reach \ksmbd code. Campaigns found six CVEs in
+file-table lifetime, IPC validation and SMBDirect teardown, all fixed
+upstream. The work does not try to out-benchmark edge-coverage engines; it
+explores a different axis, in which mutation is guided by what the target's
+functions actually receive and return rather than by fuzzer-generated input
+alone. A controlled multi-arm ablation, run on the same kernel and grains,
+isolates that contribution. I believe the direction is promising and deserves
+further development. Source code is available at \anonrepo{}.
+
+%Bibliography
+\bibliographystyle{unsrt}
+\bibliography{../shared/references}
+
+\appendix
+\section{Dataflow-Directed Mutator}\label{app:i2s}
+
+\begin{algorithm}[h]
+\caption{\textsc{MutateI2S}: one directed step (library tier).}\label{alg:i2s}
+\begin{algorithmic}[1]
+\Function{MutateI2S}{$D$, $\mathit{seed}$}
+  \If{arm $=$ \texttt{pc-havoc} \textbf{or} $\mathit{seed} \bmod 3 \neq 0$} \Return \textsc{Havoc}($D$) \EndIf
+  \State grow $D$ to $\geq 16$ bytes (zero-filled, bounded by \texttt{max\_len})
+  \State $U \gets \emptyset$; $h \gets 0$ \Comment{unplaced operands; hit count}
+  \ForAll{record $r \in \mathit{buf}$ with $r.\tau = \texttt{C}$, width $w \geq 2$, $a_1 \neq a_2$}
+    \If{$\mathrm{LE}_w(a_1)$ or $\mathrm{LE}_w(a_2)$ occurs in $D$}
+      \State overwrite one occurrence with the other operand; $h \gets h+1$
+    \Else
+      \State $U \gets U \cup \{a_1, a_2\}$
+    \EndIf
+  \EndFor
+  \For{$t \gets 1$ \textbf{to} $6$} \Comment{inject: this execution or persistent ring}
+    \State $v \gets$ ($t$ odd \textbf{and} $U \neq \emptyset$) ? pick($U$) : pick($\mathit{CmpRing}$)
+    \State write $\mathrm{LE}_{|v|}(v)$ at offset $(\mathit{seed} + 29t) \bmod (|D| - |v| + 1)$; $h \gets h+1$
+  \EndFor
+  \ForAll{record $r$ with $r.\tau = \texttt{E}$, field $v_k \notin \{0, \bot\}$}
+    \For{$w \in \{8, 4, 2\}$ with $v_k < 2^{8w}$}
+      \If{$\mathrm{LE}_w(v_k)$ occurs in $D$ at offset $o$}
+        \State $x \gets$ pick from $\mathit{RetDict}$, this execution's returns, or $\mathit{Boundary}_w$
+        \State write $\mathrm{LE}_w(x)$ at $o$; $h \gets h+1$; \textbf{break}
+      \EndIf
+    \EndFor
+  \EndFor
+  \State \Return $h > 0$ ? $D$ : \textsc{Havoc}($D$)
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\section{Generated Library-Tier Grain Harness}\label{app:harness}
+
+\begin{lstlisting}[language=C,caption={The harness \texttt{gen.py} emits for every library grain (abridged). Kernel coverage, not user-space coverage, populates \libfuzzer's extra counters.},label=lst:grain]
+__attribute__((used, section("__libfuzzer_extra_counters")))
+static uint8_t ctr[4096];
+static int g_octet = 1;
+
+int LLVMFuzzerInitialize(int *argc, char ***argv) {
+    const char *ip = getenv("GRAIN_IP");          /* 127.0.0.<n> */
+    if (ip) { const char *p = strrchr(ip, '.'); if (p) g_octet = atoi(p + 1); }
+    if (pfz_init((unsigned long)g_octet) < 0)      /* mmap kcov_dataflow, publish */
+        _exit(1);                                  /* handle 0x4b440000 | n        */
+    return 0;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    static uint32_t feats[4096];
+    pfz_grain_run(IDX, data, (int)size);           /* fixed prefix + target PDU    */
+    int n = pfz_get_features(feats, 4096);         /* fold this conn's records     */
+    memset(ctr, 0, sizeof(ctr));
+    for (int i = 0; i < n; i++) ctr[feats[i] & 4095]++;
+    return 0;
+}
+
+size_t LLVMFuzzerCustomMutator(uint8_t *d, size_t s, size_t m, unsigned seed) {
+    size_t r = pfz_mutate_i2s(d, s, m, seed);      /* Algorithm 1, else havoc      */
+    return r ? r : LLVMFuzzerMutate(d, s, m);
+}
+\end{lstlisting}
+
+\end{document}
