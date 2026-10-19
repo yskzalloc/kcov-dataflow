@@ -184,7 +184,7 @@ build_llvm() {
 	local -a configs
 	configs=("$LLVM_BUILD"/runtimes/runtimes-bins/compiler-rt/test/sanitizer_common/*-Linux)
 	if [[ -d ${configs[0]} ]]; then
-		"$LLVM_BUILD/bin/llvm-lit" -s --filter=sanitizer_coverage_trace_args \
+		"$LLVM_BUILD/bin/llvm-lit" -s --filter='sanitizer_coverage_trace_(args|access)' \
 			"${configs[@]}"
 	else
 		say "llvm: no compiler-rt in $LLVM_BUILD; runtime tests not run"
@@ -287,6 +287,14 @@ build_linux() {
 		KCOV_DATAFLOW_NO_INLINE
 		DEBUG_INFO_DWARF5 DEBUG_FS MODULES WERROR
 	)
+	# Access records (KCOV_DF_ACCESS=0 builds without them, to check that
+	# the stream is then what it was before they existed).
+	local -a access=(KCOV_DATAFLOW_POINTEE_ACCESS
+			 KCOV_DATAFLOW_POINTEE_ACCESS_VOLATILE
+			 KCOV_DATAFLOW_POINTEE_ACCESS_ATOMIC)
+	if [[ ${KCOV_DF_ACCESS:-1} == 1 ]]; then
+		want+=("${access[@]}")
+	fi
 	local -a make_args=(LLVM=1 CC=clang RUSTC="$RUSTC"
 			    RUST_LIB_SRC="$RUST_LIB_SRC")
 	local missing=() c
@@ -311,6 +319,11 @@ build_linux() {
 	for c in "${want[@]}"; do
 		./scripts/config --enable "$c" || return 1
 	done
+	if [[ ${KCOV_DF_ACCESS:-1} != 1 ]]; then
+		for c in "${access[@]}"; do
+			./scripts/config --disable "$c" || return 1
+		done
+	fi
 	# arm64, as in CI: no 32-bit compat (its vdso32 needs the ARM target),
 	# and no objects using NEON intrinsics, which the clang of the LLVM base
 	# cannot compile in the kernel (22287cb04839 declares the

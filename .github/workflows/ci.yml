@@ -14,14 +14,24 @@
 # Rust kernel modules only build on non-RT (CONFIG_PREEMPT_RT conflicts with CONFIG_RUST)
 #
 # What each job is expected to prove:
-#   non-RT (CONFIG_RUST=y): all four test modules run and pass, and binderfs
+#   non-RT (CONFIG_RUST=y): all five test modules run and pass, and binderfs
 #     too -- the binder driver in this tree is ANDROID_BINDER_IPC_RUST, which
 #     "depends on RUST" (drivers/android/Kconfig), so binderfs exists only here.
 #   RT (CONFIG_RUST unset): the kernel builds and boots, the ioctl interface
-#     passes, and the two C modules (rust_ffi_contract, eight_struct_args_c --
-#     both unconditional obj-m) run and pass. The two Rust modules and
-#     binderfs legitimately SKIP. An RT job going green therefore does NOT
-#     mean the Rust side works; only the non-RT jobs can say that.
+#     passes, and the three C modules (rust_ffi_contract, eight_struct_args_c,
+#     pointee_access_c -- all unconditional obj-m) run and pass. The two Rust
+#     modules and binderfs legitimately SKIP. An RT job going green therefore
+#     does NOT mean the Rust side works; only the non-RT jobs can say that.
+#
+# Access records (CONFIG_KCOV_DATAFLOW_POINTEE_ACCESS[_VOLATILE|_ATOMIC]: the
+# values a function loads and stores through its pointer arguments) exist
+# only in Phase 2 of the series; the same pipeline runs Phase 1, which has
+# none. "Detect access-record support" asks the compiler and the kernel tree
+# which one this is. On Phase 2 they are on in every job but one:
+# x86_64-noaccess builds the same kernel with them off, the way
+# rebuild-kselftest.sh does with KCOV_DF_ACCESS=0, and the record stream must
+# then be what it was before access records existed -- no ACCESS record, the
+# same args/ret checks passing. On Phase 1 every job checks that.
 #
 # Every job also checks the records against the test modules' DWARF:
 # test_modules.py resolves each one through "sancov -symbolize-dataflow" (the
@@ -34,7 +44,7 @@
 #
 # Timeouts: the kcov_dataflow "settings" file asks for 300s per target, which
 # is sized for KVM. The arm64 runners have no KVM, so everything runs under
-# TCG and the heaviest target (test_modules.py: four module load/trigger/
+# TCG and the heaviest target (test_modules.py: five module load/trigger/
 # unload cycles against an INSTRUMENT_ALL kernel) runs several times longer.
 # Each job therefore overrides the timeout explicitly rather than inheriting a
 # value that silently kills a test mid-run.
@@ -101,11 +111,14 @@ jobs:
           -DLLVM_TARGETS_TO_BUILD="${{ matrix.target }}"
         ninja -C build
 
-    # The toolchain's own tests: the trace-args/trace-ret pass, the codegen
-    # it relies on (!pcsections on calls, one entry per PC), the DWARF tag,
-    # sancov, the clang flags, and the compiler-rt runtime end to end. Run on
-    # a cache hit too: they take a minute and say the cached build is sound.
-    # Tests for the other architecture report UNSUPPORTED.
+    # The toolchain's own tests: the trace-args/trace-ret pass and its access
+    # records (Instrumentation/SanitizerCoverage/trace-pointee-access*), the
+    # codegen it relies on (!pcsections on calls, one entry per PC), the
+    # DWARF tag, sancov (including access-record decoding and skipping
+    # descriptors of an unknown version), the clang flags, the compiler-rt
+    # runtime end to end, and libFuzzer's value profile. Run on a cache hit
+    # too: they take a minute and say the cached build is sound. Tests for
+    # the other architecture report UNSUPPORTED.
     - name: Test custom LLVM
       run: |
         cd llvm-project
@@ -129,7 +142,16 @@ jobs:
           echo "FAIL: no compiler-rt sanitizer_common test configurations"
           exit 1
         fi
-        build/bin/llvm-lit -sv --filter=sanitizer_coverage_trace_args "${configs[@]}"
+        build/bin/llvm-lit -sv --filter='sanitizer_coverage_trace_(args|access)' "${configs[@]}"
+        # libFuzzer folds trace-args/trace-ret values, and access records,
+        # into its value profile. One suite per architecture
+        # (X86_64DefaultLinuxConfig, AARCH64DefaultLinuxConfig).
+        fuzzer=(build/runtimes/runtimes-bins/compiler-rt/test/fuzzer/*DefaultLinuxConfig)
+        if [ ${#fuzzer[@]} -eq 0 ]; then
+          echo "FAIL: no compiler-rt libFuzzer test configuration"
+          exit 1
+        fi
+        build/bin/llvm-lit -sv --filter='trace-(args|pointee-access)-value-profile' "${fuzzer[@]}"
 
     - name: Cache Rust build
       id: cache-rust
@@ -182,6 +204,7 @@ jobs:
             runner: ubuntu-latest
             rust-target: x86_64-unknown-linux-gnu
             rt: false
+            access: true
             # KVM: the 300s in the kselftest settings file is adequate, but be
             # explicit so the value does not depend on the runner image.
             timeout: 600
@@ -190,12 +213,22 @@ jobs:
             runner: ubuntu-latest
             rust-target: x86_64-unknown-linux-gnu
             rt: true
+            access: true
+            timeout: 600
+          # Access records compiled out; see the header.
+          - name: x86_64-noaccess
+            arch: x86_64
+            runner: ubuntu-latest
+            rust-target: x86_64-unknown-linux-gnu
+            rt: false
+            access: false
             timeout: 600
           - name: arm64
             arch: arm64
             runner: ubuntu-24.04-arm
             rust-target: aarch64-unknown-linux-gnu
             rt: false
+            access: true
             # No KVM on GitHub arm64 runners, so this is TCG. Measured under
             # KVM the three targets take ~70s of guest time; give TCG room
             # rather than have test_modules.py killed on its last module.
@@ -205,6 +238,7 @@ jobs:
             runner: ubuntu-24.04-arm
             rust-target: aarch64-unknown-linux-gnu
             rt: true
+            access: true
             timeout: 1800
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
@@ -226,6 +260,49 @@ jobs:
       run: |
         chmod +x llvm-project/build/bin/*
         chmod +x rust/build/${{ matrix.rust-target }}/stage1/bin/*
+
+    # What this job can expect of access records, as $ACCESS for the steps
+    # below. The pipeline serves both stacks of the series: Phase 1 (trace-
+    # args/trace-ret, pointee snapshots) has no access records at all, and
+    # Phase 2 adds them. Which one this is follows from the submodules, not
+    # from the matrix:
+    #   - the compiler: the same probe the Kconfig's cc-option makes. A
+    #     Phase 1 clang rejects -sanitizer-coverage-trace-pointee-access, so
+    #     the kernel options are unavailable and every module records none;
+    #   - the kernel: a tree without the Kconfig symbols has no access
+    #     records either, and test_modules.py does not report on them.
+    # The probe asks the compiler, not the kernel config, so it does not fail
+    # open: on a Phase 2 toolchain, access options that do not take are
+    # still reported MISSING by "Verify kernel config".
+    # A matrix entry with access: false (x86_64-noaccess) is off either way;
+    # on Phase 1 it is a duplicate of x86_64.
+    - name: Detect access-record support
+      run: |
+        cc_access=false
+        if llvm-project/build/bin/clang -Werror -fsanitize-coverage=trace-args \
+             -mllvm -sanitizer-coverage-trace-pointee-access \
+             -c -x c /dev/null -o /dev/null 2>/dev/null; then
+          cc_access=true
+        fi
+        kernel_access=false
+        if grep -q "^config KCOV_DATAFLOW_POINTEE_ACCESS$" linux/lib/Kconfig.debug; then
+          kernel_access=true
+        fi
+        access=false
+        if [ "${{ matrix.access }}" = "true" ] && [ $cc_access = true ] && \
+           [ $kernel_access = true ]; then
+          access=true
+        fi
+        echo "compiler access records: $cc_access"
+        echo "kernel access records:   $kernel_access"
+        echo "matrix access:           ${{ matrix.access }}"
+        echo "=> expecting access records: $access"
+        if [ "${{ matrix.access }}" = "true" ] && [ $access = false ]; then
+          echo "note: no access records in this toolchain/kernel (Phase 1);" \
+               "this job checks them absent instead"
+        fi
+        echo "ACCESS=$access" >> "$GITHUB_ENV"
+        echo "KERNEL_ACCESS=$kernel_access" >> "$GITHUB_ENV"
 
     - name: Install dependencies
       run: |
@@ -298,6 +375,20 @@ jobs:
           RUST_CONFIGS="$RUST_CONFIGS --configitem CONFIG_ANDROID_BINDER_IPC_RUST=y"
         fi
 
+        # Access records: on where expected ($ACCESS), explicitly off
+        # otherwise (they default to n, but say which, so a default change
+        # cannot flip the job's meaning).
+        ACCESS_CONFIGS=""
+        for s in CONFIG_KCOV_DATAFLOW_POINTEE_ACCESS \
+                 CONFIG_KCOV_DATAFLOW_POINTEE_ACCESS_VOLATILE \
+                 CONFIG_KCOV_DATAFLOW_POINTEE_ACCESS_ATOMIC; do
+          if [ "$ACCESS" = "true" ]; then
+            ACCESS_CONFIGS="$ACCESS_CONFIGS --configitem $s=y"
+          else
+            ACCESS_CONFIGS="$ACCESS_CONFIGS --configitem $s=n"
+          fi
+        done
+
         vng --build \
           --configitem CONFIG_KCOV=y \
           --configitem CONFIG_KCOV_DATAFLOW_ARGS=y \
@@ -307,6 +398,7 @@ jobs:
           --configitem CONFIG_DEBUG_INFO=y \
           --configitem CONFIG_DEBUG_INFO_REDUCED=n \
           --configitem CONFIG_WERROR=y \
+          $ACCESS_CONFIGS \
           $RUST_CONFIGS \
           $EXTRA_CONFIGS \
           LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC \
@@ -373,6 +465,28 @@ jobs:
           echo "MISSING CONFIG_KCOV_DATAFLOW_POINTEE_BYTES (pointee snapshots off)"
           rc=1
         fi
+        # The access options carry the same fail-open cc-option/rustc-option
+        # dependency, so read them back too -- both ways: a noaccess job that
+        # silently had them on would not test what it claims to. $ACCESS is
+        # true only where the compiler accepts the option (Phase 2), so on
+        # Phase 1 they are expected unset, which is what Phase 1 delivers.
+        for s in CONFIG_KCOV_DATAFLOW_POINTEE_ACCESS \
+                 CONFIG_KCOV_DATAFLOW_POINTEE_ACCESS_VOLATILE \
+                 CONFIG_KCOV_DATAFLOW_POINTEE_ACCESS_ATOMIC; do
+          if [ "$ACCESS" = "true" ]; then
+            if grep -q "^$s=y" .config; then
+              echo "ok      $s=y"
+            else
+              echo "MISSING $s"
+              rc=1
+            fi
+          elif grep -q "^$s=y" .config; then
+            echo "UNEXPECTED $s=y on an access-off build"
+            rc=1
+          else
+            echo "ok      $s unset"
+          fi
+        done
         v=$(../llvm-project/build/bin/llvm-dwarfdump --debug-info vmlinux 2>/dev/null |
             grep -m1 -o "version = 0x000[0-9]") || true
         if [ "$v" = "version = 0x0005" ]; then
@@ -440,6 +554,7 @@ jobs:
           /tmp/kselftest_result.txt 2>/dev/null || echo "MISSING"
         echo "============================================"
         grep -E "^# # [a-z_]+: DWARF: |^# # DWARF: " /tmp/kselftest_result.txt 2>/dev/null || true
+        grep -E "^# # [a-z_]+: access records " /tmp/kselftest_result.txt 2>/dev/null || true
 
     - name: Upload logs
       if: always()
@@ -487,14 +602,46 @@ jobs:
           fail "failing test case"
         fi
 
-        # Modules that are unconditional obj-m (both are C) must run in every
-        # configuration, RT included.
-        for m in rust_ffi_contract eight_struct_args_c; do
+        # Modules that are unconditional obj-m (all C) must run in every
+        # configuration, RT included. pointee_access_c came with the access
+        # records' kernel side, so it exists only in a kernel that has them
+        # -- in a Phase 1 toolchain job too, where it checks that nothing is
+        # recorded.
+        cmods="rust_ffi_contract eight_struct_args_c"
+        [ "$KERNEL_ACCESS" = "true" ] && cmods="$cmods pointee_access_c"
+        for m in $cmods; do
           grep -qE "^# ok [0-9]+ $m" $R || fail "module $m did not report ok"
           if grep -qE "^# ok [0-9]+ $m.*# SKIP" $R; then
             fail "module $m was skipped"
           fi
         done
+
+        # What test_modules.py expects of a module follows from what its
+        # __sancov_dataflow descriptors say it was compiled to record, so a
+        # module built without access records would pass its checks on an
+        # access job too. Pin that to the job ($ACCESS, see "Detect
+        # access-record support"): every module that ran says "compiled in"
+        # (with records from pointee_access_c, which exists for them) when
+        # access records are expected, and "not compiled in, 0 recorded"
+        # otherwise -- on Phase 1 that is every job.
+        if [ "$KERNEL_ACCESS" = "true" ]; then
+          ran=$(grep -cE "^# # [a-z_]+: access records " $R || true)
+          [ "$ran" -gt 0 ] || fail "no module reported its access records"
+          if [ "$ACCESS" = "true" ]; then
+            if grep -E "^# # [a-z_]+: access records not compiled in" $R; then
+              fail "a module was built without access records on an access build"
+            fi
+            grep -qE "^# # pointee_access_c: access records compiled in, [1-9][0-9]* recorded" $R || \
+              fail "pointee_access_c recorded no access records"
+          else
+            if grep -E "^# # [a-z_]+: access records compiled in" $R; then
+              fail "a module was built with access records on an access-off build"
+            fi
+            if grep -E "^# # [a-z_]+: access records not compiled in, [1-9]" $R; then
+              fail "ACCESS records recorded on an access-off build"
+            fi
+          fi
+        fi
 
         # The Rust modules are obj-$(CONFIG_RUST), so they are only required
         # where Rust is enabled. Scoped to module names on purpose: binderfs
