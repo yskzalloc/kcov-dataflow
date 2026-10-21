@@ -39,6 +39,15 @@
 # tests first, so a toolchain regression fails there rather than as a
 # kselftest failure.
 #
+# phase-0-5-a toolchain: llvm-project carries only the instrumentation, the
+# clang flag, the compiler-rt callbacks and their documentation. Everything
+# that needs a later step -- the !pcsections codegen fixes, the
+# __sancov_dataflow descriptors and DW_TAG_LLVM_sancov_observation, sancov
+# -symbolize-dataflow, libFuzzer's value profile and access records -- is
+# commented out below rather than removed, and comes back with that step.
+# Until then every job builds without access records, and the DWARF checks
+# of test_modules.py skip (its sancov has no -symbolize-dataflow).
+#
 # Timeouts: the kcov_dataflow "settings" file asks for 300s per target, which
 # is sized for KVM. The arm64 runners have no KVM, so everything runs under
 # TCG and the heaviest target (test_modules.py: five module load/trigger/
@@ -119,17 +128,20 @@ jobs:
     - name: Test custom LLVM
       run: |
         cd llvm-project
-        build/bin/llvm-lit -sv \
-          llvm/test/Instrumentation/SanitizerCoverage \
-          llvm/test/CodeGen/X86/pcsections-per-pc.ll \
-          llvm/test/CodeGen/X86/pcsections-call.ll \
-          llvm/test/CodeGen/AArch64/pcsections-per-pc.ll \
-          llvm/test/CodeGen/AArch64/pcsections-call.ll \
-          llvm/test/DebugInfo/X86/sancov-observation.ll \
-          llvm/test/DebugInfo/AArch64/call-site-param-zero-register.ll \
-          llvm/test/tools/sancov \
-          clang/test/CodeGen/sanitizer-coverage-trace-args-ret.c \
+        lit_tests=(
+          llvm/test/Instrumentation/SanitizerCoverage
+          # Not in the phase-0-5-a toolchain; see the header.
+          # llvm/test/CodeGen/X86/pcsections-per-pc.ll
+          # llvm/test/CodeGen/X86/pcsections-call.ll
+          # llvm/test/CodeGen/AArch64/pcsections-per-pc.ll
+          # llvm/test/CodeGen/AArch64/pcsections-call.ll
+          # llvm/test/DebugInfo/X86/sancov-observation.ll
+          # llvm/test/DebugInfo/AArch64/call-site-param-zero-register.ll
+          llvm/test/tools/sancov
+          clang/test/CodeGen/sanitizer-coverage-trace-args-ret.c
           clang/test/Driver/fsanitize-coverage.c
+        )
+        build/bin/llvm-lit -sv "${lit_tests[@]}"
         # lit finds a suite only from a directory with its own lit.site.cfg.py:
         # one per sanitizer configuration (asan-<arch>-Linux, ...), not their
         # parent.
@@ -143,12 +155,13 @@ jobs:
         # libFuzzer folds trace-args/trace-ret values, and access records,
         # into its value profile. One suite per architecture
         # (X86_64DefaultLinuxConfig, AARCH64DefaultLinuxConfig).
-        fuzzer=(build/runtimes/runtimes-bins/compiler-rt/test/fuzzer/*DefaultLinuxConfig)
-        if [ ${#fuzzer[@]} -eq 0 ]; then
-          echo "FAIL: no compiler-rt libFuzzer test configuration"
-          exit 1
-        fi
-        build/bin/llvm-lit -sv --filter='trace-(args|pointee-access)-value-profile' "${fuzzer[@]}"
+        # Not in the phase-0-5-a toolchain; see the header.
+        # fuzzer=(build/runtimes/runtimes-bins/compiler-rt/test/fuzzer/*DefaultLinuxConfig)
+        # if [ ${#fuzzer[@]} -eq 0 ]; then
+        #   echo "FAIL: no compiler-rt libFuzzer test configuration"
+        #   exit 1
+        # fi
+        # build/bin/llvm-lit -sv --filter='trace-(args|pointee-access)-value-profile' "${fuzzer[@]}"
 
     - name: Cache Rust build
       id: cache-rust
@@ -179,6 +192,41 @@ jobs:
         EOF
         python3 x.py build --stage 1 library
 
+    # The kernel's Kconfig probes rustc with rustc-option, which only checks
+    # that -Cllvm-args=-sanitizer-coverage-* is accepted. A rustc that parses
+    # -Cllvm-args into LLVM's global options accepts them and ignores them:
+    # since LLVM #232599 the Instrumentation options live in each LLVMContext,
+    # and the rustc wrapper has to copy them in (LLVMRustSetLLVMOptions and
+    # LLVMRustOptimize in compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp).
+    # Without that the Rust modules build uninstrumented and the selftests see
+    # "0 from <module>". Checked on a cache hit too: the cache key is the
+    # submodule revisions, so a cached rustc is the one these sources build.
+    - name: Verify rustc instruments with -Cllvm-args
+      run: |
+        RUSTC="$PWD/rust/build/${{ matrix.rust-target }}/stage1/bin/rustc"
+        probe=$(mktemp -d)
+        # #[no_mangle]: rustc infers #[inline] for a small pub fn and leaves it
+        # to the crates that call it, so the probe crate would have no
+        # function of its own to instrument.
+        echo '#[no_mangle] pub extern "C" fn f(a: u64) -> u64 { a + 1 }' > "$probe/probe.rs"
+        "$RUSTC" --crate-type=lib --emit=llvm-ir -O \
+          -Cpasses=sancov-module \
+          -Cllvm-args=-sanitizer-coverage-level=3 \
+          -Cllvm-args=-sanitizer-coverage-trace-args \
+          --out-dir "$probe" "$probe/probe.rs"
+        want='declare void @__sanitizer_cov_trace_args(i32, i32, i64, ptr, i32)'
+        got=$(grep -ho 'declare void @__sanitizer_cov_trace_args(.*)' "$probe"/*.ll | head -1 || true)
+        # The pass declares the callback whenever it runs; only a call shows
+        # that -sanitizer-coverage-trace-args itself reached it.
+        calls=$(cat "$probe"/*.ll | grep -c 'call void @__sanitizer_cov_trace_args(' || true)
+        rm -rf "$probe"
+        if [ "$got" != "$want" ] || [ "$calls" -eq 0 ]; then
+          echo "FAIL: rustc does not instrument with -Cllvm-args=-sanitizer-coverage-trace-args"
+          echo "  want: $want, and at least one call"
+          echo "  got:  ${got:-<no __sanitizer_cov_trace_args declaration at all>}, $calls call(s)"
+          exit 1
+        fi
+        echo "rustc: $got, $calls call(s)"
     - name: Upload toolchain
       uses: actions/upload-artifact@v4
       with:
@@ -201,7 +249,8 @@ jobs:
             runner: ubuntu-latest
             rust-target: x86_64-unknown-linux-gnu
             rt: false
-            access: true
+            # access: true  (phase-0-5-a has no access records; see the header)
+            access: false
             # KVM: the 300s in the kselftest settings file is adequate, but be
             # explicit so the value does not depend on the runner image.
             timeout: 600
@@ -210,22 +259,26 @@ jobs:
             runner: ubuntu-latest
             rust-target: x86_64-unknown-linux-gnu
             rt: true
-            access: true
-            timeout: 600
-          # Access records compiled out; see the header.
-          - name: x86_64-noaccess
-            arch: x86_64
-            runner: ubuntu-latest
-            rust-target: x86_64-unknown-linux-gnu
-            rt: false
+            # access: true  (phase-0-5-a has no access records; see the header)
             access: false
             timeout: 600
+          # Access records compiled out; see the header. With the
+          # phase-0-5-a toolchain every job is built that way, so this one
+          # would only repeat x86_64.
+          # - name: x86_64-noaccess
+          #   arch: x86_64
+          #   runner: ubuntu-latest
+          #   rust-target: x86_64-unknown-linux-gnu
+          #   rt: false
+          #   access: false
+          #   timeout: 600
           - name: arm64
             arch: arm64
             runner: ubuntu-24.04-arm
             rust-target: aarch64-unknown-linux-gnu
             rt: false
-            access: true
+            # access: true  (phase-0-5-a has no access records; see the header)
+            access: false
             # No KVM on GitHub arm64 runners, so this is TCG. Measured under
             # KVM the three targets take ~70s of guest time; give TCG room
             # rather than have test_modules.py killed on its last module.
@@ -235,7 +288,8 @@ jobs:
             runner: ubuntu-24.04-arm
             rust-target: aarch64-unknown-linux-gnu
             rt: true
-            access: true
+            # access: true  (phase-0-5-a has no access records; see the header)
+            access: false
             timeout: 1800
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
@@ -358,26 +412,28 @@ jobs:
           LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC \
           2>&1 | tee /tmp/kernel_build.txt
 
-    # The descriptors the compiler emits next to every trace call
-    # (__sancov_dataflow) need a rule in vmlinux.lds.h -- an orphan section
-    # is a link error under WERROR -- one output section per module, or the
-    # loader fails with -EEXIST, and objtool's IBT check must skip them: they
-    # point at call instructions, never at an indirect branch target. A
-    # warning here is one per instrumented call, so check for any at all.
-    - name: Verify the observation descriptors
-      run: |
-        rc=0
-        if grep -E "__sancov_dataflow.*(data relocation|is being placed)" /tmp/kernel_build.txt | head -5 | grep .; then
-          echo "FAIL: build warnings about __sancov_dataflow"
-          rc=1
-        fi
-        if llvm-project/build/bin/llvm-readelf -S linux/vmlinux | grep -q " __sancov_dataflow "; then
-          echo "ok      vmlinux has __sancov_dataflow"
-        else
-          echo "MISSING __sancov_dataflow in vmlinux"
-          rc=1
-        fi
-        exit $rc
+    # Not with the phase-0-5-a toolchain, which emits no descriptors; see
+    # the header.
+    ## The descriptors the compiler emits next to every trace call
+    ## (__sancov_dataflow) need a rule in vmlinux.lds.h -- an orphan section
+    ## is a link error under WERROR -- one output section per module, or the
+    ## loader fails with -EEXIST, and objtool's IBT check must skip them: they
+    ## point at call instructions, never at an indirect branch target. A
+    ## warning here is one per instrumented call, so check for any at all.
+    #- name: Verify the observation descriptors
+    #  run: |
+    #    rc=0
+    #    if grep -E "__sancov_dataflow.*(data relocation|is being placed)" /tmp/kernel_build.txt | head -5 | grep .; then
+    #      echo "FAIL: build warnings about __sancov_dataflow"
+    #      rc=1
+    #    fi
+    #    if llvm-project/build/bin/llvm-readelf -S linux/vmlinux | grep -q " __sancov_dataflow "; then
+    #      echo "ok      vmlinux has __sancov_dataflow"
+    #    else
+    #      echo "MISSING __sancov_dataflow in vmlinux"
+    #      rc=1
+    #    fi
+    #    exit $rc
 
     # CONFIG_KCOV_DATAFLOW_* carry
     #   depends on !RUST || $(rustc-option,-Cllvm-args=-sanitizer-coverage-...)
@@ -477,12 +533,13 @@ jobs:
           install INSTALL_PATH=$PWD/kselftest-install
         ls -l kselftest-install/kcov_dataflow
         # One descriptor section per module, which sancov can resolve.
-        for ko in kselftest-install/kcov_dataflow/*.ko; do
-          n=$(../llvm-project/build/bin/llvm-readelf -S "$ko" | grep -c " __sancov_dataflow ")
-          echo "$ko: $n __sancov_dataflow section(s)"
-          [ "$n" = 1 ] || exit 1
-          ../llvm-project/build/bin/sancov -symbolize-dataflow "$ko" > /dev/null
-        done
+        # Not with the phase-0-5-a toolchain; see the header.
+        # for ko in kselftest-install/kcov_dataflow/*.ko; do
+        #   n=$(../llvm-project/build/bin/llvm-readelf -S "$ko" | grep -c " __sancov_dataflow ")
+        #   echo "$ko: $n __sancov_dataflow section(s)"
+        #   [ "$n" = 1 ] || exit 1
+        #   ../llvm-project/build/bin/sancov -symbolize-dataflow "$ko" > /dev/null
+        # done
 
     # The guest sees the host's file system, so test_modules.py can run the
     # toolchain's sancov for its DWARF checks.
@@ -544,9 +601,11 @@ jobs:
 
         # The DWARF checks need sancov in the guest; skipped, they leave the
         # mapping of records to source parameters unverified.
-        if grep -q "DWARF checks skipped" $R; then
-          fail "DWARF source map checks did not run (no sancov in the guest)"
-        fi
+        # Not with the phase-0-5-a toolchain, whose sancov has no
+        # -symbolize-dataflow; see the header.
+        # if grep -q "DWARF checks skipped" $R; then
+        #   fail "DWARF source map checks did not run (no sancov in the guest)"
+        # fi
 
         if grep -qE "^(# )?not ok" $R; then
           echo "--- failing cases ---"

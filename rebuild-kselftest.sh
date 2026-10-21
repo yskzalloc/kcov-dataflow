@@ -46,6 +46,8 @@
 #     having validated the Rust side
 #   - the DWARF source-map checks ran: test_modules.py resolved the records
 #     through "sancov -symbolize-dataflow" ($SANCOV), rather than skipping
+#     (not checked with the phase-0-5-a toolchain, whose sancov has no
+#     -symbolize-dataflow; see report_results)
 #
 set -o pipefail
 
@@ -165,17 +167,23 @@ build_llvm() {
 	# own tests regressed, rather than at kselftest time.
 	# Tests for a target the build does not include report UNSUPPORTED.
 	local t=$LLVM_DIR/llvm/test
-	"$LLVM_BUILD/bin/llvm-lit" -s \
-		"$t/Instrumentation/SanitizerCoverage" \
-		"$t/CodeGen/X86/pcsections-per-pc.ll" \
-		"$t/CodeGen/X86/pcsections-call.ll" \
-		"$t/CodeGen/AArch64/pcsections-per-pc.ll" \
-		"$t/CodeGen/AArch64/pcsections-call.ll" \
-		"$t/DebugInfo/X86/sancov-observation.ll" \
-		"$t/DebugInfo/AArch64/call-site-param-zero-register.ll" \
-		"$t/tools/sancov" \
-		"$LLVM_DIR/clang/test/CodeGen/sanitizer-coverage-trace-args-ret.c" \
-		"$LLVM_DIR/clang/test/Driver/fsanitize-coverage.c" || return 1
+	local -a lit_tests=(
+		"$t/Instrumentation/SanitizerCoverage"
+		# Not in the phase-0-5-a toolchain (instrumentation, clang flag,
+		# compiler-rt callbacks, docs only): the !pcsections codegen
+		# fixes, the DWARF tag, the AArch64 WZR/XZR call-site fix and the
+		# sancov dataflow tests come with later steps.
+		# "$t/CodeGen/X86/pcsections-per-pc.ll"
+		# "$t/CodeGen/X86/pcsections-call.ll"
+		# "$t/CodeGen/AArch64/pcsections-per-pc.ll"
+		# "$t/CodeGen/AArch64/pcsections-call.ll"
+		# "$t/DebugInfo/X86/sancov-observation.ll"
+		# "$t/DebugInfo/AArch64/call-site-param-zero-register.ll"
+		"$t/tools/sancov"
+		"$LLVM_DIR/clang/test/CodeGen/sanitizer-coverage-trace-args-ret.c"
+		"$LLVM_DIR/clang/test/Driver/fsanitize-coverage.c"
+	)
+	"$LLVM_BUILD/bin/llvm-lit" -s "${lit_tests[@]}" || return 1
 
 	# The runtime end to end, under every sanitizer configuration, when the
 	# build has compiler-rt (as CI's does). lit finds a suite only from a
@@ -227,23 +235,31 @@ EOF
 	# llvm-ir to "-o /dev/stdout" when the input is stdin.
 	local probe
 	probe=$(mktemp -d /tmp/kcov-df-rustc-probe.XXXXXX) || return 1
-	echo 'pub fn f(a: u64) -> u64 { a + 1 }' > "$probe/probe.rs"
+	# #[no_mangle]: rustc infers #[inline] for a small pub fn and leaves it to
+	# the crates that call it, so the probe would have nothing to instrument.
+	echo '#[no_mangle] pub extern "C" fn f(a: u64) -> u64 { a + 1 }' > "$probe/probe.rs"
 	"$RUSTC" --crate-type=lib --emit=llvm-ir -O -g \
 		-Cpasses=sancov-module \
 		-Cllvm-args=-sanitizer-coverage-level=3 \
 		-Cllvm-args=-sanitizer-coverage-trace-args \
 		--out-dir "$probe" "$probe/probe.rs" >/dev/null 2>&1
-	local decl
+	local decl calls
 	decl=$(grep -ho 'declare void @__sanitizer_cov_trace_args(.*)' \
 		"$probe"/*.ll 2>/dev/null | head -1)
+	# The pass declares the callback whenever it runs; only a call shows that
+	# -sanitizer-coverage-trace-args itself reached it (a rustc that does not
+	# copy -Cllvm-args into the per-context options drops it).
+	calls=$(cat "$probe"/*.ll 2>/dev/null |
+		grep -c 'call void @__sanitizer_cov_trace_args(')
 	rm -rf "$probe"
-	if [[ $decl != 'declare void @__sanitizer_cov_trace_args(i32, i32, i64, ptr, i32)' ]]; then
-		say "rust: rustc does not emit the expected trace_args signature"
-		echo "  want: declare void @__sanitizer_cov_trace_args(i32, i32, i64, ptr, i32)"
-		echo "  got:  ${decl:-<no __sanitizer_cov_trace_args declaration at all>}"
+	if [[ $decl != 'declare void @__sanitizer_cov_trace_args(i32, i32, i64, ptr, i32)' ||
+	      ${calls:-0} -eq 0 ]]; then
+		say "rust: rustc does not instrument with -Cllvm-args=-sanitizer-coverage-trace-args"
+		echo "  want: declare void @__sanitizer_cov_trace_args(i32, i32, i64, ptr, i32), and a call"
+		echo "  got:  ${decl:-<no __sanitizer_cov_trace_args declaration at all>}, ${calls:-0} call(s)"
 		return 1
 	fi
-	say "rust: trace_args signature verified: $decl"
+	say "rust: trace_args signature verified: $decl, $calls call(s)"
 }
 
 # --- linux --------------------------------------------------------------
@@ -289,10 +305,15 @@ build_linux() {
 	)
 	# Access records (KCOV_DF_ACCESS=0 builds without them, to check that
 	# the stream is then what it was before they existed).
+	#
+	# Off by default with the phase-0-5-a toolchain: it has no
+	# -sanitizer-coverage-trace-pointee-access, so the cc-option behind
+	# these symbols fails and requesting them would fail the read-back
+	# below. KCOV_DF_ACCESS=1 asks for them again with a later toolchain.
 	local -a access=(KCOV_DATAFLOW_POINTEE_ACCESS
 			 KCOV_DATAFLOW_POINTEE_ACCESS_VOLATILE
 			 KCOV_DATAFLOW_POINTEE_ACCESS_ATOMIC)
-	if [[ ${KCOV_DF_ACCESS:-1} == 1 ]]; then
+	if [[ ${KCOV_DF_ACCESS:-0} == 1 ]]; then
 		want+=("${access[@]}")
 	fi
 	local -a make_args=(LLVM=1 CC=clang RUSTC="$RUSTC"
@@ -319,7 +340,7 @@ build_linux() {
 	for c in "${want[@]}"; do
 		./scripts/config --enable "$c" || return 1
 	done
-	if [[ ${KCOV_DF_ACCESS:-1} != 1 ]]; then
+	if [[ ${KCOV_DF_ACCESS:-0} != 1 ]]; then
 		for c in "${access[@]}"; do
 			./scripts/config --disable "$c" || return 1
 		done
@@ -354,10 +375,11 @@ build_linux() {
 
 	# The trace calls' observation descriptors are kept in vmlinux, for
 	# "sancov -symbolize-dataflow vmlinux" (see include/asm-generic/vmlinux.lds.h).
-	"$LLVM_BUILD/bin/llvm-readelf" -S vmlinux | grep -q " __sancov_dataflow " || {
-		say "linux: vmlinux has no __sancov_dataflow section"
-		return 1
-	}
+	# Disabled for the phase-0-5-a toolchain, which emits no descriptors.
+	# "$LLVM_BUILD/bin/llvm-readelf" -S vmlinux | grep -q " __sancov_dataflow " || {
+	# 	say "linux: vmlinux has no __sancov_dataflow section"
+	# 	return 1
+	# }
 }
 
 # --- selftest -----------------------------------------------------------
@@ -376,15 +398,17 @@ build_selftest() {
 
 	# One descriptor section per module -- two fail the load with -EEXIST,
 	# see scripts/module.lds.S -- and one sancov can resolve.
-	local ko n
-	for ko in "$KSELFTEST_DIR"/kcov_dataflow/*.ko; do
-		n=$("$LLVM_BUILD/bin/llvm-readelf" -S "$ko" | grep -c " __sancov_dataflow ")
-		if [[ $n != 1 ]]; then
-			say "selftest: $ko has $n __sancov_dataflow sections, want 1"
-			return 1
-		fi
-		"$LLVM_BUILD/bin/sancov" -symbolize-dataflow "$ko" > /dev/null || return 1
-	done
+	# Disabled for the phase-0-5-a toolchain: no descriptors, and its
+	# sancov has no -symbolize-dataflow.
+	# local ko n
+	# for ko in "$KSELFTEST_DIR"/kcov_dataflow/*.ko; do
+	# 	n=$("$LLVM_BUILD/bin/llvm-readelf" -S "$ko" | grep -c " __sancov_dataflow ")
+	# 	if [[ $n != 1 ]]; then
+	# 		say "selftest: $ko has $n __sancov_dataflow sections, want 1"
+	# 		return 1
+	# 	fi
+	# 	"$LLVM_BUILD/bin/sancov" -symbolize-dataflow "$ko" > /dev/null || return 1
+	# done
 }
 
 # The banner and the checks below are the local half of
@@ -459,9 +483,11 @@ report_results() {
 
 	# The DWARF source-map checks need sancov; without it they are skipped,
 	# which leaves the mapping of records to source parameters unverified.
-	if grep -q "DWARF checks skipped" "$log"; then
-		fail "DWARF source map checks did not run (no sancov in the guest)"
-	fi
+	# Disabled for the phase-0-5-a toolchain: its sancov has no
+	# -symbolize-dataflow, so test_modules.py skips the DWARF checks.
+	# if grep -q "DWARF checks skipped" "$log"; then
+	# 	fail "DWARF source map checks did not run (no sancov in the guest)"
+	# fi
 
 	if grep -qE "^(# )?not ok" "$log"; then
 		echo "--- failing cases ---"
