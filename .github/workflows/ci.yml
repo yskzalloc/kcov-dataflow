@@ -8,8 +8,8 @@
 #   - rustc: built against custom LLVM so Rust .ko modules get the passes natively
 #
 # Runners:
-#   - x86_64: ubuntu-latest (KVM available)
-#   - arm64:  ubuntu-24.04-arm (TCG only, no KVM on GitHub arm64 runners)
+#   - x86_64: ubuntu-26.04 (KVM available)
+#   - arm64:  ubuntu-26.04-arm (TCG only, no KVM on GitHub arm64 runners)
 #
 # Rust kernel modules only build on non-RT (CONFIG_PREEMPT_RT conflicts with CONFIG_RUST)
 #
@@ -62,6 +62,12 @@ on:
     branches: [main, kcov-dataflow-*]
   pull_request:
 
+env:
+  # Part of the LLVM and rustc cache keys: bump it whenever the LLVM CMake
+  # configuration below changes, so that a build made with the old one is not
+  # restored for the same llvm-project commit.
+  LLVM_BUILD_CONFIG: v2-nolibxml2
+
 jobs:
   # Stage 1: Build custom LLVM + rustc (per architecture)
   build:
@@ -69,11 +75,11 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-26.04
             target: X86
             rust-target: x86_64-unknown-linux-gnu
           - arch: arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
             target: AArch64
             rust-target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
@@ -101,8 +107,14 @@ jobs:
       uses: actions/cache@v4
       with:
         path: llvm-project/build
-        key: llvm-${{ matrix.arch }}-${{ steps.revs.outputs.llvm }}
+        key: llvm-${{ env.LLVM_BUILD_CONFIG }}-${{ matrix.arch }}-${{ steps.revs.outputs.llvm }}
 
+    # LLVM_ENABLE_LIBXML2=OFF: CMake enables libxml2 whenever the runner
+    # image happens to ship its headers, and then ld.lld (lld-link's manifest
+    # merging) needs libxml2.so.2 at run time. A build restored from the cache
+    # or downloaded by the test job can land on an image without it, where
+    # every -fuse-ld=lld link fails: "ld.lld: error while loading shared
+    # libraries: libxml2.so.2" (the hwasan compiler-rt tests on arm64).
     - name: Build custom LLVM
       if: steps.cache-llvm.outputs.cache-hit != 'true'
       run: |
@@ -112,10 +124,16 @@ jobs:
           -DCMAKE_C_COMPILER=clang \
           -DCMAKE_CXX_COMPILER=clang++ \
           -DLLVM_ENABLE_LLD=ON \
+          -DLLVM_ENABLE_LIBXML2=OFF \
           -DLLVM_ENABLE_PROJECTS="clang;lld" \
           -DLLVM_ENABLE_RUNTIMES="compiler-rt" \
           -DLLVM_TARGETS_TO_BUILD="${{ matrix.target }}"
         ninja -C build
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
 
     # The toolchain's own tests: the trace-args/trace-ret pass and its access
     # records (Instrumentation/SanitizerCoverage/trace-pointee-access*), the
@@ -127,7 +145,16 @@ jobs:
     # the other architecture report UNSUPPORTED.
     - name: Test custom LLVM
       run: |
+        export PYTHON_BIN="$(which python3)"
         cd llvm-project
+        # A toolchain restored from the cache was linked on an earlier runner
+        # image; say so plainly if this one lacks a library it needs.
+        for b in build/bin/clang build/bin/ld.lld build/bin/opt build/bin/llvm-config; do
+          if ldd "$b" | grep "not found"; then
+            echo "FAIL: $b needs a shared library this runner does not have"
+            exit 1
+          fi
+        done
         lit_tests=(
           llvm/test/Instrumentation/SanitizerCoverage
           # Not in the phase-0-5-a toolchain; see the header.
@@ -141,7 +168,7 @@ jobs:
           clang/test/CodeGen/sanitizer-coverage-trace-args-ret.c
           clang/test/Driver/fsanitize-coverage.c
         )
-        build/bin/llvm-lit -sv "${lit_tests[@]}"
+        "$PYTHON_BIN" build/bin/llvm-lit -sv "${lit_tests[@]}"
         # lit finds a suite only from a directory with its own lit.site.cfg.py:
         # one per sanitizer configuration (asan-<arch>-Linux, ...), not their
         # parent.
@@ -151,7 +178,7 @@ jobs:
           echo "FAIL: no compiler-rt sanitizer_common test configurations"
           exit 1
         fi
-        build/bin/llvm-lit -sv --filter='sanitizer_coverage_trace_(args|access)' "${configs[@]}"
+        "$PYTHON_BIN" build/bin/llvm-lit -sv --filter='sanitizer_coverage_trace_(args|access)' "${configs[@]}"
         # libFuzzer folds trace-args/trace-ret values, and access records,
         # into its value profile. One suite per architecture
         # (X86_64DefaultLinuxConfig, AARCH64DefaultLinuxConfig).
@@ -168,7 +195,7 @@ jobs:
       uses: actions/cache@v4
       with:
         path: rust/build/${{ matrix.rust-target }}/stage1
-        key: rust-${{ matrix.arch }}-${{ steps.revs.outputs.rust }}-${{ steps.revs.outputs.llvm }}
+        key: rust-${{ env.LLVM_BUILD_CONFIG }}-${{ matrix.arch }}-${{ steps.revs.outputs.rust }}-${{ steps.revs.outputs.llvm }}
 
     - name: Build custom rustc (stage1)
       if: steps.cache-rust.outputs.cache-hit != 'true'
@@ -214,7 +241,7 @@ jobs:
           -Cllvm-args=-sanitizer-coverage-level=3 \
           -Cllvm-args=-sanitizer-coverage-trace-args \
           --out-dir "$probe" "$probe/probe.rs"
-        want='declare void @__sanitizer_cov_trace_args(i32, i32, i64, ptr, i32)'
+        want='declare void @__sanitizer_cov_trace_args(i64, i64, ptr)'
         got=$(grep -ho 'declare void @__sanitizer_cov_trace_args(.*)' "$probe"/*.ll | head -1 || true)
         # The pass declares the callback whenever it runs; only a call shows
         # that -sanitizer-coverage-trace-args itself reached it.
@@ -246,7 +273,7 @@ jobs:
         include:
           - name: x86_64
             arch: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-26.04
             rust-target: x86_64-unknown-linux-gnu
             rt: false
             # access: true  (phase-0-5-a has no access records; see the header)
@@ -256,7 +283,7 @@ jobs:
             timeout: 600
           - name: x86_64-rt
             arch: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-26.04
             rust-target: x86_64-unknown-linux-gnu
             rt: true
             # access: true  (phase-0-5-a has no access records; see the header)
@@ -274,7 +301,7 @@ jobs:
           #   timeout: 600
           - name: arm64
             arch: arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
             rust-target: aarch64-unknown-linux-gnu
             rt: false
             # access: true  (phase-0-5-a has no access records; see the header)
@@ -285,7 +312,7 @@ jobs:
             timeout: 1800
           - name: arm64-rt
             arch: arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
             rust-target: aarch64-unknown-linux-gnu
             rt: true
             # access: true  (phase-0-5-a has no access records; see the header)
@@ -545,6 +572,22 @@ jobs:
     # toolchain's sancov for its DWARF checks.
     - name: Run selftests
       run: |
+        # Work around Ubuntu 26 virtme-init shebang issue
+        set -euxo pipefail
+
+        VIRTME_INIT="$(
+          venv-virtme/bin/python -c \
+            'import pathlib, virtme; print(pathlib.Path(virtme.__file__).parent / "guest" / "virtme-init")'
+        )"
+
+        test -f "$VIRTME_INIT"
+
+        sed -i \
+          '1s|^#!/usr/bin/env bash$|#!/bin/bash|' \
+          "$VIRTME_INIT"
+
+        head -n 1 "$VIRTME_INIT"
+
         source venv-virtme/bin/activate
         cd linux
         vng --user root --verbose \
@@ -656,7 +699,10 @@ jobs:
               fail "module $m was skipped on a CONFIG_RUST=y build"
             fi
           done
-          grep -qE "^# ok [0-9]+ kcov_dataflow.binderfs_setup" $R || \
+          # Any of its subtests: the guest console shares the log, and a
+          # kernel message can land in the middle of one of their lines.
+          { grep -qE "^# ok [0-9]+ kcov_dataflow\.binderfs_(setup|captured|valid_records)( |$)" $R && \
+            ! grep -qE "kcov_dataflow\.binderfs_.*# SKIP" $R; } || \
             fail "binderfs did not run on a CONFIG_ANDROID_BINDER_IPC_RUST=y build"
         else
           echo "note: CONFIG_RUST unset (RT build) -- Rust modules and"

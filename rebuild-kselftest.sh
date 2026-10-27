@@ -230,7 +230,7 @@ EOF
 	(cd "$RUST_DIR" && python3 x.py build --stage 1 library -j "$JOBS") || return 1
 
 	# Cheap proof that the relink took: the callback the pass declares must
-	# have the current five-argument signature, not the old pc-carrying one.
+	# have the current (u64 tag, u64 val, const u64 *offsets) signature.
 	# Written through a temp dir rather than stdout: rustc does not emit
 	# llvm-ir to "-o /dev/stdout" when the input is stdin.
 	local probe
@@ -252,10 +252,10 @@ EOF
 	calls=$(cat "$probe"/*.ll 2>/dev/null |
 		grep -c 'call void @__sanitizer_cov_trace_args(')
 	rm -rf "$probe"
-	if [[ $decl != 'declare void @__sanitizer_cov_trace_args(i32, i32, i64, ptr, i32)' ||
+	if [[ $decl != 'declare void @__sanitizer_cov_trace_args(i64, i64, ptr)' ||
 	      ${calls:-0} -eq 0 ]]; then
 		say "rust: rustc does not instrument with -Cllvm-args=-sanitizer-coverage-trace-args"
-		echo "  want: declare void @__sanitizer_cov_trace_args(i32, i32, i64, ptr, i32), and a call"
+		echo "  want: declare void @__sanitizer_cov_trace_args(i64, i64, ptr), and a call"
 		echo "  got:  ${decl:-<no __sanitizer_cov_trace_args declaration at all>}, ${calls:-0} call(s)"
 		return 1
 	fi
@@ -476,7 +476,10 @@ report_results() {
 					fail "module $m was skipped on a CONFIG_RUST=y build"
 				fi
 			done
-			grep -qE "^# ok [0-9]+ kcov_dataflow.binderfs_setup" "$log" ||
+			# Any of its subtests: the guest console shares the log, and a
+			# kernel message can land in the middle of one of their lines.
+			grep -qE "^# ok [0-9]+ kcov_dataflow\.binderfs_(setup|captured|valid_records)( |$)" "$log" &&
+				! grep -qE "kcov_dataflow\.binderfs_.*# SKIP" "$log" ||
 				fail "binderfs did not run on a CONFIG_ANDROID_BINDER_IPC_RUST=y build"
 		fi
 	fi
