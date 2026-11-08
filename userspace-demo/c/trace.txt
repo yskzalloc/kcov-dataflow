@@ -1,0 +1,29 @@
+ENTRY pc=0x201ae9 arg[0] size=4 val=0x1
+ENTRY pc=0x201afd arg[1] size=8 val=0x7fff89a13848
+ENTRY pc=0x201908 arg[0] size=4 val=0x8201
+ENTRY pc=0x20191f arg[1] size=4 val=0x10
+ENTRY pc=0x2018e3 arg[0] size=8 val=0x18603
+RET   pc=0x2018ee size=0 val=0
+ENTRY pc=0x2018e3 arg[0] size=8 val=0x10
+RET   pc=0x2018ee size=0 val=0
+RET   pc=0x201945 size=4 val=0x10
+ENTRY pc=0x2018e3 arg[0] size=8 val=0x10
+RET   pc=0x2018ee size=0 val=0
+ENTRY pc=0x20198b arg[0] size=8 val=0x1
+ENTRY pc=0x20199f arg[1] size=8 val=0x2
+ENTRY pc=0x2019b3 arg[2] size=8 val=0x3
+ENTRY pc=0x2019c7 arg[3] size=8 val=0x4
+ENTRY pc=0x2019db arg[4] size=8 val=0x5
+ENTRY pc=0x2019ef arg[5] size=8 val=0x6
+ENTRY pc=0x201a05 arg[6] size=8 val=0x7
+ENTRY pc=0x201a19 arg[7] size=8 val=0x8
+ENTRY pc=0x201a2f arg[8] size=8 val=0x9
+ENTRY pc=0x201a48 arg[9] size=8 val=0xa
+RET   pc=0x201a7a size=8 val=0x37
+ENTRY pc=0x2018e3 arg[0] size=8 val=0x37
+RET   pc=0x2018ee size=0 val=0
+ENTRY pc=0x201aa5 arg[0] size=24 @0x7fff89a136e0 {0x2, 0x1000, 0x41}
+RET   pc=0x201ac3 size=8 val=0x1043
+ENTRY pc=0x2018e3 arg[0] size=8 val=0x1043
+RET   pc=0x2018ee size=0 val=0
+RET   pc=0x201ba1 size=4 val=0
